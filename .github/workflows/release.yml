@@ -1,0 +1,52 @@
+name: Build Caddy-Trojan
+
+
+on: 
+    workflow_dispatch:
+    push:
+      paths:
+        - 'sha'
+
+jobs:
+  build-caddy-trojan:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [linux]
+        arch: [amd64, arm64]
+        go-version: [1.22.x]
+    
+
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: true
+          cache-dependency-path: |
+            **/go.sum
+    
+      - name: Build Xcaddy
+        run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+    
+      - name: Build Caddy-Trojan
+        id: build_caddy_trojan
+        run: |
+          mkdir -p ~/output
+          cd ~/output
+          xcaddy build --with github.com/imgk/caddy-trojan
+          echo "my_caddy_version=$(./caddy version | awk '{print $1}')" >> $GITHUB_OUTPUT
+          tar -czvf ../caddy_trojan_${{ matrix.os }}_${{ matrix.arch }}.tar.gz .
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.TOKEN }}
+        with:
+          body: New Release.
+          tag_name: ${{ steps.build_caddy_trojan.outputs.my_caddy_version }}
+          draft: false
+          prerelease: false
+          files: /home/runner/*.tar.gz
