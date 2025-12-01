@@ -1,28 +1,35 @@
-name: Check
+name: Check Upstream
 
-
-on: 
-    workflow_dispatch:
-    schedule:
-      - cron: '30 2 5 * *'
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 2 * * *' # 每天运行一次即可
 
 jobs:
-  build:
-
+  check:
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v2
+      - uses: actions/checkout@v4 # 升级到 v4
 
-    - name: Check And Commit
-      run: |
-        sudo apt update -y
-        sudo apt install jq -y
-        chmod +x update_sha.sh
-        ./update_sha.sh
+      - name: Check Upstream SHA
+        id: check
+        run: |
+          # 获取远程 SHA
+          REMOTE_SHA=$(curl -s "https://api.github.com/repos/imgk/caddy-trojan/commits" | jq -r '.[0].sha')
+          LOCAL_SHA=$(cat sha 2>/dev/null || echo "")
+          
+          if [ "$REMOTE_SHA" != "$LOCAL_SHA" ]; then
+            echo "$REMOTE_SHA" > sha
+            echo "updated=true" >> $GITHUB_OUTPUT
+          else
+            echo "updated=false" >> $GITHUB_OUTPUT
+          fi
 
-    - name: Push changes
-      uses: ad-m/github-push-action@master
-      with:
-         github_token: ${{ secrets.TOKEN }}
-         branch: main
+      - name: Commit and Push
+        if: steps.check.outputs.updated == 'true'
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add sha
+          git commit -m "chore: update upstream sha to $(cat sha)"
+          git push
