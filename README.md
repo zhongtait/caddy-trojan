@@ -2,7 +2,7 @@
 #### 首次安装 ####
 请将结尾的password更换为自己的密码，例如 bash easytrojan.sh 123456，安装成功后会返回trojan的连接参数
 ```
-curl https://raw.githubusercontent.com/xiaopowanyi/caddy-trojan/refs/heads/main/easytrojan.sh -o easytrojan.sh && chmod +x easytrojan.sh && bash easytrojan.sh password
+curl https://raw.githubusercontent.com/zhongtait/caddy-trojan/refs/heads/main/easytrojan.sh -o easytrojan.sh && chmod +x easytrojan.sh && bash easytrojan.sh password
 ```
 
 #### 放行端口 ####
@@ -22,7 +22,7 @@ sudo ufw allow proto tcp from any to any port 80,443 && sudo iptables -F
 
 #### 重新安装 ####
 ```
-systemctl stop caddy.service && curl https://raw.githubusercontent.com/xiaopowanyi/caddy-trojan/refs/heads/main/easytrojan.sh -o easytrojan.sh && chmod +x easytrojan.sh && bash easytrojan.sh password
+systemctl stop caddy.service && curl https://raw.githubusercontent.com/zhongtait/caddy-trojan/refs/heads/main/easytrojan.sh -o easytrojan.sh && chmod +x easytrojan.sh && bash easytrojan.sh password
 ```
 
 #### 完全卸载 ####

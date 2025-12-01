@@ -3,7 +3,7 @@
 # Notes: EasyTrojan for CentOS/RedHat 7+ Debian 9+ and Ubuntu 16+
 #
 # Project home page:
-#        https://github.com/eastmaple/easytrojan
+#        https://github.com/zhongtait/caddy-trojan
 
 trojan_passwd=$1
 caddy_domain=$2
@@ -33,10 +33,10 @@ fi
 
 case $(uname -m) in
     x86_64)
-        caddy_url=https://github.com/xiaopowanyi/caddy-trojan/releases/download/v2.8.4/caddy_trojan_linux_amd64.tar.gz
+        caddy_url=https://github.com/zhongtait/caddy-trojan/releases/latest/download/caddy_trojan_linux_amd64.tar.gz
         ;;
     aarch64)
-        caddy_url=https://github.com/xiaopowanyi/caddy-trojan/releases/download/v2.8.4/caddy_trojan_linux_arm64.tar.gz
+        caddy_url=https://github.com/zhongtait/caddy-trojan/releases/latest/download/caddy_trojan_linux_arm64.tar.gz
         ;;
     *) 
         echo "Error: Your system version does not support"
