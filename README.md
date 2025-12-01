@@ -22,7 +22,7 @@
 执行以下命令即可开始安装。脚本将引导你输入密码；如果未提供域名，将自动生成专用域名。
 
 ```bash
-curl -O [https://raw.githubusercontent.com/zhongtait/caddy-trojan/main/easytrojan.sh](https://raw.githubusercontent.com/zhongtait/caddy-trojan/main/easytrojan.sh) && chmod +x easytrojan.sh && bash easytrojan.sh
+curl -O https://raw.githubusercontent.com/zhongtait/caddy-trojan/main/easytrojan.sh && chmod +x easytrojan.sh && bash easytrojan.sh
 ```
 
 ### 2. 高级模式 (自动化部署)
@@ -77,7 +77,7 @@ sudo ufw allow 443/tcp
 本项目提供了一键卸载脚本，可彻底清理安装的文件、服务及系统配置。
 
 ```bash
-curl -O [https://raw.githubusercontent.com/zhongtait/caddy-trojan/main/uninstall.sh](https://raw.githubusercontent.com/zhongtait/caddy-trojan/main/uninstall.sh) && chmod +x uninstall.sh && bash uninstall.sh
+curl -O https://raw.githubusercontent.com/zhongtait/caddy-trojan/main/uninstall.sh && chmod +x uninstall.sh && bash uninstall.sh
 ```
 
 ## ⚠️ 免责声明
@@ -88,6 +88,4 @@ curl -O [https://raw.githubusercontent.com/zhongtait/caddy-trojan/main/uninstall
 
 -----
 
-[MIT License](https://www.google.com/search?q=LICENSE) © 2025 zhongtait
-
-```
+[MIT License](https://www.google.com/search?q=MIT LICENSE) © 2025 zhongtait
