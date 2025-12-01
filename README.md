@@ -88,4 +88,4 @@ curl -O https://raw.githubusercontent.com/zhongtait/caddy-trojan/main/uninstall.
 
 -----
 
-[MIT License](https://www.google.com/search?q=MIT LICENSE) © 2025 zhongtait
+[MIT License](https://www.google.com/search?q=MITLICENSE) © 2025 zhongtait
