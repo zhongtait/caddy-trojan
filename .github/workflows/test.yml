@@ -3,19 +3,23 @@ name: Check Upstream
 on:
   workflow_dispatch:
   schedule:
-    - cron: '30 2 * * *' # 每天运行一次即可
+    - cron: '30 2 * * *'
+
+# ✅ 新增：赋予 GITHUB_TOKEN 写入仓库的权限
+permissions:
+  contents: write
 
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4 # 升级到 v4
-
+      - uses: actions/checkout@v4
+      
       - name: Check Upstream SHA
         id: check
         run: |
-          # 获取远程 SHA
-          REMOTE_SHA=$(curl -s "https://api.github.com/repos/imgk/caddy-trojan/commits" | jq -r '.[0].sha')
+          # 获取远程 SHA (添加 User-Agent 避免 API 限制)
+          REMOTE_SHA=$(curl -s -H "User-Agent: Caddy-Trojan-CI" "https://api.github.com/repos/imgk/caddy-trojan/commits" | jq -r '.[0].sha')
           LOCAL_SHA=$(cat sha 2>/dev/null || echo "")
           
           if [ "$REMOTE_SHA" != "$LOCAL_SHA" ]; then
