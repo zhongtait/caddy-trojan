@@ -110,15 +110,101 @@ chmod 700 /etc/caddy
 [ -n "$caddy_domain" ] && rm -rf /etc/caddy/certificates
 
 # ==================== 伪装页面 ====================
-# 创建简单的伪装页面，比直接返回 503 更隐蔽
+# 生成一个看起来像个人技术博客的伪装页面
 mkdir -p /etc/caddy/www
 cat > /etc/caddy/www/index.html <<'HTMLEOF'
 <!DOCTYPE html>
-<html>
-<head><title>Welcome</title></head>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dev Notes - A Personal Blog about Software Engineering</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: Georgia, 'Times New Roman', serif; color: #333; line-height: 1.8; background: #fafafa; }
+        a { color: #2563eb; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        .container { max-width: 720px; margin: 0 auto; padding: 0 20px; }
+        header { border-bottom: 1px solid #e5e7eb; padding: 40px 0 20px; margin-bottom: 40px; background: #fff; }
+        header .container { display: flex; justify-content: space-between; align-items: baseline; }
+        .site-title { font-size: 28px; font-weight: bold; color: #111; letter-spacing: -0.5px; }
+        .site-title a { color: #111; }
+        nav a { margin-left: 24px; color: #666; font-size: 15px; font-family: -apple-system, sans-serif; }
+        .post { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 32px; margin-bottom: 28px; }
+        .post-meta { font-family: -apple-system, sans-serif; font-size: 13px; color: #999; margin-bottom: 12px; }
+        .post-meta span { margin-right: 16px; }
+        .post h2 { font-size: 22px; margin-bottom: 14px; color: #111; line-height: 1.4; }
+        .post h2 a { color: #111; }
+        .post p { color: #555; font-size: 16px; margin-bottom: 12px; }
+        .read-more { font-family: -apple-system, sans-serif; font-size: 14px; font-weight: 500; }
+        .tag { display: inline-block; background: #f3f4f6; color: #666; padding: 2px 10px; border-radius: 12px; font-size: 12px; font-family: -apple-system, sans-serif; margin-right: 6px; }
+        .sidebar { margin-top: 48px; padding: 24px; background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; }
+        .sidebar h3 { font-size: 16px; margin-bottom: 12px; font-family: -apple-system, sans-serif; }
+        .sidebar p { font-size: 14px; color: #666; font-family: -apple-system, sans-serif; }
+        footer { text-align: center; padding: 40px 0; color: #999; font-size: 13px; font-family: -apple-system, sans-serif; }
+        @media (max-width: 768px) { header .container { flex-direction: column; gap: 12px; } nav a { margin-left: 0; margin-right: 16px; } }
+    </style>
+</head>
 <body>
-<h1>It works!</h1>
-<p>This is the default web page for this server.</p>
+    <header>
+        <div class="container">
+            <div class="site-title"><a href="#">Dev Notes</a></div>
+            <nav>
+                <a href="#">Archive</a>
+                <a href="#">Tags</a>
+                <a href="#">About</a>
+            </nav>
+        </div>
+    </header>
+    <main class="container">
+        <article class="post">
+            <div class="post-meta">
+                <span>May 12, 2025</span>
+                <span class="tag">Rust</span>
+                <span class="tag">Performance</span>
+            </div>
+            <h2><a href="#">Understanding Zero-Cost Abstractions in Rust</a></h2>
+            <p>One of Rust's core promises is zero-cost abstractions: you don't pay a runtime penalty for using high-level constructs. But what does this actually mean in practice? Let's look at how the compiler optimizes iterators, closures, and trait objects...</p>
+            <a href="#" class="read-more">Continue reading &rarr;</a>
+        </article>
+        <article class="post">
+            <div class="post-meta">
+                <span>May 5, 2025</span>
+                <span class="tag">Distributed Systems</span>
+                <span class="tag">Architecture</span>
+            </div>
+            <h2><a href="#">Lessons Learned from Building a Multi-Region Database</a></h2>
+            <p>After spending two years working on a globally distributed database, I want to share some hard-won lessons about consistency models, conflict resolution, and why CRDTs aren't always the answer you think they are...</p>
+            <a href="#" class="read-more">Continue reading &rarr;</a>
+        </article>
+        <article class="post">
+            <div class="post-meta">
+                <span>Apr 28, 2025</span>
+                <span class="tag">Go</span>
+                <span class="tag">Concurrency</span>
+            </div>
+            <h2><a href="#">A Practical Guide to Go's Context Package</a></h2>
+            <p>The context package is one of Go's most important but often misunderstood features. In this post, I'll walk through real-world patterns for cancellation propagation, timeout handling, and the common pitfalls that trip up even experienced Go developers...</p>
+            <a href="#" class="read-more">Continue reading &rarr;</a>
+        </article>
+        <article class="post">
+            <div class="post-meta">
+                <span>Apr 19, 2025</span>
+                <span class="tag">Linux</span>
+                <span class="tag">Networking</span>
+            </div>
+            <h2><a href="#">Deep Dive into TCP BBR Congestion Control</a></h2>
+            <p>Google's BBR algorithm fundamentally changed how we think about congestion control. Instead of treating packet loss as the primary signal, BBR models the network path to find the optimal operating point. Here's how it works under the hood...</p>
+            <a href="#" class="read-more">Continue reading &rarr;</a>
+        </article>
+        <div class="sidebar">
+            <h3>About this blog</h3>
+            <p>Hi, I'm a software engineer writing about systems programming, distributed systems, and performance optimization. Views are my own. Feel free to reach out via the contact page.</p>
+        </div>
+    </main>
+    <footer>
+        <p>&copy; 2025 Dev Notes. Built with simplicity in mind.</p>
+    </footer>
 </body>
 </html>
 HTMLEOF
@@ -317,8 +403,8 @@ ok "System optimizations applied (BBR: $(sysctl -n net.ipv4.tcp_congestion_contr
 # ==================== 验证安装 ====================
 info "Verifying installation..."
 sleep 2
-check_http=$(curl -sL --max-time 10 "https://${nip_domain}" -k 2>/dev/null | head -c 100 || echo "")
-if echo "$check_http" | grep -q "It works"; then
+check_http=$(curl -sL --max-time 10 "https://${nip_domain}" -k 2>/dev/null | head -c 200 || echo "")
+if echo "$check_http" | grep -q "Dev Notes"; then
     ok "HTTPS verification passed"
 else
     warn "HTTPS check inconclusive. Please ensure TCP ports 80 and 443 are open."
@@ -326,6 +412,10 @@ else
 fi
 
 # ==================== 完成 ====================
+# 生成分享链接（兼容 v2rayN / Clash / Shadowrocket 等客户端）
+encoded_passwd=$(printf '%s' "$trojan_passwd" | sed 's/@/%40/g; s/:/%3A/g; s/!/%21/g; s/#/%23/g')
+share_link="trojan://${encoded_passwd}@${nip_domain}:443?security=tls&sni=${nip_domain}&type=ws&host=${nip_domain}&path=%2F#${nip_domain}"
+
 clear
 echo ""
 echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
@@ -340,5 +430,8 @@ echo -e "${GREEN}╠════════════════════
 echo -e "${GREEN}║${NC}  Manage   : systemctl {start|stop|restart|status} caddy"
 echo -e "${GREEN}║${NC}  Logs     : journalctl -u caddy --no-pager -n 50"
 echo -e "${GREEN}║${NC}  Config   : /etc/caddy/Caddyfile"
+echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
+echo -e "${GREEN}║${NC}  ${YELLOW}Share Link (copy to v2rayN/Clash/Shadowrocket):${NC}"
+echo -e "${GREEN}║${NC}  ${CYAN}${share_link}${NC}"
 echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
 echo ""
