@@ -23,12 +23,12 @@ jobs:
             goarch: arm64
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
-          go-version: '1.22.x'
+          go-version: '1.23.x'
           cache: true
           cache-dependency-path: '**/go.sum'
 
@@ -59,7 +59,7 @@ jobs:
           echo "filename=${FILENAME}" >> $GITHUB_OUTPUT
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: caddy_trojan_${{ matrix.os }}_${{ matrix.arch }}
           path: caddy_trojan_${{ matrix.os }}_${{ matrix.arch }}.tar.gz
@@ -68,10 +68,10 @@ jobs:
     needs: build-caddy-trojan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: artifacts
           merge-multiple: true
