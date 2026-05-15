@@ -59,6 +59,15 @@ if [ -f /etc/systemd/system/caddy.service ]; then
     ok "Service file removed"
 fi
 
+# 删除证书续签定时器
+if [ -f /etc/systemd/system/caddy-renew.timer ]; then
+    systemctl stop caddy-renew.timer &>/dev/null || true
+    systemctl disable caddy-renew.timer &>/dev/null || true
+    rm -f /etc/systemd/system/caddy-renew.timer
+    rm -f /etc/systemd/system/caddy-renew.service
+    ok "Certificate renewal timer removed"
+fi
+
 # 删除配置文件目录（包含证书、密码、伪装页面）
 if [ -d /etc/caddy ]; then
     rm -rf /etc/caddy
