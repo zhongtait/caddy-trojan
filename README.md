@@ -54,11 +54,17 @@ sudo ufw allow proto tcp from any to any port 80,443
 ## 管理命令
 
 ```bash
-# 查看状态
-systemctl status caddy
+# 查看状态（含分享链接、证书到期时间）
+bash easytrojan.sh status
 
-# 重启服务
-systemctl restart caddy
+# 更新脚本和 Caddy 到最新版本
+bash easytrojan.sh update
+
+# 强制续签证书
+bash easytrojan.sh renew
+
+# 服务管理
+systemctl {start|stop|restart|status} caddy
 
 # 查看日志
 journalctl -u caddy --no-pager -n 50
@@ -69,6 +75,8 @@ curl -X POST -H "Content-Type: application/json" -d '{"password": "newpass"}' ht
 # 配置文件
 cat /etc/caddy/Caddyfile
 ```
+
+> 证书会通过 systemd timer 每月自动检查续签，也可以手动执行 `bash easytrojan.sh renew`。
 
 ## 重新安装
 

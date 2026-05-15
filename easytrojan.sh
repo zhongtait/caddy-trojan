@@ -3,6 +3,12 @@
 # EasyTrojan - One-click Caddy-Trojan installer
 # Supports: CentOS/RedHat 7+, Debian 9+, Ubuntu 16+
 #
+# Usage:
+#   bash easytrojan.sh <password> [domain]   - Install
+#   bash easytrojan.sh update                - Update script + Caddy binary
+#   bash easytrojan.sh renew                 - Force certificate renewal
+#   bash easytrojan.sh status                - Show service status
+#
 # Based on: https://github.com/imgk/caddy-trojan
 # Project:  https://github.com/zhongtait/caddy-trojan
 
@@ -22,6 +28,144 @@ ok()    { echo -e "${GREEN}[OK]${NC} $*"; }
 
 check_cmd() { command -v "$1" &>/dev/null; }
 
+# ==================== 子命令：update ====================
+do_update() {
+    [ "$(id -u)" != "0" ] && error "You must be root to run this script"
+
+    # 更新脚本自身
+    info "Updating easytrojan.sh script..."
+    local script_url="https://raw.githubusercontent.com/zhongtait/caddy-trojan/main/easytrojan.sh"
+    local script_path
+    script_path=$(readlink -f "$0" 2>/dev/null || echo "/usr/local/bin/easytrojan.sh")
+    if curl -fsSL --connect-timeout 10 --max-time 30 "$script_url" -o "${script_path}.tmp"; then
+        chmod +x "${script_path}.tmp"
+        mv -f "${script_path}.tmp" "$script_path"
+        ok "Script updated"
+    else
+        warn "Script update failed, continuing with Caddy update..."
+        rm -f "${script_path}.tmp"
+    fi
+
+    # 更新 Caddy 二进制
+    case $(uname -m) in
+        x86_64)  arch="amd64" ;;
+        aarch64) arch="arm64" ;;
+        *)       error "Unsupported architecture: $(uname -m)" ;;
+    esac
+
+    caddy_url="https://github.com/zhongtait/caddy-trojan/releases/latest/download/caddy_trojan_linux_${arch}.tar.gz"
+
+    local old_version
+    old_version=$(/usr/local/bin/caddy version 2>/dev/null | awk '{print $1}' || echo 'not installed')
+    info "Current Caddy version: $old_version"
+    info "Downloading latest Caddy-Trojan (${arch})..."
+
+    if ! curl -fsSL --connect-timeout 15 --max-time 180 "$caddy_url" | tar -zx -C /usr/local/bin caddy; then
+        error "Failed to download Caddy binary."
+    fi
+    chmod +x /usr/local/bin/caddy
+
+    local new_version
+    new_version=$(/usr/local/bin/caddy version 2>/dev/null | awk '{print $1}' || echo 'unknown')
+
+    if [ "$old_version" = "$new_version" ]; then
+        ok "Caddy already up to date: $new_version"
+    else
+        info "Restarting Caddy service..."
+        systemctl restart caddy.service
+        ok "Caddy updated: $old_version -> $new_version"
+    fi
+    exit 0
+}
+
+# ==================== 子命令：renew ====================
+do_renew() {
+    [ "$(id -u)" != "0" ] && error "You must be root to run this script"
+
+    if ! systemctl is-active --quiet caddy 2>/dev/null; then
+        error "Caddy service is not running"
+    fi
+
+    info "Forcing certificate renewal..."
+    # 删除旧证书，Caddy 会自动重新申请
+    rm -rf /etc/caddy/certificates
+    rm -rf /etc/caddy/acme
+    systemctl restart caddy.service
+
+    info "Waiting for new certificate..."
+    count=0
+    max_wait=40
+    until [ -d /etc/caddy/certificates ]; do
+        count=$((count + 1))
+        if (( count > max_wait )); then
+            error "Certificate renewal failed. Check: journalctl -u caddy --no-pager -n 30"
+        fi
+        sleep 3
+    done
+    ok "Certificate renewed successfully"
+    exit 0
+}
+
+# ==================== 子命令：status ====================
+do_status() {
+    echo ""
+    if systemctl is-active --quiet caddy 2>/dev/null; then
+        echo -e "  Service: ${GREEN}running${NC}"
+    else
+        echo -e "  Service: ${RED}stopped${NC}"
+    fi
+
+    if [ -f /usr/local/bin/caddy ]; then
+        echo -e "  Version: $(/usr/local/bin/caddy version 2>/dev/null | awk '{print $1}' || echo 'unknown')"
+    fi
+
+    if [ -f /etc/caddy/trojan/passwd.txt ]; then
+        echo -e "  Users  : $(wc -l < /etc/caddy/trojan/passwd.txt)"
+    fi
+
+    # 证书信息
+    local cert_dir="/etc/caddy/certificates"
+    if [ -d "$cert_dir" ]; then
+        local cert_file
+        cert_file=$(find "$cert_dir" -name "*.crt" -type f 2>/dev/null | head -1)
+        if [ -n "$cert_file" ] && check_cmd openssl; then
+            local expiry
+            expiry=$(openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | cut -d= -f2)
+            echo -e "  Cert   : expires $expiry"
+        else
+            echo -e "  Cert   : ${GREEN}present${NC}"
+        fi
+    else
+        echo -e "  Cert   : ${RED}not found${NC}"
+    fi
+
+    # 分享链接
+    if [ -f /etc/caddy/trojan/passwd.txt ] && [ -f /etc/caddy/Caddyfile ]; then
+        local domain passwd
+        domain=$(grep -oP '(?<=:443, )[\w.-]+' /etc/caddy/Caddyfile 2>/dev/null | head -1)
+        passwd=$(head -1 /etc/caddy/trojan/passwd.txt)
+        if [ -n "$domain" ] && [ -n "$passwd" ]; then
+            local encoded_passwd
+            encoded_passwd=$(printf '%s' "$passwd" | sed 's/@/%40/g; s/:/%3A/g; s/!/%21/g; s/#/%23/g')
+            # 检查是否启用了 websocket
+            if grep -q "websocket" /etc/caddy/Caddyfile 2>/dev/null; then
+                echo -e "  Link   : ${CYAN}trojan://${encoded_passwd}@${domain}:443?security=tls&sni=${domain}&type=ws&host=${domain}&path=%2F#${domain}${NC}"
+            else
+                echo -e "  Link   : ${CYAN}trojan://${encoded_passwd}@${domain}:443?security=tls&sni=${domain}&type=tcp#${domain}${NC}"
+            fi
+        fi
+    fi
+    echo ""
+    exit 0
+}
+
+# ==================== 路由子命令 ====================
+case "${1:-}" in
+    update)  do_update ;;
+    renew)   do_renew ;;
+    status)  do_status ;;
+esac
+
 # ==================== 参数与环境检查 ====================
 trojan_passwd="${1:-}"
 caddy_domain="${2:-}"
@@ -39,6 +183,17 @@ if [ -n "$check_port" ]; then
     else
         error "Port 80 or 443 is already in use by another process:\n$check_port"
     fi
+fi
+
+# ==================== 备份已有证书（重装场景） ====================
+cert_backup=""
+if [ -d /etc/caddy/certificates ]; then
+    info "Backing up existing certificates..."
+    cert_backup="/tmp/caddy-cert-backup-$$"
+    mkdir -p "$cert_backup"
+    cp -r /etc/caddy/certificates "$cert_backup/" 2>/dev/null || true
+    cp -r /etc/caddy/acme "$cert_backup/" 2>/dev/null || true
+    ok "Certificates backed up"
 fi
 
 # 获取服务器 IP（多源备用）
@@ -317,11 +472,25 @@ max_wait=40
 until [ -d /etc/caddy/certificates ]; do
     count=$((count + 1))
     if (( count > max_wait )); then
-        error "Certificate application failed after $((max_wait * 3))s.\nPlease check:\n  1. TCP ports 80 and 443 are open\n  2. Domain resolves correctly\n  3. journalctl -u caddy --no-pager -n 30"
+        # 尝试从备份恢复证书
+        if [ -n "$cert_backup" ] && [ -d "$cert_backup/certificates" ]; then
+            warn "New certificate request failed. Restoring from backup..."
+            cp -r "$cert_backup/certificates" /etc/caddy/ 2>/dev/null || true
+            cp -r "$cert_backup/acme" /etc/caddy/ 2>/dev/null || true
+            chown -R caddy:caddy /etc/caddy
+            systemctl restart caddy.service
+            ok "Certificates restored from backup"
+        else
+            error "Certificate application failed after $((max_wait * 3))s.\nPlease check:\n  1. TCP ports 80 and 443 are open\n  2. Domain resolves correctly\n  3. journalctl -u caddy --no-pager -n 30"
+        fi
+        break
     fi
     sleep 3
 done
-ok "SSL certificate obtained"
+[ -d /etc/caddy/certificates ] && ok "SSL certificate ready"
+
+# 清理备份
+[ -n "$cert_backup" ] && rm -rf "$cert_backup"
 
 # ==================== 系统优化（使用独立配置文件） ====================
 info "Applying system optimizations..."
@@ -400,6 +569,42 @@ EOF
 
 ok "System optimizations applied (BBR: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 'N/A'))"
 
+# ==================== 证书自动续签定时器 ====================
+# Caddy 本身会自动续签，但添加一个定时重启作为保险
+# 每月 1 号和 15 号凌晨 3 点重启 Caddy 触发证书检查
+info "Setting up certificate renewal timer..."
+
+cat > /etc/systemd/system/caddy-renew.service <<EOF
+[Unit]
+Description=Caddy Certificate Renewal Check
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/caddy reload --config /etc/caddy/Caddyfile --force
+User=caddy
+Group=caddy
+Environment=XDG_CONFIG_HOME=/etc XDG_DATA_HOME=/etc
+EOF
+
+cat > /etc/systemd/system/caddy-renew.timer <<EOF
+[Unit]
+Description=Caddy Certificate Renewal Timer
+
+[Timer]
+OnCalendar=*-*-01,15 03:00:00
+RandomizedDelaySec=3600
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable caddy-renew.timer &>/dev/null
+systemctl start caddy-renew.timer &>/dev/null
+ok "Certificate renewal timer enabled (1st & 15th of each month)"
+
 # ==================== 验证安装 ====================
 info "Verifying installation..."
 sleep 2
@@ -410,6 +615,11 @@ else
     warn "HTTPS check inconclusive. Please ensure TCP ports 80 and 443 are open."
     warn "Verify by visiting: https://${nip_domain}"
 fi
+
+# ==================== 安装脚本到系统路径 ====================
+# 复制脚本到 /usr/local/bin 方便后续使用 update/renew/status 命令
+cp -f "$0" /usr/local/bin/easytrojan.sh 2>/dev/null || true
+chmod +x /usr/local/bin/easytrojan.sh 2>/dev/null || true
 
 # ==================== 完成 ====================
 # 生成分享链接（兼容 v2rayN / Clash / Shadowrocket 等客户端）
@@ -430,6 +640,8 @@ echo -e "${GREEN}╠════════════════════
 echo -e "${GREEN}║${NC}  Manage   : systemctl {start|stop|restart|status} caddy"
 echo -e "${GREEN}║${NC}  Logs     : journalctl -u caddy --no-pager -n 50"
 echo -e "${GREEN}║${NC}  Config   : /etc/caddy/Caddyfile"
+echo -e "${GREEN}║${NC}  Update   : bash easytrojan.sh update"
+echo -e "${GREEN}║${NC}  Status   : bash easytrojan.sh status"
 echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
 echo -e "${GREEN}║${NC}  ${YELLOW}Share Link (copy to v2rayN/Clash/Shadowrocket):${NC}"
 echo -e "${GREEN}║${NC}  ${CYAN}${share_link}${NC}"
