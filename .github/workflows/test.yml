@@ -5,7 +5,6 @@ on:
   schedule:
     - cron: '30 2 * * *'
 
-# ✅ 新增：赋予 GITHUB_TOKEN 写入仓库的权限
 permissions:
   contents: write
 
@@ -14,19 +13,32 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Check Upstream SHA
         id: check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 获取远程 SHA (添加 User-Agent 避免 API 限制)
-          REMOTE_SHA=$(curl -s -H "User-Agent: Caddy-Trojan-CI" "https://api.github.com/repos/imgk/caddy-trojan/commits" | jq -r '.[0].sha')
+          # 使用 token 避免 API 限流
+          REMOTE_SHA=$(curl -sf -H "Authorization: token $GITHUB_TOKEN" \
+            -H "User-Agent: Caddy-Trojan-CI" \
+            "https://api.github.com/repos/imgk/caddy-trojan/commits?per_page=1" \
+            | jq -r '.[0].sha')
+
+          if [ -z "$REMOTE_SHA" ] || [ "$REMOTE_SHA" = "null" ]; then
+            echo "Failed to fetch upstream SHA"
+            exit 1
+          fi
+
           LOCAL_SHA=$(cat sha 2>/dev/null || echo "")
-          
+
           if [ "$REMOTE_SHA" != "$LOCAL_SHA" ]; then
             echo "$REMOTE_SHA" > sha
             echo "updated=true" >> $GITHUB_OUTPUT
+            echo "Upstream updated: $LOCAL_SHA -> $REMOTE_SHA"
           else
             echo "updated=false" >> $GITHUB_OUTPUT
+            echo "No changes detected"
           fi
 
       - name: Commit and Push
@@ -35,5 +47,5 @@ jobs:
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git add sha
-          git commit -m "chore: update upstream sha to $(cat sha)"
+          git commit -m "chore: update upstream sha to $(cat sha | head -c 7)"
           git push

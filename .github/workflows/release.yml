@@ -1,12 +1,11 @@
 name: Build Caddy-Trojan
 
-on: 
-    workflow_dispatch:
-    push:
-      paths:
-        - 'sha'
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'sha'
 
-# ✅ 新增：必须赋予写入权限才能创建 Release
 permissions:
   contents: write
 
@@ -15,43 +14,86 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        os: [linux]
-        arch: [amd64, arm64]
-        go-version: [1.22.x]
-    
+        include:
+          - os: linux
+            arch: amd64
+            goarch: amd64
+          - os: linux
+            arch: arm64
+            goarch: arm64
+
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: ${{ matrix.go-version }}
+          go-version: '1.22.x'
           cache: true
-          cache-dependency-path: |
-            **/go.sum
-    
-      - name: Build Xcaddy
+          cache-dependency-path: '**/go.sum'
+
+      - name: Install Xcaddy
         run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
-    
+
       - name: Build Caddy-Trojan
-        id: build_caddy_trojan
+        id: build
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.goarch }}
         run: |
-          mkdir -p ~/output
-          cd ~/output
+          mkdir -p output
+          cd output
           xcaddy build --with github.com/imgk/caddy-trojan
-          # 确保版本号提取正确，去除可能导致文件路径非法的字符
-          echo "my_caddy_version=$(./caddy version | awk '{print $1}')" >> $GITHUB_OUTPUT
-          tar -czvf ../caddy_trojan_${{ matrix.os }}_${{ matrix.arch }}.tar.gz .
+
+          # 获取版本号（仅在本机架构时可执行）
+          if [ "${{ matrix.goarch }}" = "amd64" ]; then
+            VERSION=$(./caddy version | awk '{print $1}')
+          else
+            VERSION="latest"
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+          # 打包
+          FILENAME="caddy_trojan_${{ matrix.os }}_${{ matrix.arch }}.tar.gz"
+          tar -czvf "../${FILENAME}" caddy
+          echo "filename=${FILENAME}" >> $GITHUB_OUTPUT
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: caddy_trojan_${{ matrix.os }}_${{ matrix.arch }}
+          path: caddy_trojan_${{ matrix.os }}_${{ matrix.arch }}.tar.gz
+
+  release:
+    needs: build-caddy-trojan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Get Caddy version
+        id: version
+        run: |
+          # 解压 amd64 版本获取版本号
+          tar -xzf artifacts/caddy_trojan_linux_amd64.tar.gz -C /tmp
+          VERSION=$(/tmp/caddy version | awk '{print $1}')
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
-        # ✅ 修改：直接使用 env 传递内置 Token，不需要 secrets.TOKEN
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          body: New Release.
-          tag_name: ${{ steps.build_caddy_trojan.outputs.my_caddy_version }}
+          body: |
+            Caddy-Trojan ${{ steps.version.outputs.version }}
+            
+            Built with [imgk/caddy-trojan](https://github.com/imgk/caddy-trojan) plugin.
+          tag_name: ${{ steps.version.outputs.version }}
           draft: false
           prerelease: false
-          # 注意：softprops/action-gh-release 会自动处理并发上传，不需要担心 matrix 并行问题
-          files: /home/runner/*.tar.gz
+          files: artifacts/*.tar.gz
