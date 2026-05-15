@@ -1,60 +1,135 @@
 #!/bin/bash
 #
-# Notes: EasyTrojan for CentOS/RedHat 7+ Debian 9+ and Ubuntu 16+
+# EasyTrojan - One-click Caddy-Trojan installer
+# Supports: CentOS/RedHat 7+, Debian 9+, Ubuntu 16+
 #
-# Project home page:
-#        https://github.com/zhongtait/caddy-trojan
+# Based on: https://github.com/imgk/caddy-trojan
+# Project:  https://github.com/zhongtait/caddy-trojan
 
-trojan_passwd=$1
-caddy_domain=$2
-address_ip=$(curl ipv4.ip.sb)
-nip_domain=${address_ip}.nip.io
-check_port=$(ss -Hlnp sport = :80 or sport = :443)
+set -euo pipefail
 
-[ "$trojan_passwd" = "" ] && { echo "Error: You must enter a trojan's password to run this script"; exit 1; }
-[ "$caddy_domain" != "" ] && domain_ip=$(ping "${caddy_domain}" -c 1 | sed '1{s/[^(]*(//;s/).*//;q}') && [ "$domain_ip" != "$address_ip" ] && { echo "Error: Could not resolve hostname"; exit 1; }
-[ "$(id -u)" != "0" ] && { echo "Error: You must be root to run this script"; exit 1; }
-[ "$check_port" != "" ] && { echo "Error: Port 80 or 443 is already in use"; exit 1; }
+# ==================== 颜色与工具函数 ====================
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
 
-check_cmd () { command -v "$1" &>/dev/null; }
+info()  { echo -e "${CYAN}[INFO]${NC} $*"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
+error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
+ok()    { echo -e "${GREEN}[OK]${NC} $*"; }
 
-if ! check_cmd tar; then
-    echo "tar: command not found, installing..."
-    if check_cmd yum; then
-        yum install -y tar
-    elif check_cmd apt-get; then
-        apt-get install -y tar
-    elif check_cmd dnf; then
-        dnf install -y tar
+check_cmd() { command -v "$1" &>/dev/null; }
+
+# ==================== 参数与环境检查 ====================
+trojan_passwd="${1:-}"
+caddy_domain="${2:-}"
+
+[ -z "$trojan_passwd" ] && error "Usage: bash easytrojan.sh <password> [domain]"
+[ "$(id -u)" != "0" ] && error "You must be root to run this script"
+
+# 检查端口占用（排除已有的 caddy 进程，支持重装场景）
+check_port=$(ss -Hlnp sport = :80 or sport = :443 | grep -v caddy || true)
+if [ -n "$check_port" ]; then
+    # 如果 caddy 正在运行，先停止它
+    if systemctl is-active --quiet caddy 2>/dev/null; then
+        info "Stopping existing Caddy service for reinstall..."
+        systemctl stop caddy
     else
-        echo "Error: Unable to install tar"; exit 1
+        error "Port 80 or 443 is already in use by another process:\n$check_port"
     fi
 fi
 
+# 获取服务器 IP（多源备用）
+info "Detecting server IP..."
+address_ip=""
+for ip_service in "ipv4.ip.sb" "api.ipify.org" "ifconfig.me"; do
+    address_ip=$(curl -s --connect-timeout 5 --max-time 10 "$ip_service" 2>/dev/null) && break
+done
+[ -z "$address_ip" ] && error "Failed to detect server IP. Check network connectivity."
+nip_domain="${address_ip}.nip.io"
+info "Server IP: $address_ip"
+
+# 验证自定义域名
+if [ -n "$caddy_domain" ]; then
+    domain_ip=$(ping "${caddy_domain}" -c 1 -W 5 2>/dev/null | sed '1{s/[^(]*(//;s/).*//;q}')
+    [ "$domain_ip" != "$address_ip" ] && error "Domain '$caddy_domain' resolves to '$domain_ip', expected '$address_ip'"
+    nip_domain="$caddy_domain"
+    info "Using custom domain: $caddy_domain"
+fi
+
+# ==================== 依赖安装 ====================
+install_pkg() {
+    local pkg="$1"
+    if ! check_cmd "$pkg"; then
+        info "Installing $pkg..."
+        if check_cmd dnf; then
+            dnf install -y "$pkg" &>/dev/null
+        elif check_cmd yum; then
+            yum install -y "$pkg" &>/dev/null
+        elif check_cmd apt-get; then
+            apt-get update -qq &>/dev/null
+            apt-get install -y "$pkg" &>/dev/null
+        else
+            error "Unable to install $pkg: no supported package manager found"
+        fi
+    fi
+}
+
+install_pkg tar
+install_pkg curl
+
+# ==================== 下载 Caddy ====================
 case $(uname -m) in
-    x86_64)
-        caddy_url=https://github.com/zhongtait/caddy-trojan/releases/latest/download/caddy_trojan_linux_amd64.tar.gz
-        ;;
-    aarch64)
-        caddy_url=https://github.com/zhongtait/caddy-trojan/releases/latest/download/caddy_trojan_linux_arm64.tar.gz
-        ;;
-    *) 
-        echo "Error: Your system version does not support"
-        exit 1
-        ;;
+    x86_64)  arch="amd64" ;;
+    aarch64) arch="arm64" ;;
+    *)       error "Unsupported architecture: $(uname -m)" ;;
 esac
 
-curl -L $caddy_url | tar -zx -C /usr/local/bin caddy
+caddy_url="https://github.com/zhongtait/caddy-trojan/releases/latest/download/caddy_trojan_linux_${arch}.tar.gz"
 
-if ! id caddy &>/dev/null; then groupadd --system caddy; useradd --system -g caddy -s "$(command -v nologin)" caddy; fi
+info "Downloading Caddy-Trojan (${arch})..."
+if ! curl -fsSL --connect-timeout 15 --max-time 180 "$caddy_url" | tar -zx -C /usr/local/bin caddy; then
+    error "Failed to download Caddy binary. Check network or try again."
+fi
+chmod +x /usr/local/bin/caddy
+ok "Caddy binary installed: $(/usr/local/bin/caddy version 2>/dev/null | awk '{print $1}' || echo 'unknown')"
 
-mkdir -p /etc/caddy/trojan && chown -R caddy:caddy /etc/caddy && chmod 700 /etc/caddy
+# ==================== 创建用户与目录 ====================
+if ! id caddy &>/dev/null; then
+    groupadd --system caddy
+    useradd --system -g caddy -s "$(command -v nologin)" caddy
+fi
 
-[ "$caddy_domain" != "" ] && nip_domain=$caddy_domain && rm -rf /etc/caddy/certificates
+mkdir -p /etc/caddy/trojan
+chown -R caddy:caddy /etc/caddy
+chmod 700 /etc/caddy
 
+# 使用自定义域名时清除旧证书以重新申请
+[ -n "$caddy_domain" ] && rm -rf /etc/caddy/certificates
+
+# ==================== 伪装页面 ====================
+# 创建简单的伪装页面，比直接返回 503 更隐蔽
+mkdir -p /etc/caddy/www
+cat > /etc/caddy/www/index.html <<'HTMLEOF'
+<!DOCTYPE html>
+<html>
+<head><title>Welcome</title></head>
+<body>
+<h1>It works!</h1>
+<p>This is the default web page for this server.</p>
+</body>
+</html>
+HTMLEOF
+chown -R caddy:caddy /etc/caddy/www
+
+# ==================== 生成 Caddyfile ====================
+# 参考上游 imgk/caddy-trojan 推荐配置
+info "Generating Caddyfile..."
 cat > /etc/caddy/Caddyfile <<EOF
 {
-    order trojan before respond
+    order trojan before file_server
     https_port 443
     servers :443 {
         listener_wrappers {
@@ -71,18 +146,16 @@ cat > /etc/caddy/Caddyfile <<EOF
     }
 }
 :443, $nip_domain {
-    tls $address_ip@nip.io {
-        protocols tls1.2 tls1.2
-        ciphers TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
-    }
+    tls ${address_ip}@nip.io
     log {
         level ERROR
     }
     trojan {
+        connect_method
         websocket
     }
-    respond "Service Unavailable" 503 {
-        close
+    file_server {
+        root /etc/caddy/www
     }
 }
 :80 {
@@ -90,6 +163,8 @@ cat > /etc/caddy/Caddyfile <<EOF
 }
 EOF
 
+# ==================== 生成 Systemd 服务 ====================
+info "Creating systemd service..."
 cat > /etc/systemd/system/caddy.service <<EOF
 [Unit]
 Description=Caddy
@@ -109,102 +184,75 @@ LimitNOFILE=1048576
 LimitNPROC=512
 PrivateTmp=true
 AmbientCapabilities=CAP_NET_BIND_SERVICE
+Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-if ip link show lo | grep -q DOWN; then ip link set lo up; fi
-systemctl daemon-reload && systemctl restart caddy.service && systemctl enable caddy.service
+# ==================== 启动服务 ====================
+# 确保 loopback 接口启用
+if ip link show lo | grep -q DOWN; then
+    ip link set lo up
+fi
 
-curl -X POST -H "Content-Type: application/json" -d "{\"password\": \"$trojan_passwd\"}" http://127.0.0.1:2019/trojan/users/add
-echo "$trojan_passwd" >> /etc/caddy/trojan/passwd.txt && sort /etc/caddy/trojan/passwd.txt | uniq > /etc/caddy/trojan/passwd.tmp && mv -f /etc/caddy/trojan/passwd.tmp /etc/caddy/trojan/passwd.txt
+info "Starting Caddy service..."
+systemctl daemon-reload
+systemctl restart caddy.service
+systemctl enable caddy.service &>/dev/null
 
-echo "Obtaining and Installing an SSL Certificate..."
-count=0
-sslfail=0
-until [ -d /etc/caddy/certificates ]; do
-count=$((count + 1))
-sleep 3
-(( count > 20 )) && sslfail=1 && break
+# 等待 Caddy Admin API 就绪
+info "Waiting for Caddy API..."
+api_ready=0
+for i in $(seq 1 10); do
+    if curl -sf http://127.0.0.1:2019/config/ &>/dev/null; then
+        api_ready=1
+        break
+    fi
+    sleep 1
 done
+[ "$api_ready" = "0" ] && error "Caddy API not responding. Check: journalctl -u caddy --no-pager -n 20"
 
-[ "$sslfail" = "1" ] && { echo "Certificate application failed, please check your server firewall and network settings"; exit 1; }
+# 添加 Trojan 用户
+curl -sf -X POST -H "Content-Type: application/json" \
+    -d "{\"password\": \"$trojan_passwd\"}" \
+    http://127.0.0.1:2019/trojan/users/add || error "Failed to add trojan user via API"
 
-sed -i '/^# End of file/,$d' /etc/security/limits.conf
+# 持久化密码（去重）
+echo "$trojan_passwd" >> /etc/caddy/trojan/passwd.txt
+sort -u /etc/caddy/trojan/passwd.txt -o /etc/caddy/trojan/passwd.txt
+ok "Trojan user added"
 
-cat >> /etc/security/limits.conf <<EOF
-# End of file
-*     soft   nofile    1048576
-*     hard   nofile    1048576
-*     soft   nproc     1048576
-*     hard   nproc     1048576
-*     soft   core      1048576
-*     hard   core      1048576
-*     hard   memlock   unlimited
-*     soft   memlock   unlimited
+# ==================== 等待 SSL 证书 ====================
+info "Obtaining SSL certificate (this may take up to 2 minutes)..."
+count=0
+max_wait=40
+until [ -d /etc/caddy/certificates ]; do
+    count=$((count + 1))
+    if (( count > max_wait )); then
+        error "Certificate application failed after $((max_wait * 3))s.\nPlease check:\n  1. TCP ports 80 and 443 are open\n  2. Domain resolves correctly\n  3. journalctl -u caddy --no-pager -n 30"
+    fi
+    sleep 3
+done
+ok "SSL certificate obtained"
 
-root     soft   nofile    1048576
-root     hard   nofile    1048576
-root     soft   nproc     1048576
-root     hard   nproc     1048576
-root     soft   core      1048576
-root     hard   core      1048576
-root     hard   memlock   unlimited
-root     soft   memlock   unlimited
-EOF
+# ==================== 系统优化（使用独立配置文件） ====================
+info "Applying system optimizations..."
 
-sed -i '/fs.file-max/d' /etc/sysctl.conf
-sed -i '/fs.inotify.max_user_instances/d' /etc/sysctl.conf
-sed -i '/net.core.somaxconn/d' /etc/sysctl.conf
-sed -i '/net.core.netdev_max_backlog/d' /etc/sysctl.conf
-sed -i '/net.core.rmem_max/d' /etc/sysctl.conf
-sed -i '/net.core.wmem_max/d' /etc/sysctl.conf
-sed -i '/net.ipv4.udp_rmem_min/d' /etc/sysctl.conf
-sed -i '/net.ipv4.udp_wmem_min/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_rmem/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_wmem/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_syncookies/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_fin_timeout/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_tw_reuse/d' /etc/sysctl.conf
-sed -i '/net.ipv4.ip_local_port_range/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_max_syn_backlog/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_max_tw_buckets/d' /etc/sysctl.conf
-sed -i '/net.ipv4.route.gc_timeout/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_syn_retries/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_synack_retries/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_timestamps/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_max_orphans/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_no_metrics_save/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_ecn/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_frto/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_mtu_probing/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_rfc1337/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_sack/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_fack/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_window_scaling/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_adv_win_scale/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_moderate_rcvbuf/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_keepalive_time/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_notsent_lowat/d' /etc/sysctl.conf
-sed -i '/net.ipv4.conf.all.route_localnet/d' /etc/sysctl.conf
-sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf
-sed -i '/net.ipv4.conf.all.forwarding/d' /etc/sysctl.conf
-sed -i '/net.ipv4.conf.default.forwarding/d' /etc/sysctl.conf
-sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-
-cat >> /etc/sysctl.conf << EOF
+# 使用 /etc/sysctl.d/ 目录，便于管理和卸载
+cat > /etc/sysctl.d/99-caddy-trojan.conf <<EOF
+# Caddy-Trojan system optimizations
 fs.file-max = 1048576
 fs.inotify.max_user_instances = 8192
 net.core.somaxconn = 32768
 net.core.netdev_max_backlog = 32768
-net.core.rmem_max=33554432
-net.core.wmem_max=33554432
-net.ipv4.udp_rmem_min=8192
-net.ipv4.udp_wmem_min=8192
-net.ipv4.tcp_rmem=4096 87380 33554432
-net.ipv4.tcp_wmem=4096 16384 33554432
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.ipv4.udp_rmem_min = 8192
+net.ipv4.udp_wmem_min = 8192
+net.ipv4.tcp_rmem = 4096 87380 33554432
+net.ipv4.tcp_wmem = 4096 16384 33554432
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_fin_timeout = 30
 net.ipv4.tcp_tw_reuse = 1
@@ -234,17 +282,63 @@ net.ipv4.conf.all.forwarding = 1
 net.ipv4.conf.default.forwarding = 1
 EOF
 
-modprobe tcp_bbr &>/dev/null
-if grep -wq bbr /proc/sys/net/ipv4/tcp_available_congestion_control; then
-echo "net.core.default_qdisc = fq" >>/etc/sysctl.conf
-echo "net.ipv4.tcp_congestion_control = bbr" >>/etc/sysctl.conf
+# BBR 拥塞控制
+modprobe tcp_bbr &>/dev/null || true
+if grep -wq bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+    echo "net.core.default_qdisc = fq" >> /etc/sysctl.d/99-caddy-trojan.conf
+    echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.d/99-caddy-trojan.conf
 fi
 
-sysctl -p
+sysctl --system &>/dev/null
 
-check_http=$(curl -L http://"$nip_domain")
-[ "$check_http" != "Service Unavailable" ] && { echo "You have installed EasyTrojan 2.0,please enable TCP port 80 and 443"; exit 1; }
+# 使用 limits.d 目录，便于管理和卸载
+cat > /etc/security/limits.d/caddy-trojan.conf <<EOF
+# Caddy-Trojan limits optimizations
+*     soft   nofile    1048576
+*     hard   nofile    1048576
+*     soft   nproc     1048576
+*     hard   nproc     1048576
+*     soft   core      1048576
+*     hard   core      1048576
+*     hard   memlock   unlimited
+*     soft   memlock   unlimited
+root  soft   nofile    1048576
+root  hard   nofile    1048576
+root  soft   nproc     1048576
+root  hard   nproc     1048576
+root  soft   core      1048576
+root  hard   core      1048576
+root  hard   memlock   unlimited
+root  soft   memlock   unlimited
+EOF
 
+ok "System optimizations applied (BBR: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 'N/A'))"
+
+# ==================== 验证安装 ====================
+info "Verifying installation..."
+sleep 2
+check_http=$(curl -sL --max-time 10 "https://${nip_domain}" -k 2>/dev/null | head -c 100 || echo "")
+if echo "$check_http" | grep -q "It works"; then
+    ok "HTTPS verification passed"
+else
+    warn "HTTPS check inconclusive. Please ensure TCP ports 80 and 443 are open."
+    warn "Verify by visiting: https://${nip_domain}"
+fi
+
+# ==================== 完成 ====================
 clear
-
-echo "You have successfully installed EasyTrojan 2.0" && echo "Address: $nip_domain | Port: 443 | Password: $trojan_passwd | Alpn: h2,http/1.1"
+echo ""
+echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${GREEN}║         EasyTrojan Installed Successfully!                  ║${NC}"
+echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
+echo -e "${GREEN}║${NC}  Address  : ${CYAN}${nip_domain}${NC}"
+echo -e "${GREEN}║${NC}  Port     : ${CYAN}443${NC}"
+echo -e "${GREEN}║${NC}  Password : ${CYAN}${trojan_passwd}${NC}"
+echo -e "${GREEN}║${NC}  ALPN     : ${CYAN}h2,http/1.1${NC}"
+echo -e "${GREEN}║${NC}  Transport: ${CYAN}websocket${NC}"
+echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
+echo -e "${GREEN}║${NC}  Manage   : systemctl {start|stop|restart|status} caddy"
+echo -e "${GREEN}║${NC}  Logs     : journalctl -u caddy --no-pager -n 50"
+echo -e "${GREEN}║${NC}  Config   : /etc/caddy/Caddyfile"
+echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
+echo ""
