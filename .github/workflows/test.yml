@@ -7,10 +7,13 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   check:
     runs-on: ubuntu-latest
+    outputs:
+      updated: ${{ steps.check.outputs.updated }}
     steps:
       - uses: actions/checkout@v5
 
@@ -52,3 +55,11 @@ jobs:
           git add sha
           git commit -m "chore: update upstream sha to $(cut -c1-7 sha)"
           git push
+
+  # GITHUB_TOKEN pushes do NOT trigger other workflows (GitHub security).
+  # Explicitly call the build workflow when upstream changed.
+  build:
+    needs: check
+    if: needs.check.outputs.updated == 'true'
+    uses: ./.github/workflows/release.yml
+    secrets: inherit
