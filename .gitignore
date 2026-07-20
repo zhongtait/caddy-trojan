@@ -1,2 +1,24 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp
 
-/.idea
+# Local secrets / env
+.env
+.env.*
+!.env.example
+
+# Python leftovers
+__pycache__/
+*.py
+.venv/
+venv/
+
+# Local build artifacts
+output/
+*.tar.gz
+caddy
+
+# Local drafts
+*.draft.md
