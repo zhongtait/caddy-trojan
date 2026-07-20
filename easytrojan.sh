@@ -572,6 +572,7 @@ generate_caddyfile() {
     mkdir -p "$CADDY_DIR" "$WWW_DIR" "$TROJAN_DIR"
     local users_block tls_line
     users_block=$(build_users_directive)
+    # NOTE: $(...) strips trailing newlines; keep ${tls_line} on its own line in the heredoc.
     tls_line=$(tls_directive_line "$site_domain")
 
     cat > "$CADDYFILE" <<EOF
@@ -594,7 +595,8 @@ generate_caddyfile() {
 ${users_block}    }
 }
 :443, ${site_domain} {
-${tls_line}    log {
+${tls_line}
+    log {
         level ERROR
     }
     trojan {
