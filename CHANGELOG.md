@@ -10,6 +10,8 @@
 
 ### Fixed
 
+- GitHub Actions 构建 Go 版本从 1.23.x 升到 1.25.x（Caddy v2.11.4 要求 go >= 1.25.1）。
+- Check Upstream 在检测到更新后通过 workflow_call 直接触发 Build（规避 GITHUB_TOKEN push 不触发其他 workflow 的限制）。
 - 修正实现计划中“删除 API 不存在/重启必丢用户”等不准确表述对应的实现路径。
 
 
