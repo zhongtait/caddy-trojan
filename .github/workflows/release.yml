@@ -13,6 +13,7 @@ jobs:
   build-caddy-trojan:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: linux
@@ -30,39 +31,28 @@ jobs:
         with:
           go-version: '1.23.x'
           cache: true
-          cache-dependency-path: '**/go.sum'
 
       - name: Install Xcaddy
         run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 
       - name: Build Caddy-Trojan
-        id: build
         env:
           GOOS: ${{ matrix.os }}
           GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
         run: |
           mkdir -p output
           cd output
           xcaddy build --with github.com/imgk/caddy-trojan
-
-          # 获取版本号（仅在本机架构时可执行）
-          if [ "${{ matrix.goarch }}" = "amd64" ]; then
-            VERSION=$(./caddy version | awk '{print $1}')
-          else
-            VERSION="latest"
-          fi
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-
-          # 打包
           FILENAME="caddy_trojan_${{ matrix.os }}_${{ matrix.arch }}.tar.gz"
           tar -czvf "../${FILENAME}" caddy
-          echo "filename=${FILENAME}" >> $GITHUB_OUTPUT
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
           name: caddy_trojan_${{ matrix.os }}_${{ matrix.arch }}
           path: caddy_trojan_${{ matrix.os }}_${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
 
   release:
     needs: build-caddy-trojan
@@ -76,24 +66,37 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Get Caddy version
-        id: version
+      - name: Prepare checksums and tag
+        id: meta
         run: |
-          # 解压 amd64 版本获取版本号
+          set -euo pipefail
           tar -xzf artifacts/caddy_trojan_linux_amd64.tar.gz -C /tmp
           VERSION=$(/tmp/caddy version | awk '{print $1}')
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          SHORT_SHA=$(cut -c1-7 sha)
+          TAG="${VERSION}+trojan.${SHORT_SHA}"
+          (
+            cd artifacts
+            sha256sum *.tar.gz > SHA256SUMS
+          )
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "sha=$(cat sha)" >> "$GITHUB_OUTPUT"
+          cat artifacts/SHA256SUMS
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           body: |
-            Caddy-Trojan ${{ steps.version.outputs.version }}
-            
-            Built with [imgk/caddy-trojan](https://github.com/imgk/caddy-trojan) plugin.
-          tag_name: ${{ steps.version.outputs.version }}
+            Caddy-Trojan ${{ steps.meta.outputs.version }}
+
+            - Upstream plugin SHA: `${{ steps.meta.outputs.sha }}`
+            - Built with [imgk/caddy-trojan](https://github.com/imgk/caddy-trojan)
+            - Verify downloads with `SHA256SUMS`
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.tag }}
           draft: false
           prerelease: false
-          files: artifacts/*.tar.gz
+          files: |
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS
+          fail_on_unmatched_files: true

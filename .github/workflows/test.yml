@@ -19,8 +19,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 使用 token 避免 API 限流
-          REMOTE_SHA=$(curl -sf -H "Authorization: token $GITHUB_TOKEN" \
+          set -euo pipefail
+          REMOTE_SHA=$(curl -sf \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
             -H "User-Agent: Caddy-Trojan-CI" \
             "https://api.github.com/repos/imgk/caddy-trojan/commits?per_page=1" \
             | jq -r '.[0].sha')
@@ -33,19 +35,20 @@ jobs:
           LOCAL_SHA=$(cat sha 2>/dev/null || echo "")
 
           if [ "$REMOTE_SHA" != "$LOCAL_SHA" ]; then
-            echo "$REMOTE_SHA" > sha
-            echo "updated=true" >> $GITHUB_OUTPUT
-            echo "Upstream updated: $LOCAL_SHA -> $REMOTE_SHA"
+            printf '%s\n' "$REMOTE_SHA" > sha
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+            echo "Upstream updated: ${LOCAL_SHA:-none} -> ${REMOTE_SHA}"
           else
-            echo "updated=false" >> $GITHUB_OUTPUT
+            echo "updated=false" >> "$GITHUB_OUTPUT"
             echo "No changes detected"
           fi
 
       - name: Commit and Push
         if: steps.check.outputs.updated == 'true'
         run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
+          set -euo pipefail
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
           git add sha
-          git commit -m "chore: update upstream sha to $(cat sha | head -c 7)"
+          git commit -m "chore: update upstream sha to $(cut -c1-7 sha)"
           git push
