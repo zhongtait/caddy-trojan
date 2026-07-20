@@ -87,6 +87,13 @@ sha256sum -c SHA256SUMS
 - 如果仓库启用了 GitHub Security Advisories，请优先使用私密安全报告。
 - 如果没有启用，请通过维护者提供的私密联系方式报告。
 - 报告中建议包含影响范围、复现步骤、相关日志和修复建议。
+
+## TLS 证书材料
+
+- **auto**：证书与 ACME 账户材料位于 `/etc/caddy/certificates` 与 `/etc/caddy/acme`，属主应为 `caddy`，目录权限宜收紧。
+- **origin**：私钥位于 `/etc/caddy/certs/origin.key`（600）。请勿把 Origin 私钥提交到公开仓库或聊天记录。
+- 卸载脚本会删除整个 `/etc/caddy`（含证书与 `trojan/` 状态文件）。
+
 ## 第三方伪装站
 
 默认伪装站使用 [CorentinTh/it-tools](https://github.com/CorentinTh/it-tools) 的 release 静态资源（GPL-3.0）。安装时会从 GitHub 下载 zip 并解压到 `/etc/caddy/www`。请遵守其许可证与上游安全公告。

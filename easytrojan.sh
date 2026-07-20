@@ -5,9 +5,12 @@
 #
 # Usage:
 #   bash easytrojan.sh install --domain DOMAIN [--password PASS] [--version VER] [--skip-domain-check]
+#                            [--tls-mode auto|origin] [--origin-cert PATH] [--origin-key PATH]
 #   bash easytrojan.sh update  [--version VER]
 #   bash easytrojan.sh renew [--force]
-#   bash easytrojan.sh status [--show-link]
+#   bash easytrojan.sh status [--show-link] [--server ADDR]
+#   bash easytrojan.sh link [--server ADDR] [--password PASS]
+#   bash easytrojan.sh cert {auto|origin|status} ...
 #   bash easytrojan.sh user {add|list|del} ...
 #   bash easytrojan.sh <password> <domain>   # legacy
 #
@@ -27,6 +30,12 @@ CADDY_DIR="/etc/caddy"
 TROJAN_DIR="${CADDY_DIR}/trojan"
 PASSWD_FILE="${TROJAN_DIR}/passwd.txt"
 DOMAIN_FILE="${TROJAN_DIR}/domain.txt"
+TLS_MODE_FILE="${TROJAN_DIR}/tls-mode.txt"
+TLS_CERT_FILE_REC="${TROJAN_DIR}/tls-cert.path"
+TLS_KEY_FILE_REC="${TROJAN_DIR}/tls-key.path"
+ORIGIN_CERT_DIR="${CADDY_DIR}/certs"
+ORIGIN_CERT_DEFAULT="${ORIGIN_CERT_DIR}/origin.crt"
+ORIGIN_KEY_DEFAULT="${ORIGIN_CERT_DIR}/origin.key"
 CADDYFILE="${CADDY_DIR}/Caddyfile"
 WWW_DIR="${CADDY_DIR}/www"
 ADMIN_API="http://127.0.0.1:2019"
@@ -54,9 +63,14 @@ EasyTrojan - One-click Caddy-Trojan installer
 
 Usage:
   bash easytrojan.sh install --domain DOMAIN [--password PASSWORD] [--version VERSION] [--skip-domain-check]
+                             [--tls-mode auto|origin] [--origin-cert PATH] [--origin-key PATH]
   bash easytrojan.sh update  [--version VERSION]
   bash easytrojan.sh renew [--force]
-  bash easytrojan.sh status [--show-link]
+  bash easytrojan.sh status [--show-link] [--server ADDR]
+  bash easytrojan.sh link [--server ADDR] [--password PASSWORD]
+  bash easytrojan.sh cert auto
+  bash easytrojan.sh cert origin --cert PATH --key PATH
+  bash easytrojan.sh cert status
   bash easytrojan.sh user add [--password PASSWORD]
   bash easytrojan.sh user list
   bash easytrojan.sh user del --password PASSWORD
@@ -68,9 +82,14 @@ Legacy:
 Examples:
   bash easytrojan.sh install --domain example.com
   bash easytrojan.sh install --domain example.com --password 'strong_password'
+  bash easytrojan.sh install --domain example.com --tls-mode origin \
+       --origin-cert /root/origin.pem --origin-key /root/origin.key --skip-domain-check
+  bash easytrojan.sh cert origin --cert /root/origin.pem --key /root/origin.key
   bash easytrojan.sh update --version v2.11.3+trojan.932ef9b
   bash easytrojan.sh status
   bash easytrojan.sh status --show-link
+  bash easytrojan.sh status --show-link --server 104.16.1.1
+  bash easytrojan.sh link --server 104.16.1.1
   bash easytrojan.sh user add
   bash easytrojan.sh user list
 
@@ -79,6 +98,9 @@ Notes:
   - Domain A record must point to this server before install
   - Open TCP 80 and 443 (security group / firewall) before install
   - status does not print share links by default (use --show-link)
+  - --server ADDR: share-link address for Cloudflare preferred IP (SNI/Host still use domain)
+  - --tls-mode auto: Caddy ACME (default). origin: Cloudflare Origin / file certs
+  - Reinstall without --tls-mode keeps previous TLS mode; origin reuses /etc/caddy/certs if present
   - Camouflage site defaults to CorentinTh/it-tools (override: IT_TOOLS_VERSION=...)
 EOF
 }
@@ -204,6 +226,21 @@ parse_common_args() {
                 skip_domain_check="1"
                 shift
                 ;;
+            --tls-mode)
+                [ -n "${2:-}" ] || error "--tls-mode requires auto or origin"
+                tls_mode="$2"
+                shift 2
+                ;;
+            --origin-cert)
+                [ -n "${2:-}" ] || error "--origin-cert requires a path"
+                origin_cert_src="$2"
+                shift 2
+                ;;
+            --origin-key)
+                [ -n "${2:-}" ] || error "--origin-key requires a path"
+                origin_key_src="$2"
+                shift 2
+                ;;
             -h|--help)
                 usage
                 exit 0
@@ -283,16 +320,111 @@ read_installed_domain() {
     return 1
 }
 
+
+read_tls_mode() {
+    if [ -f "$TLS_MODE_FILE" ]; then
+        tr -d '[:space:]' < "$TLS_MODE_FILE" | tr '[:upper:]' '[:lower:]'
+    else
+        printf 'auto'
+    fi
+}
+
+read_tls_cert_path() {
+    if [ -f "$TLS_CERT_FILE_REC" ]; then
+        tr -d '\r\n' < "$TLS_CERT_FILE_REC"
+    else
+        printf '%s' "$ORIGIN_CERT_DEFAULT"
+    fi
+}
+
+read_tls_key_path() {
+    if [ -f "$TLS_KEY_FILE_REC" ]; then
+        tr -d '\r\n' < "$TLS_KEY_FILE_REC"
+    else
+        printf '%s' "$ORIGIN_KEY_DEFAULT"
+    fi
+}
+
+normalize_tls_mode() {
+    local m
+    m=$(printf '%s' "${1:-auto}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    case "$m" in
+        auto|acme|le|letsencrypt) printf 'auto' ;;
+        origin|cf|cloudflare|file) printf 'origin' ;;
+        *) error "Invalid tls mode: $1 (use auto or origin)" ;;
+    esac
+}
+
+persist_tls_config() {
+    local mode="$1" cert_path="${2:-}" key_path="${3:-}"
+    mkdir -p "$TROJAN_DIR"
+    chmod 700 "$TROJAN_DIR"
+    printf '%s\n' "$mode" > "$TLS_MODE_FILE"
+    chown caddy:caddy "$TLS_MODE_FILE" 2>/dev/null || true
+    chmod 600 "$TLS_MODE_FILE"
+    if [ "$mode" = "origin" ]; then
+        printf '%s\n' "$cert_path" > "$TLS_CERT_FILE_REC"
+        printf '%s\n' "$key_path" > "$TLS_KEY_FILE_REC"
+        chown caddy:caddy "$TLS_CERT_FILE_REC" "$TLS_KEY_FILE_REC" 2>/dev/null || true
+        chmod 600 "$TLS_CERT_FILE_REC" "$TLS_KEY_FILE_REC"
+    else
+        rm -f "$TLS_CERT_FILE_REC" "$TLS_KEY_FILE_REC"
+    fi
+}
+
+# Install origin cert/key into /etc/caddy/certs (or keep absolute paths if already under CADDY_DIR)
+install_origin_material() {
+    local src_cert="$1" src_key="$2"
+    [ -n "$src_cert" ] && [ -f "$src_cert" ] || error "Origin certificate not found: ${src_cert:-<empty>}"
+    [ -n "$src_key" ] && [ -f "$src_key" ] || error "Origin private key not found: ${src_key:-<empty>}"
+
+    mkdir -p "$ORIGIN_CERT_DIR"
+    cp -f "$src_cert" "$ORIGIN_CERT_DEFAULT"
+    cp -f "$src_key" "$ORIGIN_KEY_DEFAULT"
+    chown caddy:caddy "$ORIGIN_CERT_DEFAULT" "$ORIGIN_KEY_DEFAULT"
+    chmod 600 "$ORIGIN_CERT_DEFAULT" "$ORIGIN_KEY_DEFAULT"
+    chmod 700 "$ORIGIN_CERT_DIR"
+    chown caddy:caddy "$ORIGIN_CERT_DIR"
+
+    if check_cmd openssl; then
+        openssl x509 -in "$ORIGIN_CERT_DEFAULT" -noout -subject >/dev/null 2>&1             || error "Invalid certificate file: $ORIGIN_CERT_DEFAULT"
+        if ! openssl pkey -in "$ORIGIN_KEY_DEFAULT" -check -noout >/dev/null 2>&1             && ! openssl rsa -in "$ORIGIN_KEY_DEFAULT" -check -noout >/dev/null 2>&1; then
+            warn "Could not fully validate private key format (continuing)"
+        fi
+    fi
+    ok "Origin certificate installed at $ORIGIN_CERT_DEFAULT"
+}
+
+tls_directive_line() {
+    local mode cert_path key_path site_domain="$1"
+    mode=$(read_tls_mode)
+    if [ "$mode" = "origin" ]; then
+        cert_path=$(read_tls_cert_path)
+        key_path=$(read_tls_key_path)
+        [ -f "$cert_path" ] || error "TLS origin cert missing: $cert_path (run: easytrojan cert origin --cert ... --key ...)"
+        [ -f "$key_path" ] || error "TLS origin key missing: $key_path"
+        printf '    tls %s %s\n' "$cert_path" "$key_path"
+    else
+        printf '    tls admin@%s\n' "$site_domain"
+    fi
+}
+
+# Build trojan share URI.
+# $1 domain (SNI/Host/remark), $2 password, $3 transport ws|tcp,
+# $4 optional connect address (Cloudflare preferred IP/host). Defaults to domain.
 build_share_link() {
-    local domain="$1" passwd="$2" transport="${3:-ws}"
-    local encoded
+    local domain="$1" passwd="$2" transport="${3:-ws}" server="${4:-}"
+    local encoded addr
     encoded=$(urlencode "$passwd")
+    addr="${server:-$domain}"
+    [ -n "$addr" ] || error "Share link needs domain or --server address"
     if [ "$transport" = "ws" ]; then
+        # Address may be CF anycast IP; SNI + WS Host must remain the real domain.
         printf 'trojan://%s@%s:443?security=tls&sni=%s&type=ws&host=%s&path=%%2F#%s' \
-            "$encoded" "$domain" "$domain" "$domain" "$domain"
+            "$encoded" "$addr" "$domain" "$domain" "$domain"
     else
         printf 'trojan://%s@%s:443?security=tls&sni=%s&type=tcp#%s' \
-            "$encoded" "$domain" "$domain" "$domain"
+            "$encoded" "$addr" "$domain" "$domain"
     fi
 }
 
@@ -438,8 +570,9 @@ generate_caddyfile() {
     fi
     [ -n "$site_domain" ] || error "Domain not set; cannot generate Caddyfile"
     mkdir -p "$CADDY_DIR" "$WWW_DIR" "$TROJAN_DIR"
-    local users_block
+    local users_block tls_line
     users_block=$(build_users_directive)
+    tls_line=$(tls_directive_line "$site_domain")
 
     cat > "$CADDYFILE" <<EOF
 {
@@ -461,8 +594,7 @@ generate_caddyfile() {
 ${users_block}    }
 }
 :443, ${site_domain} {
-    tls admin@${site_domain}
-    log {
+${tls_line}    log {
         level ERROR
     }
     trojan {
@@ -898,8 +1030,7 @@ ensure_cert_storage() {
 setup_renew_timer() {
     info "Setting up certificate renewal timer..."
 
-    # Safety net around Caddy built-in ACME renewer:
-    # keep storage writable, reload daily, restart if cert near expiry.
+    # Safety net for ACME mode; origin/file certs only log remaining validity.
     cat > /usr/local/bin/caddy-cert-maintain <<'EOF'
 #!/bin/bash
 set -uo pipefail
@@ -907,9 +1038,18 @@ export XDG_CONFIG_HOME=/etc
 export XDG_DATA_HOME=/etc
 export HOME=/var/lib/caddy
 
+TLS_MODE_FILE=/etc/caddy/trojan/tls-mode.txt
+TLS_CERT_REC=/etc/caddy/trojan/tls-cert.path
+ORIGIN_CERT=/etc/caddy/certs/origin.crt
+
 mkdir -p /etc/caddy/certificates /etc/caddy/acme /var/lib/caddy
 chown -R caddy:caddy /etc/caddy /var/lib/caddy 2>/dev/null || true
 find /etc/caddy -type d -exec chmod 700 {} \; 2>/dev/null || true
+
+mode=auto
+if [ -f "$TLS_MODE_FILE" ]; then
+  mode=$(tr -d '[:space:]' < "$TLS_MODE_FILE" | tr '[:upper:]' '[:lower:]')
+fi
 
 if ! systemctl is-active --quiet caddy; then
   systemctl start caddy || true
@@ -918,6 +1058,25 @@ fi
 
 if systemctl is-active --quiet caddy; then
   /usr/local/bin/caddy reload --config /etc/caddy/Caddyfile --force 2>/dev/null || true
+fi
+
+if [ "$mode" = "origin" ]; then
+  CERT_FILE=""
+  if [ -f "$TLS_CERT_REC" ]; then
+    CERT_FILE=$(tr -d '\r\n' < "$TLS_CERT_REC")
+  fi
+  [ -n "$CERT_FILE" ] && [ -f "$CERT_FILE" ] || CERT_FILE="$ORIGIN_CERT"
+  if [ -f "$CERT_FILE" ] && command -v openssl >/dev/null 2>&1; then
+    END_RAW=$(openssl x509 -enddate -noout -in "$CERT_FILE" 2>/dev/null | cut -d= -f2 || true)
+    if ! openssl x509 -checkend $((30 * 86400)) -noout -in "$CERT_FILE" 2>/dev/null; then
+      logger -t caddy-cert-maintain "origin cert near expiry (${END_RAW:-unknown}); replace with: easytrojan cert origin --cert PATH --key PATH"
+    else
+      logger -t caddy-cert-maintain "origin cert ok; expires ${END_RAW:-unknown}"
+    fi
+  else
+    logger -t caddy-cert-maintain "origin mode but cert file missing"
+  fi
+  exit 0
 fi
 
 CERT_FILE=$(find /etc/caddy/certificates -name '*.crt' -type f 2>/dev/null | head -1 || true)
@@ -1058,11 +1217,34 @@ do_renew() {
     done
 
     systemctl is-active --quiet caddy 2>/dev/null || error "Caddy service is not running"
-    ensure_cert_storage
     # Keep daily maintenance timer present on older installs
     if [ ! -f /etc/systemd/system/caddy-renew.timer ] || [ ! -x /usr/local/bin/caddy-cert-maintain ]; then
         setup_renew_timer
     fi
+
+    if [ "$(read_tls_mode)" = "origin" ]; then
+        local cert_file key_file expiry
+        cert_file=$(read_tls_cert_path)
+        key_file=$(read_tls_key_path)
+        [ -f "$cert_file" ] || error "Origin cert missing: $cert_file (easytrojan cert origin --cert PATH --key PATH)"
+        [ -f "$key_file" ] || error "Origin key missing: $key_file"
+        if [ "$force_reissue" = "1" ]; then
+            error "renew --force applies to ACME mode only. For origin certs use: easytrojan cert origin --cert PATH --key PATH"
+        fi
+        info "TLS mode is origin (file cert); no ACME renewal"
+        if check_cmd openssl; then
+            expiry=$(openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | cut -d= -f2 || true)
+            ok "Origin certificate present (expires: ${expiry:-unknown})"
+            if ! openssl x509 -checkend $((30 * 86400)) -noout -in "$cert_file" 2>/dev/null; then
+                warn "Origin cert expires within 30 days; re-issue in Cloudflare and run cert origin"
+            fi
+        else
+            ok "Origin certificate present: $cert_file"
+        fi
+        exit 0
+    fi
+
+    ensure_cert_storage
 
     if [ "$force_reissue" = "1" ]; then
         warn "Force re-issue: deleting existing certificate material"
@@ -1102,11 +1284,26 @@ do_renew() {
 }
 
 do_status() {
-    local show_link=0
+    local show_link=0 server_addr=""
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --show-link|--link) show_link=1; shift ;;
-            -h|--help) echo "Usage: easytrojan status [--show-link]"; exit 0 ;;
+            --server|--addr|--address)
+                [ -n "${2:-}" ] || error "--server requires an address (IP or hostname)"
+                server_addr="$2"
+                show_link=1
+                shift 2
+                ;;
+            -h|--help)
+                cat <<'EOF'
+Usage: easytrojan status [--show-link] [--server ADDR]
+
+  --show-link       Print trojan share links (passwords in URL)
+  --server ADDR     Connect address for share links (e.g. Cloudflare preferred IP).
+                    SNI and WS Host stay as the installed domain.
+EOF
+                exit 0
+                ;;
             *) error "Unknown status argument: $1" ;;
         esac
     done
@@ -1130,19 +1327,36 @@ do_status() {
     local domain=""
     domain=$(read_installed_domain 2>/dev/null || true)
     [ -n "$domain" ] && echo -e "  Domain : ${CYAN}${domain}${NC}"
+    echo -e "  TLS    : ${CYAN}$(read_tls_mode)${NC}"
 
-    local cert_dir="${CADDY_DIR}/certificates"
-    if [ -d "$cert_dir" ]; then
-        local cert_file expiry
-        cert_file=$(find "$cert_dir" -name "*.crt" -type f 2>/dev/null | head -1)
-        if [ -n "$cert_file" ] && check_cmd openssl; then
-            expiry=$(openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | cut -d= -f2)
-            echo -e "  Cert   : expires $expiry"
+    local cert_file="" expiry=""
+    if [ "$(read_tls_mode)" = "origin" ]; then
+        cert_file=$(read_tls_cert_path)
+        if [ -f "$cert_file" ]; then
+            if check_cmd openssl; then
+                expiry=$(openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | cut -d= -f2)
+                echo -e "  Cert   : origin file, expires ${expiry:-unknown}"
+            else
+                echo -e "  Cert   : ${GREEN}origin file present${NC}"
+            fi
         else
-            echo -e "  Cert   : ${GREEN}present${NC}"
+            echo -e "  Cert   : ${RED}origin file missing${NC}"
         fi
     else
-        echo -e "  Cert   : ${RED}not found${NC}"
+        local cert_dir="${CADDY_DIR}/certificates"
+        if [ -d "$cert_dir" ]; then
+            cert_file=$(find "$cert_dir" -name "*.crt" -type f 2>/dev/null | head -1)
+            if [ -n "$cert_file" ] && check_cmd openssl; then
+                expiry=$(openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | cut -d= -f2)
+                echo -e "  Cert   : ACME, expires $expiry"
+            elif [ -n "$cert_file" ]; then
+                echo -e "  Cert   : ${GREEN}present${NC}"
+            else
+                echo -e "  Cert   : ${RED}not found${NC}"
+            fi
+        else
+            echo -e "  Cert   : ${RED}not found${NC}"
+        fi
     fi
 
     if systemctl list-timers --all 2>/dev/null | grep -q caddy-renew.timer; then
@@ -1155,18 +1369,174 @@ do_status() {
 
     if [ "$show_link" = "1" ] && [ -f "$PASSWD_FILE" ] && [ -n "$domain" ]; then
         local passwd transport="ws"
-        passwd=$(head -1 "$PASSWD_FILE")
         if [ -f "$CADDYFILE" ] && ! grep -q "websocket" "$CADDYFILE" 2>/dev/null; then
             transport="tcp"
         fi
-        if [ -n "$passwd" ]; then
-            echo -e "  Link   : ${CYAN}$(build_share_link "$domain" "$passwd" "$transport")${NC}"
+        if [ -n "$server_addr" ]; then
+            echo -e "  Server : ${CYAN}${server_addr}${NC}  (SNI/Host: ${domain})"
+        fi
+        while IFS= read -r passwd || [ -n "$passwd" ]; do
+            [ -n "$passwd" ] || continue
+            echo -e "  Link   : ${CYAN}$(build_share_link "$domain" "$passwd" "$transport" "$server_addr")${NC}"
+        done < "$PASSWD_FILE"
+        if [ -n "$server_addr" ]; then
+            echo -e "  Tip    : Client address=${server_addr}, SNI/Host=${domain}, WS path=/"
         fi
     elif [ -f "$PASSWD_FILE" ] && [ -n "$domain" ]; then
-        echo -e "  Link   : ${YELLOW}hidden${NC} (use: easytrojan status --show-link)"
+        echo -e "  Link   : ${YELLOW}hidden${NC} (use: easytrojan status --show-link [--server CF_IP])"
     fi
     echo ""
     exit 0
+}
+
+do_link() {
+    local server_addr="" pass_filter=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --server|--addr|--address)
+                [ -n "${2:-}" ] || error "--server requires an address (IP or hostname)"
+                server_addr="$2"
+                shift 2
+                ;;
+            --password)
+                [ -n "${2:-}" ] || error "--password requires a value"
+                pass_filter="$2"
+                shift 2
+                ;;
+            -h|--help)
+                cat <<'EOF'
+Usage: easytrojan link [--server ADDR] [--password PASSWORD]
+
+Print trojan share links for installed users.
+  --server ADDR   Use ADDR as connect host (Cloudflare preferred IP).
+                  SNI and WS Host remain the installed domain.
+  --password PASS Only print link for this password.
+EOF
+                exit 0
+                ;;
+            *) error "Unknown argument: $1" ;;
+        esac
+    done
+
+    local domain transport="ws" passwd
+    domain=$(read_installed_domain 2>/dev/null || true)
+    [ -n "$domain" ] || error "Domain not found. Install first: easytrojan install --domain example.com"
+    [ -f "$PASSWD_FILE" ] || error "No passwords in $PASSWD_FILE"
+    if [ -f "$CADDYFILE" ] && ! grep -q "websocket" "$CADDYFILE" 2>/dev/null; then
+        transport="tcp"
+    fi
+
+    local found=0
+    while IFS= read -r passwd || [ -n "$passwd" ]; do
+        [ -n "$passwd" ] || continue
+        if [ -n "$pass_filter" ] && [ "$passwd" != "$pass_filter" ]; then
+            continue
+        fi
+        found=1
+        build_share_link "$domain" "$passwd" "$transport" "$server_addr"
+        printf '\n'
+    done < "$PASSWD_FILE"
+    [ "$found" -eq 1 ] || error "No matching password in passwd.txt"
+    if [ -n "$server_addr" ]; then
+        echo -e "${YELLOW}# address=${server_addr}  sni/host=${domain}  path=/${NC}" >&2
+    fi
+    exit 0
+}
+
+do_cert() {
+    require_root
+    local sub="${1:-}"
+    [ -n "$sub" ] || error "Usage: easytrojan cert {auto|origin|status}"
+    shift || true
+
+    case "$sub" in
+        status|show)
+            local mode cert key domain
+            mode=$(read_tls_mode)
+            domain=$(read_installed_domain 2>/dev/null || true)
+            echo ""
+            echo -e "  TLS mode : ${CYAN}${mode}${NC}"
+            [ -n "$domain" ] && echo -e "  Domain   : ${CYAN}${domain}${NC}"
+            if [ "$mode" = "origin" ]; then
+                cert=$(read_tls_cert_path)
+                key=$(read_tls_key_path)
+                echo -e "  Cert file: ${cert}"
+                echo -e "  Key file : ${key}"
+                if [ -f "$cert" ] && check_cmd openssl; then
+                    echo -e "  Subject  : $(openssl x509 -in "$cert" -noout -subject 2>/dev/null | sed 's/^subject=//')"
+                    echo -e "  Expires  : $(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | cut -d= -f2)"
+                fi
+            else
+                echo -e "  Issuer   : Caddy ACME (Let's Encrypt / ZeroSSL etc.)"
+            fi
+            echo ""
+            exit 0
+            ;;
+        auto|acme)
+            local domain
+            domain=$(read_installed_domain 2>/dev/null || true)
+            [ -n "$domain" ] || error "Domain not found; install first"
+            persist_tls_config "auto"
+            ensure_cert_storage
+            generate_caddyfile "$domain"
+            setup_renew_timer
+            if systemctl is-active --quiet caddy 2>/dev/null; then
+                # restart so ACME manager picks clean tls directive immediately
+                systemctl restart caddy.service
+                wait_for_admin_api || warn "Caddy Admin API not ready after restart"
+            fi
+            ok "TLS mode set to auto (Caddy ACME). Ensure ports 80/443 and DNS allow issuance."
+            info "Check progress with: easytrojan status / journalctl -u caddy -n 30"
+            exit 0
+            ;;
+        origin|cf)
+            local cert_src="" key_src="" domain
+            while [ "$#" -gt 0 ]; do
+                case "$1" in
+                    --cert|--origin-cert)
+                        [ -n "${2:-}" ] || error "--cert requires a path"
+                        cert_src="$2"; shift 2 ;;
+                    --key|--origin-key)
+                        [ -n "${2:-}" ] || error "--key requires a path"
+                        key_src="$2"; shift 2 ;;
+                    -h|--help)
+                        echo "Usage: easytrojan cert origin --cert PATH --key PATH"
+                        exit 0 ;;
+                    *) error "Unknown argument: $1" ;;
+                esac
+            done
+            [ -n "$cert_src" ] || error "Missing --cert PATH"
+            [ -n "$key_src" ] || error "Missing --key PATH"
+            domain=$(read_installed_domain 2>/dev/null || true)
+            [ -n "$domain" ] || error "Domain not found; install first"
+            install_origin_material "$cert_src" "$key_src"
+            persist_tls_config "origin" "$ORIGIN_CERT_DEFAULT" "$ORIGIN_KEY_DEFAULT"
+            generate_caddyfile "$domain"
+            setup_renew_timer
+            if systemctl is-active --quiet caddy 2>/dev/null; then
+                reload_caddy
+            fi
+            ok "TLS mode set to origin (file cert). Cloudflare SSL should be Full (strict)."
+            exit 0
+            ;;
+        -h|--help|help)
+            cat <<'EOF'
+Usage:
+  easytrojan cert status
+  easytrojan cert auto
+  easytrojan cert origin --cert PATH --key PATH
+
+TLS modes:
+  auto    Caddy automatic HTTPS (ACME). Best for direct / DNS-only.
+  origin  Cloudflare Origin Certificate or any cert/key files.
+          Recommended for long-term Cloudflare orange-cloud proxy.
+EOF
+            exit 0
+            ;;
+        *)
+            error "Unknown cert subcommand: $sub (auto|origin|status)"
+            ;;
+    esac
 }
 
 do_user() {
@@ -1371,6 +1741,31 @@ do_install() {
 
     write_camouflage_site
 
+    # TLS mode: auto (ACME) or origin (Cloudflare Origin / file certs).
+    # If --tls-mode omitted on reinstall, keep previous mode from tls-mode.txt.
+    if [ -n "${tls_mode:-}" ]; then
+        tls_mode=$(normalize_tls_mode "$tls_mode")
+    else
+        tls_mode=$(normalize_tls_mode "$(read_tls_mode)")
+        info "TLS mode not specified; using saved/default: $tls_mode"
+    fi
+    if [ "$tls_mode" = "origin" ]; then
+        if [ -n "${origin_cert_src:-}" ] || [ -n "${origin_key_src:-}" ]; then
+            [ -n "${origin_cert_src:-}" ] || error "origin mode requires --origin-cert PATH"
+            [ -n "${origin_key_src:-}" ] || error "origin mode requires --origin-key PATH"
+            install_origin_material "$origin_cert_src" "$origin_key_src"
+        else
+            # Reinstall without new files: require existing material
+            [ -f "$ORIGIN_CERT_DEFAULT" ] && [ -f "$ORIGIN_KEY_DEFAULT" ]                 || error "origin mode needs --origin-cert/--origin-key (or existing $ORIGIN_CERT_DEFAULT)"
+            ok "Reusing existing origin certificate at $ORIGIN_CERT_DEFAULT"
+        fi
+        persist_tls_config "origin" "$ORIGIN_CERT_DEFAULT" "$ORIGIN_KEY_DEFAULT"
+        info "TLS mode: origin (file certificate)"
+    else
+        persist_tls_config "auto"
+        info "TLS mode: auto (Caddy ACME)"
+    fi
+
     # Source of truth: passwd.txt -> Caddyfile static users (imgk style)
     persist_password "$trojan_passwd"
     info "Generating Caddyfile..."
@@ -1419,27 +1814,34 @@ EOF
     assert_admin_local_only
     ok "Trojan users loaded from Caddyfile (passwd.txt)"
 
-    info "Obtaining SSL certificate (this may take up to 2 minutes)..."
-    local count=0 max_wait=40
-    until find "${CADDY_DIR}/certificates" -name '*.crt' -type f 2>/dev/null | grep -q .; do
-        count=$((count + 1))
-        if [ "$count" -gt "$max_wait" ]; then
-            if [ -n "$cert_backup" ] && [ -d "${cert_backup}/certificates" ]; then
-                warn "New certificate request failed. Restoring from backup..."
-                cp -a "${cert_backup}/certificates" "${CADDY_DIR}/" 2>/dev/null || true
-                cp -a "${cert_backup}/acme" "${CADDY_DIR}/" 2>/dev/null || true
-                chown -R caddy:caddy "$CADDY_DIR"
-                systemctl restart caddy.service
-                ok "Certificates restored from backup"
-            else
-                error "Certificate application failed after $((max_wait * 3))s.\nPlease check:\n  1. TCP ports 80 and 443 are open\n  2. Domain A record points to this server\n  3. journalctl -u caddy --no-pager -n 30"
-            fi
-            break
+    if [ "$(read_tls_mode)" = "origin" ]; then
+        ok "Using origin/file certificate (skip ACME wait)"
+        if check_cmd openssl && [ -f "$(read_tls_cert_path)" ]; then
+            info "Origin cert expires: $(openssl x509 -enddate -noout -in "$(read_tls_cert_path)" 2>/dev/null | cut -d= -f2 || echo unknown)"
         fi
-        sleep 3
-    done
-    if find "${CADDY_DIR}/certificates" -name '*.crt' -type f 2>/dev/null | grep -q .; then
-        ok "SSL certificate ready"
+    else
+        info "Obtaining SSL certificate (this may take up to 2 minutes)..."
+        local count=0 max_wait=40
+        until find "${CADDY_DIR}/certificates" -name '*.crt' -type f 2>/dev/null | grep -q .; do
+            count=$((count + 1))
+            if [ "$count" -gt "$max_wait" ]; then
+                if [ -n "$cert_backup" ] && [ -d "${cert_backup}/certificates" ]; then
+                    warn "New certificate request failed. Restoring from backup..."
+                    cp -a "${cert_backup}/certificates" "${CADDY_DIR}/" 2>/dev/null || true
+                    cp -a "${cert_backup}/acme" "${CADDY_DIR}/" 2>/dev/null || true
+                    chown -R caddy:caddy "$CADDY_DIR"
+                    systemctl restart caddy.service
+                    ok "Certificates restored from backup"
+                else
+                    error "Certificate application failed after $((max_wait * 3))s.\nPlease check:\n  1. TCP ports 80 and 443 are open\n  2. Domain A record points to this server\n  3. journalctl -u caddy --no-pager -n 30"
+                fi
+                break
+            fi
+            sleep 3
+        done
+        if find "${CADDY_DIR}/certificates" -name '*.crt' -type f 2>/dev/null | grep -q .; then
+            ok "SSL certificate ready"
+        fi
     fi
     [ -n "$cert_backup" ] && rm -rf "$cert_backup"
 
@@ -1471,6 +1873,7 @@ EOF
     echo -e "${GREEN}║${NC}  Password : ${CYAN}${trojan_passwd}${NC}"
     echo -e "${GREEN}║${NC}  ALPN     : ${CYAN}h2,http/1.1${NC}"
     echo -e "${GREEN}║${NC}  Transport: ${CYAN}websocket${NC}"
+    echo -e "${GREEN}║${NC}  TLS mode : ${CYAN}$(read_tls_mode)${NC}  (easytrojan cert status)"
     echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${GREEN}║${NC}  Manage   : systemctl {start|stop|restart|status} caddy"
     echo -e "${GREEN}║${NC}  Logs     : journalctl -u caddy --no-pager -n 50"
@@ -1490,6 +1893,9 @@ trojan_passwd=""
 caddy_domain=""
 release_version="latest"
 skip_domain_check="0"
+tls_mode=""
+origin_cert_src=""
+origin_key_src=""
 
 cmd="${1:-}"
 case "$cmd" in
@@ -1510,6 +1916,14 @@ case "$cmd" in
     status)
         shift
         do_status "$@"
+        ;;
+    link|share)
+        shift
+        do_link "$@"
+        ;;
+    cert|tls)
+        shift
+        do_cert "$@"
         ;;
     user)
         shift
