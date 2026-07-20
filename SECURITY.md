@@ -47,6 +47,10 @@ Trojan 密码会保存在：
 
 安装脚本会将该文件权限设置为 `600`，目录权限为 `700`。
 
+同一批密码也会以 `users "..."` 形式写入 `/etc/caddy/Caddyfile`（imgk/caddy-trojan 官方配置方式）。该文件权限同样为 `600`，属主 `caddy:caddy`。请勿把 Caddyfile 提交到公开仓库或分享给他人。
+
+使用 `caddy` upstream 时，用户密钥还会落在 Caddy 本地 storage（前缀 `trojan/`）。`easytrojan user del` 会同时更新 passwd.txt、Caddyfile，并调用 Admin API 删除 storage 中的键。
+
 ## 端口安全
 
 请只向公网开放必要端口：

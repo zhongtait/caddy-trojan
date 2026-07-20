@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Changed
+
+- Trojan 用户改为 **Caddyfile 静态 `users`**（与 imgk 官方一致）：`passwd.txt` → 生成 Caddyfile → `reload`；不再依赖安装后 Admin API 注入。
+- `user add|del` 同步更新 `passwd.txt` 与 Caddyfile；删除时额外调用 `DELETE /trojan/users/delete` 清理 `caddy` upstream 在 storage 中的键（仅改 Caddyfile 不够）。
+- `update` 重启后不再 API 同步用户。
+
+### Fixed
+
+- 修正实现计划中“删除 API 不存在/重启必丢用户”等不准确表述对应的实现路径。
+
+
 ### Added
 
 - 支持 `install` 子命令。
@@ -29,7 +40,7 @@
 - 证书续签：改为每日维护 timer；:80 放行 ACME HTTP-01 路径；修正证书存储目录权限。
 - `renew` 默认触发维护检查，`--force` 才删证重签。
 - 同域名重装保留证书，避免重复申请触发 Let's Encrypt 限速。
-- 重装/升级后从 `passwd.txt` 重新同步 Trojan 用户到运行中的 Caddy。
+- （已取代）用户改为 Caddyfile 静态 `users`，不再依赖 API 重注入。
 - 域名校验支持多 A 记录（任意一条匹配本机 IP 即可）。
 - 域名输入规范化（去协议/路径/端口、小写）。
 - systemd 增加 `NoNewPrivileges` / `CapabilityBoundingSet`；下载临时目录自动清理。
