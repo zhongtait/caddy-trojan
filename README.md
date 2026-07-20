@@ -92,6 +92,9 @@ sudo easytrojan user add --password 'another-strong-password'
 sudo easytrojan user list              # 密码脱敏显示
 sudo easytrojan user del --password 'password-to-remove'
 
+用户写入 `passwd.txt`，并生成 Caddyfile 全局块中的 `users "..."`（与 [imgk/caddy-trojan](https://github.com/imgk/caddy-trojan) 官方示例一致）。
+删除用户会 `reload` 配置，并调用 Admin API 清理 `caddy` upstream 的 storage 键。
+
 systemctl {start|stop|restart|status} caddy
 journalctl -u caddy --no-pager -n 50
 cat /etc/caddy/Caddyfile
