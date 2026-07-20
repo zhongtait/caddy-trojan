@@ -2,6 +2,7 @@ name: Build Caddy-Trojan
 
 on:
   workflow_dispatch:
+  workflow_call:
   push:
     paths:
       - 'sha'
@@ -29,8 +30,10 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.23.x'
-          cache: true
+          # caddy/v2 latest requires go >= 1.25.1 (GOTOOLCHAIN=local in runners)
+          go-version: '1.25.x'
+          # no go.mod in this repo (xcaddy builds in a temp module)
+          cache: false
 
       - name: Install Xcaddy
         run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
