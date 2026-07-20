@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Added
+
+- `status --server ADDR` / `link --server ADDR`：分享链接支持 Cloudflare 优选 IP（SNI/Host 仍为域名）。
+- TLS 方案选项：`auto`（Caddy ACME）与 `origin`（Cloudflare Origin / 文件证书）；`install --tls-mode`、`easytrojan cert {auto|origin|status}`。
+
 ### Changed
 
 - Trojan 用户改为 **Caddyfile 静态 `users`**（与 imgk 官方一致）：`passwd.txt` → 生成 Caddyfile → `reload`；不再依赖安装后 Admin API 注入。
