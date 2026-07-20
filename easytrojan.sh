@@ -4,17 +4,36 @@
 # Supports: CentOS/RedHat 7+, Debian 9+, Ubuntu 16+
 #
 # Usage:
-#   bash easytrojan.sh <password> [domain]   - Install
-#   bash easytrojan.sh update                - Update script + Caddy binary
-#   bash easytrojan.sh renew                 - Force certificate renewal
-#   bash easytrojan.sh status                - Show service status
+#   bash easytrojan.sh install --domain DOMAIN [--password PASS] [--version VER] [--skip-domain-check]
+#   bash easytrojan.sh update  [--version VER]
+#   bash easytrojan.sh renew [--force]
+#   bash easytrojan.sh status [--show-link]
+#   bash easytrojan.sh user {add|list|del} ...
+#   bash easytrojan.sh <password> <domain>   # legacy
 #
 # Based on: https://github.com/imgk/caddy-trojan
 # Project:  https://github.com/zhongtait/caddy-trojan
 
 set -euo pipefail
 
-# ==================== 颜色与工具函数 ====================
+REPO_OWNER="zhongtait"
+REPO_NAME="caddy-trojan"
+REPO_RAW="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main"
+REPO_API="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}"
+CADDY_BIN="/usr/local/bin/caddy"
+SCRIPT_BIN="/usr/local/bin/easytrojan"
+SCRIPT_LEGACY="/usr/local/bin/easytrojan.sh"
+CADDY_DIR="/etc/caddy"
+TROJAN_DIR="${CADDY_DIR}/trojan"
+PASSWD_FILE="${TROJAN_DIR}/passwd.txt"
+DOMAIN_FILE="${TROJAN_DIR}/domain.txt"
+CADDYFILE="${CADDY_DIR}/Caddyfile"
+WWW_DIR="${CADDY_DIR}/www"
+ADMIN_API="http://127.0.0.1:2019"
+# Static camouflage site: CorentinTh/it-tools release zip (Vue SPA)
+IT_TOOLS_REPO="CorentinTh/it-tools"
+IT_TOOLS_VERSION="${IT_TOOLS_VERSION:-latest}"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -23,113 +42,1018 @@ NC='\033[0m'
 
 info()  { echo -e "${CYAN}[INFO]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
-error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 ok()    { echo -e "${GREEN}[OK]${NC} $*"; }
+error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
 check_cmd() { command -v "$1" &>/dev/null; }
+require_root() { [ "$(id -u)" = "0" ] || error "You must be root to run this script"; }
 
-# ==================== 子命令：update ====================
-do_update() {
-    [ "$(id -u)" != "0" ] && error "You must be root to run this script"
+usage() {
+    cat <<'EOF'
+EasyTrojan - One-click Caddy-Trojan installer
 
-    # 更新脚本自身
-    info "Updating easytrojan.sh script..."
-    local script_url="https://raw.githubusercontent.com/zhongtait/caddy-trojan/main/easytrojan.sh"
-    local script_path
-    script_path=$(readlink -f "$0" 2>/dev/null || echo "/usr/local/bin/easytrojan.sh")
-    if curl -fsSL --connect-timeout 10 --max-time 30 "$script_url" -o "${script_path}.tmp"; then
-        chmod +x "${script_path}.tmp"
-        mv -f "${script_path}.tmp" "$script_path"
-        ok "Script updated"
-    else
-        warn "Script update failed, continuing with Caddy update..."
-        rm -f "${script_path}.tmp"
-    fi
+Usage:
+  bash easytrojan.sh install --domain DOMAIN [--password PASSWORD] [--version VERSION] [--skip-domain-check]
+  bash easytrojan.sh update  [--version VERSION]
+  bash easytrojan.sh renew [--force]
+  bash easytrojan.sh status [--show-link]
+  bash easytrojan.sh user add [--password PASSWORD]
+  bash easytrojan.sh user list
+  bash easytrojan.sh user del --password PASSWORD
+  bash easytrojan.sh help
 
-    # 更新 Caddy 二进制
+Legacy:
+  bash easytrojan.sh <password> <domain>
+
+Examples:
+  bash easytrojan.sh install --domain example.com
+  bash easytrojan.sh install --domain example.com --password 'strong_password'
+  bash easytrojan.sh update --version v2.11.3+trojan.932ef9b
+  bash easytrojan.sh status
+  bash easytrojan.sh status --show-link
+  bash easytrojan.sh user add
+  bash easytrojan.sh user list
+
+Notes:
+  - A real domain is required; free IP wildcard domains are not used
+  - Domain A record must point to this server before install
+  - Open TCP 80 and 443 (security group / firewall) before install
+  - status does not print share links by default (use --show-link)
+  - Camouflage site defaults to CorentinTh/it-tools (override: IT_TOOLS_VERSION=...)
+EOF
+}
+
+detect_arch() {
     case $(uname -m) in
-        x86_64)  arch="amd64" ;;
-        aarch64) arch="arm64" ;;
-        *)       error "Unsupported architecture: $(uname -m)" ;;
+        x86_64|amd64)  echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        *) error "Unsupported architecture: $(uname -m)" ;;
     esac
+}
 
-    caddy_url="https://github.com/zhongtait/caddy-trojan/releases/latest/download/caddy_trojan_linux_${arch}.tar.gz"
+is_ipv4() {
+    local ip="$1"
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    local IFS=.
+    # shellcheck disable=SC2086
+    set -- $ip
+    [ "$1" -le 255 ] && [ "$2" -le 255 ] && [ "$3" -le 255 ] && [ "$4" -le 255 ]
+}
 
-    local old_version
-    old_version=$(/usr/local/bin/caddy version 2>/dev/null | awk '{print $1}' || echo 'not installed')
-    info "Current Caddy version: $old_version"
-    info "Downloading latest Caddy-Trojan (${arch})..."
+urlencode() {
+    local s="$1" out="" i c hex
+    local LC_ALL=C
+    for (( i = 0; i < ${#s}; i++ )); do
+        c="${s:i:1}"
+        case "$c" in
+            [a-zA-Z0-9.~_-]) out+="$c" ;;
+            *)
+                printf -v hex '%%%02X' "'$c"
+                out+="$hex"
+                ;;
+        esac
+    done
+    printf '%s' "$out"
+}
 
-    if ! curl -fsSL --connect-timeout 15 --max-time 180 "$caddy_url" | tar -zx -C /usr/local/bin caddy; then
-        error "Failed to download Caddy binary."
+json_escape() {
+    local s="$1"
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\r'/\\r}
+    s=${s//$'\t'/\\t}
+    printf '%s' "$s"
+}
+
+install_pkg() {
+    local pkg="$1"
+    check_cmd "$pkg" && return 0
+    info "Installing $pkg..."
+    if check_cmd dnf; then
+        dnf install -y "$pkg" &>/dev/null || error "Failed to install $pkg via dnf"
+    elif check_cmd yum; then
+        yum install -y "$pkg" &>/dev/null || error "Failed to install $pkg via yum"
+    elif check_cmd apt-get; then
+        apt-get update -qq &>/dev/null || true
+        apt-get install -y "$pkg" &>/dev/null || error "Failed to install $pkg via apt-get"
+    else
+        error "Unable to install $pkg: no supported package manager found"
     fi
-    chmod +x /usr/local/bin/caddy
+}
 
-    local new_version
-    new_version=$(/usr/local/bin/caddy version 2>/dev/null | awk '{print $1}' || echo 'unknown')
+
+prompt_domain() {
+    if [ -z "${caddy_domain:-}" ]; then
+        if [ -t 0 ]; then
+            read -rp "Domain (required, A record must point to this server): " caddy_domain
+        else
+            error "Domain required. Use --domain example.com"
+        fi
+    fi
+    # Normalize: strip scheme/path/port/spaces, lowercase, drop trailing dots
+    caddy_domain=$(printf '%s' "${caddy_domain:-}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+    caddy_domain=${caddy_domain#http://}
+    caddy_domain=${caddy_domain#https://}
+    caddy_domain=${caddy_domain%%/*}
+    caddy_domain=${caddy_domain%%:*}
+    caddy_domain=${caddy_domain%.}
+    caddy_domain=${caddy_domain%.}
+    [ -n "$caddy_domain" ] || error "Domain cannot be empty"
+    if ! [[ "$caddy_domain" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
+        error "Invalid domain: $caddy_domain"
+    fi
+}
+prompt_password() {
+    if [ -z "${trojan_passwd:-}" ]; then
+        if [ -t 0 ]; then
+            read -rsp "Trojan password: " trojan_passwd
+            echo
+            read -rsp "Confirm password: " trojan_passwd2
+            echo
+            [ "$trojan_passwd" = "$trojan_passwd2" ] || error "Passwords do not match"
+        else
+            error "Password required. Use --password or run interactively."
+        fi
+    fi
+    [ -n "$trojan_passwd" ] || error "Password cannot be empty"
+    if [ "${#trojan_passwd}" -lt 12 ]; then
+        warn "Password is shorter than 12 characters. A strong random password is recommended."
+    fi
+}
+
+parse_common_args() {
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --password)
+                [ -n "${2:-}" ] || error "--password requires a value"
+                trojan_passwd="$2"
+                shift 2
+                ;;
+            --domain)
+                [ -n "${2:-}" ] || error "--domain requires a value"
+                caddy_domain="$2"
+                shift 2
+                ;;
+            --version)
+                [ -n "${2:-}" ] || error "--version requires a value"
+                release_version="$2"
+                shift 2
+                ;;
+            --skip-domain-check)
+                skip_domain_check="1"
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                error "Unknown argument: $1"
+                ;;
+        esac
+    done
+}
+
+detect_public_ip() {
+    local ip service
+    for service in "https://ipv4.ip.sb" "https://api.ipify.org" "https://ifconfig.me" "https://icanhazip.com"; do
+        ip=$(curl -fsS --connect-timeout 5 --max-time 10 "$service" 2>/dev/null | tr -d '[:space:]' || true)
+        if is_ipv4 "$ip"; then
+            printf '%s' "$ip"
+            return 0
+        fi
+    done
+    return 1
+}
+
+resolve_domain_ipv4_list() {
+    local domain="$1" ips=""
+    if check_cmd dig; then
+        ips=$(dig +short A "$domain" 2>/dev/null | grep -E '^[0-9.]+$' || true)
+    fi
+    if [ -z "$ips" ] && check_cmd getent; then
+        ips=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u || true)
+    fi
+    if [ -z "$ips" ] && check_cmd host; then
+        ips=$(host -t A "$domain" 2>/dev/null | awk '/has address/ {print $4}' || true)
+    fi
+    if [ -z "$ips" ] && check_cmd python3; then
+        ips=$(python3 -c 'import socket,sys
+for a in socket.getaddrinfo(sys.argv[1], None, socket.AF_INET):
+    print(a[4][0])
+' "$domain" 2>/dev/null | sort -u || true)
+    fi
+    if [ -z "$ips" ]; then
+        ips=$(ping "$domain" -c 1 -W 5 2>/dev/null | sed '1{s/[^(]*(//;s/).*//;q}' || true)
+    fi
+    # unique keep order
+    printf '%s\n' "$ips" | tr ' ' '\n' | awk 'NF && !seen[$0]++'
+}
+
+resolve_domain_ipv4() {
+    resolve_domain_ipv4_list "$1" | head -n 1
+}
+
+domain_points_to_ip() {
+    local domain="$1" expect="$2" ip
+    while IFS= read -r ip; do
+        [ "$ip" = "$expect" ] && return 0
+    done < <(resolve_domain_ipv4_list "$domain")
+    return 1
+}
+
+read_installed_domain() {
+    if [ -f "$DOMAIN_FILE" ]; then
+        head -1 "$DOMAIN_FILE"
+        return 0
+    fi
+    if [ -f "$CADDYFILE" ]; then
+        awk '
+            $0 ~ /^:443,/ {
+                line=$0
+                sub(/^:443,[[:space:]]*/, "", line)
+                sub(/[[:space:]].*$/, "", line)
+                print line
+                exit
+            }
+        ' "$CADDYFILE"
+        return 0
+    fi
+    return 1
+}
+
+build_share_link() {
+    local domain="$1" passwd="$2" transport="${3:-ws}"
+    local encoded
+    encoded=$(urlencode "$passwd")
+    if [ "$transport" = "ws" ]; then
+        printf 'trojan://%s@%s:443?security=tls&sni=%s&type=ws&host=%s&path=%%2F#%s' \
+            "$encoded" "$domain" "$domain" "$domain" "$domain"
+    else
+        printf 'trojan://%s@%s:443?security=tls&sni=%s&type=tcp#%s' \
+            "$encoded" "$domain" "$domain" "$domain"
+    fi
+}
+
+release_asset_base() {
+    local version="${1:-latest}"
+    if [ "$version" = "latest" ] || [ -z "$version" ]; then
+        printf 'https://github.com/%s/%s/releases/latest/download' "$REPO_OWNER" "$REPO_NAME"
+    else
+        printf 'https://github.com/%s/%s/releases/download/%s' "$REPO_OWNER" "$REPO_NAME" "$version"
+    fi
+}
+
+sha256_file() {
+    local file="$1"
+    if check_cmd sha256sum; then
+        sha256sum "$file" | awk '{print $1}'
+    elif check_cmd shasum; then
+        shasum -a 256 "$file" | awk '{print $1}'
+    elif check_cmd openssl; then
+        openssl dgst -sha256 "$file" | awk '{print $NF}'
+    else
+        return 1
+    fi
+}
+
+verify_archive_sha256() {
+    local archive="$1" sums_file="$2" expected=""
+    local base
+    base=$(basename "$archive")
+    expected=$(awk -v f="$base" '$2 == f {print $1; exit}' "$sums_file" 2>/dev/null || true)
+    if [ -z "$expected" ]; then
+        # also accept "hash  filename" with leading spaces
+        expected=$(grep -E "[[:space:]]${base}$" "$sums_file" 2>/dev/null | awk '{print $1; exit}' || true)
+    fi
+    if [ -z "$expected" ]; then
+        warn "SHA256SUMS has no entry for ${base}; skipping checksum verification"
+        return 0
+    fi
+    local actual
+    actual=$(sha256_file "$archive") || error "No sha256 tool available (sha256sum/shasum/openssl)"
+    if [ "$actual" != "$expected" ]; then
+        error "SHA256 mismatch for ${base}\n  expected: ${expected}\n  actual:   ${actual}"
+    fi
+    ok "SHA256 verified for ${base}"
+}
+
+download_caddy() {
+    local arch version base_url tmp_dir archive sums
+    arch=$(detect_arch)
+    version="${release_version:-latest}"
+    base_url=$(release_asset_base "$version")
+    tmp_dir=$(mktemp -d)
+    trap 'rm -rf "$tmp_dir"' RETURN
+    archive="${tmp_dir}/caddy_trojan_linux_${arch}.tar.gz"
+    sums="${tmp_dir}/SHA256SUMS"
+
+    info "Downloading Caddy-Trojan (${arch}, version=${version})..."
+    if ! curl -fsSL --connect-timeout 15 --max-time 180 \
+        "${base_url}/caddy_trojan_linux_${arch}.tar.gz" -o "$archive"; then
+        error "Failed to download Caddy binary from ${base_url}"
+    fi
+
+    if curl -fsSL --connect-timeout 10 --max-time 30 "${base_url}/SHA256SUMS" -o "$sums" 2>/dev/null; then
+        verify_archive_sha256 "$archive" "$sums"
+    else
+        warn "SHA256SUMS not found for this release; continuing without checksum"
+    fi
+
+    if ! tar -tzf "$archive" | grep -qx 'caddy'; then
+        error "Archive does not contain expected 'caddy' binary"
+    fi
+    if ! tar -xzf "$archive" -C "$tmp_dir" caddy; then
+        error "Failed to extract Caddy binary"
+    fi
+    chmod +x "${tmp_dir}/caddy"
+    # Smoke-test when the binary can run on this host
+    if ! "${tmp_dir}/caddy" version &>/dev/null; then
+        if file "${tmp_dir}/caddy" 2>/dev/null | grep -qiE 'ELF.*(executable|shared object)'; then
+            warn "Downloaded caddy could not execute 'version' (continuing; may be ok under QEMU/edge cases)"
+        else
+            error "Extracted caddy binary looks invalid"
+        fi
+    fi
+    mv -f "${tmp_dir}/caddy" "$CADDY_BIN"
+    chmod 755 "$CADDY_BIN"
+    trap - RETURN
+    rm -rf "$tmp_dir"
+}
+
+wait_for_admin_api() {
+    local i
+    for i in $(seq 1 15); do
+        curl -sf "${ADMIN_API}/config/" &>/dev/null && return 0
+        sleep 1
+    done
+    return 1
+}
+
+assert_admin_local_only() {
+    # Best-effort: ensure nothing is listening on 0.0.0.0:2019 / *:2019
+    local listeners=""
+    if check_cmd ss; then
+        listeners=$(ss -Hltn 'sport = :2019' 2>/dev/null || true)
+    elif check_cmd lsof; then
+        listeners=$(lsof -iTCP:2019 -sTCP:LISTEN 2>/dev/null || true)
+    fi
+    if echo "$listeners" | grep -Eq '0\.0\.0\.0:2019|\*:2019|:::2019'; then
+        error "Caddy Admin API appears exposed beyond localhost:\n${listeners}\nFix Caddyfile admin bind and restart."
+    fi
+}
+
+add_trojan_user() {
+    local passwd="$1" payload
+    payload=$(printf '{"password":"%s"}' "$(json_escape "$passwd")")
+    curl -sf -X POST -H "Content-Type: application/json" -d "$payload" "${ADMIN_API}/trojan/users/add"
+}
+
+# Re-load every password from passwd.txt into the running process (needed after restart/reinstall)
+sync_trojan_users_from_file() {
+    [ -f "$PASSWD_FILE" ] || return 0
+    local line
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ -n "$line" ] || continue
+        add_trojan_user "$line" >/dev/null 2>&1 || true
+    done < "$PASSWD_FILE"
+}
+
+delete_trojan_user() {
+    local passwd="$1" payload
+    payload=$(printf '{"password":"%s"}' "$(json_escape "$passwd")")
+    # imgk/caddy-trojan: DELETE /trojan/users/delete  body: {"password":"..."}
+    curl -sf -X DELETE -H "Content-Type: application/json" -d "$payload" "${ADMIN_API}/trojan/users/delete"
+}
+
+remove_password_from_file() {
+    local passwd="$1"
+    [ -f "$PASSWD_FILE" ] || return 0
+    local tmp
+    tmp=$(mktemp)
+    # exact line match only
+    grep -Fxv -- "$passwd" "$PASSWD_FILE" > "$tmp" || true
+    mv -f "$tmp" "$PASSWD_FILE"
+    chmod 600 "$PASSWD_FILE"
+    chown caddy:caddy "$PASSWD_FILE" 2>/dev/null || true
+}
+
+mask_secret() {
+    local s="$1" n=${#1}
+    if [ "$n" -le 4 ]; then
+        printf '****'
+    else
+        printf '%s***%s' "${s:0:2}" "${s: -2}"
+    fi
+}
+
+require_caddy_running() {
+    systemctl is-active --quiet caddy 2>/dev/null || error "Caddy service is not running"
+    wait_for_admin_api || error "Caddy Admin API not responding on ${ADMIN_API}"
+}
+
+persist_password() {
+    local passwd="$1"
+    mkdir -p "$TROJAN_DIR"
+    chmod 700 "$TROJAN_DIR"
+    touch "$PASSWD_FILE"
+    chmod 600 "$PASSWD_FILE"
+    chown caddy:caddy "$PASSWD_FILE" 2>/dev/null || true
+    if ! grep -Fxq "$passwd" "$PASSWD_FILE" 2>/dev/null; then
+        printf '%s\n' "$passwd" >> "$PASSWD_FILE"
+    fi
+    awk 'NF && !seen[$0]++' "$PASSWD_FILE" > "${PASSWD_FILE}.tmp"
+    mv -f "${PASSWD_FILE}.tmp" "$PASSWD_FILE"
+    chmod 600 "$PASSWD_FILE"
+    chown caddy:caddy "$PASSWD_FILE" 2>/dev/null || true
+}
+
+install_self() {
+    local src
+    src=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
+    if [ -f "$src" ]; then
+        cp -f "$src" "$SCRIPT_BIN"
+        cp -f "$src" "$SCRIPT_LEGACY"
+        chmod 755 "$SCRIPT_BIN" "$SCRIPT_LEGACY"
+    fi
+}
+
+write_camouflage_site() {
+    mkdir -p "$WWW_DIR"
+    if ! check_cmd unzip; then
+        info "Installing unzip (needed for IT-Tools package)..."
+        if check_cmd dnf; then dnf install -y unzip &>/dev/null || true
+        elif check_cmd yum; then yum install -y unzip &>/dev/null || true
+        elif check_cmd apt-get; then
+            apt-get update -qq &>/dev/null || true
+            apt-get install -y unzip &>/dev/null || true
+        fi
+    fi
+    check_cmd curl || install_pkg curl
+
+    local version="${IT_TOOLS_VERSION:-latest}"
+    local api_url asset_url tmp_dir zip_path tag name extract_root
+    tmp_dir=$(mktemp -d)
+    trap 'rm -rf "$tmp_dir"' RETURN
+
+    info "Installing camouflage site: IT-Tools (${version})..."
+
+    if [ "$version" = "latest" ]; then
+        api_url="https://api.github.com/repos/${IT_TOOLS_REPO}/releases/latest"
+    else
+        # accept v2024... or 2024...
+        case "$version" in
+            v*) tag="$version" ;;
+            *) tag="v${version}" ;;
+        esac
+        api_url="https://api.github.com/repos/${IT_TOOLS_REPO}/releases/tags/${tag}"
+    fi
+
+    if ! check_cmd unzip; then
+        warn "unzip not available; using built-in fallback tools page"
+        write_camouflage_fallback
+        trap - RETURN
+        rm -rf "$tmp_dir"
+        return 0
+    fi
+
+    # Resolve zip asset URL from GitHub API (fallback to known latest pattern if API blocked)
+    asset_url=""
+    if curl -fsSL --connect-timeout 10 --max-time 30 \
+        -H "Accept: application/vnd.github+json" \
+        -H "User-Agent: easytrojan" \
+        "$api_url" -o "${tmp_dir}/release.json" 2>/dev/null; then
+        asset_url=$(python3 -c '
+import json,sys
+try:
+  d=json.load(open(sys.argv[1],encoding="utf-8"))
+  for a in d.get("assets") or []:
+    n=a.get("name") or ""
+    if n.endswith(".zip") and "it-tools" in n:
+      print(a.get("browser_download_url",""))
+      break
+except Exception:
+  pass
+' "${tmp_dir}/release.json" 2>/dev/null || true)
+        if [ -z "$asset_url" ]; then
+            asset_url=$(grep -oE 'https://github.com/[^"]+it-tools[^"]+\.zip' "${tmp_dir}/release.json" 2>/dev/null | head -1 || true)
+        fi
+        tag=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("tag_name",""))' "${tmp_dir}/release.json" 2>/dev/null || true)
+    fi
+
+    if [ -z "$asset_url" ]; then
+        # Last-known public release zip (updated when project bumps default)
+        asset_url="https://github.com/CorentinTh/it-tools/releases/download/v2024.10.22-7ca5933/it-tools-2024.10.22-7ca5933.zip"
+        tag="v2024.10.22-7ca5933"
+        warn "GitHub API unavailable; using pinned IT-Tools release ${tag}"
+    fi
+
+    zip_path="${tmp_dir}/it-tools.zip"
+    if ! curl -fsSL --connect-timeout 15 --max-time 300 -L \
+        -H "User-Agent: easytrojan" \
+        "$asset_url" -o "$zip_path"; then
+        warn "Failed to download IT-Tools zip; using built-in fallback tools page"
+        write_camouflage_fallback
+        trap - RETURN
+        rm -rf "$tmp_dir"
+        return 0
+    fi
+
+    # Clear previous site (keep dir)
+    find "$WWW_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+    mkdir -p "${tmp_dir}/extract"
+    if ! unzip -q "$zip_path" -d "${tmp_dir}/extract"; then
+        warn "Failed to unzip IT-Tools; using built-in fallback tools page"
+        write_camouflage_fallback
+        trap - RETURN
+        rm -rf "$tmp_dir"
+        return 0
+    fi
+
+    # Zip may be flat (index.html at root) or nested in one folder
+    if [ -f "${tmp_dir}/extract/index.html" ]; then
+        extract_root="${tmp_dir}/extract"
+    else
+        local idx_html
+        idx_html=$(find "${tmp_dir}/extract" -mindepth 1 -maxdepth 4 -type f -name index.html 2>/dev/null | head -1 || true)
+        extract_root=$(dirname "$idx_html" 2>/dev/null || true)
+    fi
+    if [ -z "${extract_root:-}" ] || [ ! -f "${extract_root}/index.html" ]; then
+        warn "IT-Tools archive layout unexpected; using fallback tools page"
+        write_camouflage_fallback
+        trap - RETURN
+        rm -rf "$tmp_dir"
+        return 0
+    fi
+
+    cp -a "${extract_root}/." "$WWW_DIR/"
+    # Attribution for operators
+    cat > "${WWW_DIR}/.it-tools-source.txt" <<EOF
+source=https://github.com/${IT_TOOLS_REPO}
+tag=${tag:-$version}
+license=GPL-3.0
+homepage=https://it-tools.tech
+installed_by=easytrojan
+EOF
+
+    chown -R caddy:caddy "$WWW_DIR" 2>/dev/null || true
+    find "$WWW_DIR" -type d -exec chmod 755 {} \; 2>/dev/null || true
+    find "$WWW_DIR" -type f -exec chmod 644 {} \; 2>/dev/null || true
+    ok "IT-Tools site installed to ${WWW_DIR} (${tag:-$version})"
+    trap - RETURN
+    rm -rf "$tmp_dir"
+}
+
+# Minimal offline SPA if GitHub download fails (still looks like a real tools site)
+write_camouflage_fallback() {
+    mkdir -p "${WWW_DIR}/assets"
+    find "$WWW_DIR" -mindepth 1 -maxdepth 1 ! -name assets -exec rm -rf {} + 2>/dev/null || true
+    cat > "${WWW_DIR}/assets/app.css" <<'EOF'
+:root { --bg:#0b1220; --panel:#121a2b; --line:#243047; --text:#e8eefc; --muted:#93a0b8; --accent:#5b9dff; --ok:#3dd68c; --sans:ui-sans-serif,system-ui,sans-serif; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+* { box-sizing:border-box; } body { margin:0; font-family:var(--sans); background:radial-gradient(1000px 500px at 10% -10%,#172554 0%,transparent 50%),var(--bg); color:var(--text); min-height:100vh; }
+a { color:var(--accent); text-decoration:none; } .layout { display:grid; grid-template-columns:260px 1fr; min-height:100vh; }
+@media (max-width:860px){ .layout{grid-template-columns:1fr;} .sidebar{position:sticky;top:0;z-index:5;} }
+.sidebar { border-right:1px solid var(--line); background:rgba(18,26,43,.92); backdrop-filter:blur(8px); padding:1rem; }
+.brand { font-weight:700; letter-spacing:.02em; margin-bottom:.25rem; } .brand small { display:block; color:var(--muted); font-weight:500; font-size:.78rem; margin-top:.2rem; }
+.search { width:100%; margin:1rem 0; padding:.65rem .75rem; border-radius:10px; border:1px solid var(--line); background:#0d1526; color:var(--text); }
+.nav { display:flex; flex-direction:column; gap:.25rem; max-height:70vh; overflow:auto; }
+.nav button { text-align:left; border:0; background:transparent; color:var(--muted); padding:.55rem .65rem; border-radius:8px; cursor:pointer; font:inherit; }
+.nav button:hover,.nav button.active { background:#1a2740; color:var(--text); }
+.main { padding:1.25rem 1.4rem 2rem; } .panel { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:1rem 1.1rem; }
+h1 { font-size:1.35rem; margin:0 0 .35rem; } .desc { color:var(--muted); margin:0 0 1rem; font-size:.95rem; }
+textarea,input,select { width:100%; border:1px solid var(--line); background:#0d1526; color:var(--text); border-radius:10px; padding:.7rem .8rem; font:inherit; }
+textarea { min-height:140px; font-family:var(--mono); font-size:.9rem; resize:vertical; }
+.row { display:flex; flex-wrap:wrap; gap:.6rem; margin:.75rem 0; }
+button.act { border:0; border-radius:10px; background:var(--accent); color:#041018; font-weight:700; padding:.55rem .9rem; cursor:pointer; }
+button.ghost { border:1px solid var(--line); background:transparent; color:var(--text); border-radius:10px; padding:.55rem .9rem; cursor:pointer; }
+.out { margin-top:.8rem; white-space:pre-wrap; word-break:break-word; font-family:var(--mono); font-size:.88rem; background:#0d1526; border:1px solid var(--line); border-radius:10px; padding:.8rem; min-height:3rem; }
+.muted { color:var(--muted); font-size:.85rem; }
+EOF
+    cat > "${WWW_DIR}/index.html" <<'EOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ByteDeck — developer utilities</title>
+  <meta name="description" content="Collection of handy online tools for developers: Base64, Hash, JSON, UUID, URL encode, and more.">
+  <meta name="theme-color" content="#0b1220">
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">ByteDeck <small>developer utilities</small></div>
+      <input class="search" id="filter" type="search" placeholder="Search tools..." aria-label="Search tools">
+      <nav class="nav" id="nav" aria-label="Tools"></nav>
+      <p class="muted" style="margin-top:1rem;">Offline fallback UI. Prefer full IT-Tools when network allows.</p>
+    </aside>
+    <main class="main">
+      <section class="panel" id="app"></section>
+    </main>
+  </div>
+  <script>
+  const tools = [
+    { id:'base64', name:'Base64 encode / decode', cat:'Conversion', run(ui){
+      ui.desc('Encode or decode Base64 text in the browser.');
+      ui.area('input','Text');
+      ui.row([ui.btn('Encode',()=>ui.set(btoa(unescape(encodeURIComponent(ui.val('input')))))), ui.btn('Decode',()=>{try{ui.set(decodeURIComponent(escape(atob(ui.val('input')))))}catch(e){ui.set('Invalid Base64')}},'ghost')]);
+      ui.out();
+    }},
+    { id:'url', name:'URL encode / decode', cat:'Conversion', run(ui){
+      ui.desc('Percent-encoding helpers for query strings and paths.');
+      ui.area('input','Text');
+      ui.row([ui.btn('Encode',()=>ui.set(encodeURIComponent(ui.val('input')))), ui.btn('Decode',()=>{try{ui.set(decodeURIComponent(ui.val('input')))}catch(e){ui.set('Invalid input')}},'ghost')]);
+      ui.out();
+    }},
+    { id:'hash', name:'SHA-256 hash', cat:'Crypto', run(ui){
+      ui.desc('Compute SHA-256 using Web Crypto (local only).');
+      ui.area('input','Text');
+      ui.row([ui.btn('Hash', async ()=>{
+        const data=new TextEncoder().encode(ui.val('input'));
+        const buf=await crypto.subtle.digest('SHA-256', data);
+        ui.set([...new Uint8Array(buf)].map(b=>b.toString(16).padStart(2,'0')).join(''));
+      })]);
+      ui.out();
+    }},
+    { id:'uuid', name:'UUID generator', cat:'Generators', run(ui){
+      ui.desc('Generate RFC 4122 version 4 UUIDs.');
+      ui.row([ui.btn('Generate',()=>ui.set(crypto.randomUUID())), ui.btn('Generate ×5',()=>ui.set(Array.from({length:5},()=>crypto.randomUUID()).join('\\n')),'ghost')]);
+      ui.out();
+    }},
+    { id:'json', name:'JSON formatter', cat:'Development', run(ui){
+      ui.desc('Pretty-print or minify JSON.');
+      ui.area('input','JSON');
+      ui.row([ui.btn('Pretty',()=>{try{ui.set(JSON.stringify(JSON.parse(ui.val('input')),null,2))}catch(e){ui.set(String(e))}}), ui.btn('Minify',()=>{try{ui.set(JSON.stringify(JSON.parse(ui.val('input'))))}catch(e){ui.set(String(e))}},'ghost')]);
+      ui.out();
+    }},
+    { id:'jwt', name:'JWT decoder', cat:'Development', run(ui){
+      ui.desc('Decode JWT header and payload (no signature verify).');
+      ui.area('input','JWT');
+      ui.row([ui.btn('Decode',()=>{
+        try{
+          const p=ui.val('input').trim().split('.');
+          if(p.length<2) throw new Error('Not a JWT');
+          const dec=s=>JSON.stringify(JSON.parse(atob(s.replace(/-/g,'+').replace(/_/g,'/'))),null,2);
+          ui.set('Header\\n'+dec(p[0])+'\\n\\nPayload\\n'+dec(p[1]));
+        }catch(e){ui.set(String(e))}
+      })]);
+      ui.out();
+    }},
+    { id:'timestamp', name:'Unix timestamp', cat:'Datetime', run(ui){
+      ui.desc('Convert between Unix time and local datetime.');
+      ui.input('ts','Unix seconds', String(Math.floor(Date.now()/1000)));
+      ui.row([ui.btn('To date',()=>ui.set(new Date(Number(ui.val('ts'))*1000).toString())), ui.btn('Now',()=>{const n=Math.floor(Date.now()/1000); document.getElementById('ts').value=n; ui.set(String(n));},'ghost')]);
+      ui.out();
+    }},
+    { id:'lorem', name:'Lorem text', cat:'Text', run(ui){
+      ui.desc('Quick placeholder paragraphs.');
+      const words='lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua'.split(' ');
+      ui.row([ui.btn('3 paragraphs',()=>{
+        const para=()=>Array.from({length:40},()=>words[Math.floor(Math.random()*words.length)]).join(' ');
+        ui.set([para(),para(),para()].map(p=>p[0].toUpperCase()+p.slice(1)+'.').join('\\n\\n'));
+      })]);
+      ui.out();
+    }}
+  ];
+  const app=document.getElementById('app');
+  const nav=document.getElementById('nav');
+  const filter=document.getElementById('filter');
+  function uiFactory(){
+    const api={
+      desc(t){const p=document.createElement('p');p.className='desc';p.textContent=t;app.appendChild(p)},
+      area(id,label){const l=document.createElement('div');l.className='muted';l.textContent=label;app.appendChild(l);const t=document.createElement('textarea');t.id=id;app.appendChild(t)},
+      input(id,label,v=''){const l=document.createElement('div');l.className='muted';l.textContent=label;app.appendChild(l);const i=document.createElement('input');i.id=id;i.value=v;app.appendChild(i)},
+      row(nodes){const d=document.createElement('div');d.className='row';nodes.forEach(n=>d.appendChild(n));app.appendChild(d)},
+      btn(label,fn,cls='act'){const b=document.createElement('button');b.type='button';b.className=cls;b.textContent=label;b.onclick=fn;return b},
+      out(){const o=document.createElement('div');o.className='out';o.id='out';app.appendChild(o)},
+      val(id){return document.getElementById(id).value},
+      set(v){document.getElementById('out').textContent=v}
+    }; return api;
+  }
+  function renderList(){
+    const q=filter.value.trim().toLowerCase();
+    nav.innerHTML='';
+    tools.filter(t=>!q||t.name.toLowerCase().includes(q)||t.cat.toLowerCase().includes(q)).forEach(t=>{
+      const b=document.createElement('button'); b.type='button'; b.dataset.id=t.id; b.textContent=t.name;
+      b.onclick=()=>openTool(t.id); nav.appendChild(b);
+    });
+  }
+  function openTool(id){
+    const t=tools.find(x=>x.id===id)||tools[0];
+    [...nav.querySelectorAll('button')].forEach(b=>b.classList.toggle('active',b.dataset.id===t.id));
+    app.innerHTML='';
+    const h=document.createElement('h1'); h.textContent=t.name; app.appendChild(h);
+    const c=document.createElement('div'); c.className='muted'; c.style.marginBottom='.8rem'; c.textContent=t.cat; app.appendChild(c);
+    t.run(uiFactory());
+    history.replaceState(null,'','#'+t.id);
+  }
+  filter.addEventListener('input', renderList);
+  renderList();
+  openTool((location.hash||'#base64').slice(1));
+  </script>
+</body>
+</html>
+EOF
+    chown -R caddy:caddy "$WWW_DIR" 2>/dev/null || true
+    find "$WWW_DIR" -type d -exec chmod 755 {} \; 2>/dev/null || true
+    find "$WWW_DIR" -type f -exec chmod 644 {} \; 2>/dev/null || true
+    ok "Fallback tools site written to ${WWW_DIR}"
+}
+
+apply_sysctl_limits() {
+    info "Applying system optimizations..."
+    cat > /etc/sysctl.d/99-caddy-trojan.conf <<'EOF'
+# Caddy-Trojan system optimizations (scoped, reversible)
+fs.file-max = 1048576
+fs.inotify.max_user_instances = 8192
+net.core.somaxconn = 32768
+net.core.netdev_max_backlog = 16384
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 16384 16777216
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_fin_timeout = 30
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.ip_local_port_range = 1024 65000
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_notsent_lowat = 16384
+EOF
+    modprobe tcp_bbr &>/dev/null || true
+    if grep -wq bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+        {
+            echo "net.core.default_qdisc = fq"
+            echo "net.ipv4.tcp_congestion_control = bbr"
+        } >> /etc/sysctl.d/99-caddy-trojan.conf
+    fi
+    sysctl --system &>/dev/null || true
+
+    cat > /etc/security/limits.d/caddy-trojan.conf <<'EOF'
+# Caddy-Trojan limits
+caddy soft nofile 1048576
+caddy hard nofile 1048576
+caddy soft nproc  65535
+caddy hard nproc  65535
+root  soft nofile 1048576
+root  hard nofile 1048576
+EOF
+    ok "System optimizations applied (BBR: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 'N/A'))"
+}
+
+ensure_cert_storage() {
+    # Caddy with XDG_DATA_HOME=/etc stores ACME data under /etc/caddy
+    mkdir -p "${CADDY_DIR}/certificates" "${CADDY_DIR}/acme"
+    chown -R caddy:caddy "$CADDY_DIR"
+    chmod 700 "$CADDY_DIR"
+    # keep parent writable by caddy for renewals
+    find "$CADDY_DIR" -type d -exec chmod 700 {} \; 2>/dev/null || true
+}
+
+setup_renew_timer() {
+    info "Setting up certificate renewal timer..."
+
+    # Safety net around Caddy built-in ACME renewer:
+    # keep storage writable, reload daily, restart if cert near expiry.
+    cat > /usr/local/bin/caddy-cert-maintain <<'EOF'
+#!/bin/bash
+set -uo pipefail
+export XDG_CONFIG_HOME=/etc
+export XDG_DATA_HOME=/etc
+export HOME=/var/lib/caddy
+
+mkdir -p /etc/caddy/certificates /etc/caddy/acme /var/lib/caddy
+chown -R caddy:caddy /etc/caddy /var/lib/caddy 2>/dev/null || true
+find /etc/caddy -type d -exec chmod 700 {} \; 2>/dev/null || true
+
+if ! systemctl is-active --quiet caddy; then
+  systemctl start caddy || true
+  sleep 2
+fi
+
+if systemctl is-active --quiet caddy; then
+  /usr/local/bin/caddy reload --config /etc/caddy/Caddyfile --force 2>/dev/null || true
+fi
+
+CERT_FILE=$(find /etc/caddy/certificates -name '*.crt' -type f 2>/dev/null | head -1 || true)
+if [ -n "${CERT_FILE}" ] && command -v openssl >/dev/null 2>&1; then
+  if ! openssl x509 -checkend $((30 * 86400)) -noout -in "$CERT_FILE" 2>/dev/null; then
+    END_RAW=$(openssl x509 -enddate -noout -in "$CERT_FILE" 2>/dev/null | cut -d= -f2 || true)
+    logger -t caddy-cert-maintain "certificate near expiry (${END_RAW:-unknown}); restarting caddy for ACME renewal"
+    systemctl restart caddy
+    sleep 5
+  else
+    END_RAW=$(openssl x509 -enddate -noout -in "$CERT_FILE" 2>/dev/null | cut -d= -f2 || true)
+    logger -t caddy-cert-maintain "certificate ok; expires ${END_RAW:-unknown}"
+  fi
+fi
+exit 0
+EOF
+    chmod 755 /usr/local/bin/caddy-cert-maintain
+
+    cat > /etc/systemd/system/caddy-renew.service <<'EOF'
+[Unit]
+Description=Caddy Certificate Maintenance / Renewal Check
+After=network-online.target caddy.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/caddy-cert-maintain
+Nice=10
+EOF
+
+    cat > /etc/systemd/system/caddy-renew.timer <<'EOF'
+[Unit]
+Description=Daily Caddy Certificate Maintenance Timer
+
+[Timer]
+# Daily is safer than twice monthly; Caddy only renews near expiry
+OnCalendar=*-*-* 03:17:00
+RandomizedDelaySec=2h
+Persistent=true
+Unit=caddy-renew.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable caddy-renew.timer &>/dev/null
+    systemctl restart caddy-renew.timer &>/dev/null || systemctl start caddy-renew.timer &>/dev/null
+    ok "Certificate maintenance timer enabled (daily)"
+}
+
+do_update() {
+    require_root
+    install_pkg curl
+    install_pkg tar
+
+    # Stage 0: refresh script from GitHub then re-exec so binary update uses latest logic
+    if [ "${EASYTROJAN_UPDATE_STAGE:-0}" != "1" ]; then
+        info "Updating easytrojan script..."
+        local tmp dest
+        tmp=$(mktemp)
+        if curl -fsSL --connect-timeout 10 --max-time 30 "${REPO_RAW}/easytrojan.sh" -o "$tmp"; then
+            chmod +x "$tmp"
+            dest="$SCRIPT_BIN"
+            if [ -f "$0" ] && [ -w "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" ] 2>/dev/null; then
+                dest=$(readlink -f "$0" 2>/dev/null || echo "$SCRIPT_BIN")
+            fi
+            # Prefer installing to standard paths always
+            cp -f "$tmp" "$SCRIPT_BIN"
+            cp -f "$tmp" "$SCRIPT_LEGACY"
+            chmod 755 "$SCRIPT_BIN" "$SCRIPT_LEGACY"
+            # Also replace source path if it is a real file outside SCRIPT_BIN
+            if [ -n "${dest:-}" ] && [ "$dest" != "$SCRIPT_BIN" ] && [ -f "$dest" ]; then
+                cp -f "$tmp" "$dest" 2>/dev/null || true
+                chmod 755 "$dest" 2>/dev/null || true
+            fi
+            rm -f "$tmp"
+            ok "Script updated -> re-executing with new version"
+            local reexec_args=(update)
+            if [ -n "${release_version:-}" ] && [ "$release_version" != "latest" ]; then
+                reexec_args+=(--version "$release_version")
+            fi
+            export EASYTROJAN_UPDATE_STAGE=1
+            exec bash "$SCRIPT_BIN" "${reexec_args[@]}"
+        else
+            warn "Script update failed, continuing with current script for Caddy update..."
+            rm -f "$tmp"
+        fi
+    fi
+
+    local old_version new_version backup=""
+    old_version=$("$CADDY_BIN" version 2>/dev/null | awk '{print $1}' || echo "not-installed")
+    info "Current Caddy version: $old_version"
+    if [ -x "$CADDY_BIN" ]; then
+        backup=$(mktemp)
+        cp -f "$CADDY_BIN" "$backup"
+    fi
+
+    download_caddy
+    new_version=$("$CADDY_BIN" version 2>/dev/null | awk '{print $1}' || echo "unknown")
+    if ! "$CADDY_BIN" version &>/dev/null; then
+        if [ -n "$backup" ] && [ -f "$backup" ]; then
+            mv -f "$backup" "$CADDY_BIN"
+            chmod +x "$CADDY_BIN"
+            error "New binary is invalid; restored previous Caddy binary"
+        fi
+        error "New Caddy binary is invalid"
+    fi
+    [ -n "$backup" ] && rm -f "$backup"
 
     if [ "$old_version" = "$new_version" ]; then
         ok "Caddy already up to date: $new_version"
     else
-        info "Restarting Caddy service..."
-        systemctl restart caddy.service
+        if systemctl is-active --quiet caddy 2>/dev/null; then
+            info "Restarting Caddy service..."
+            systemctl restart caddy.service
+            wait_for_admin_api || warn "Caddy API not ready after update"
+            assert_admin_local_only || true
+            sync_trojan_users_from_file
+        fi
         ok "Caddy updated: $old_version -> $new_version"
+    fi
+    if [ -x "$CADDY_BIN" ]; then
+        setup_renew_timer
     fi
     exit 0
 }
 
-# ==================== 子命令：renew ====================
 do_renew() {
-    [ "$(id -u)" != "0" ] && error "You must be root to run this script"
+    require_root
+    local force_reissue=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --force|-f) force_reissue=1; shift ;;
+            -h|--help) echo "Usage: easytrojan renew [--force]"; exit 0 ;;
+            *) error "Unknown renew argument: $1" ;;
+        esac
+    done
 
-    if ! systemctl is-active --quiet caddy 2>/dev/null; then
-        error "Caddy service is not running"
+    systemctl is-active --quiet caddy 2>/dev/null || error "Caddy service is not running"
+    ensure_cert_storage
+    # Keep daily maintenance timer present on older installs
+    if [ ! -f /etc/systemd/system/caddy-renew.timer ] || [ ! -x /usr/local/bin/caddy-cert-maintain ]; then
+        setup_renew_timer
     fi
 
-    info "Forcing certificate renewal..."
-    # 删除旧证书，Caddy 会自动重新申请
-    rm -rf /etc/caddy/certificates
-    rm -rf /etc/caddy/acme
-    systemctl restart caddy.service
+    if [ "$force_reissue" = "1" ]; then
+        warn "Force re-issue: deleting existing certificate material"
+        rm -rf "${CADDY_DIR}/certificates" "${CADDY_DIR}/acme"
+        ensure_cert_storage
+        systemctl restart caddy.service
+    else
+        info "Triggering certificate maintenance (Caddy auto-renew if near expiry)..."
+        if [ -x /usr/local/bin/caddy-cert-maintain ]; then
+            /usr/local/bin/caddy-cert-maintain || true
+        else
+            # fallback if helper not installed yet
+            export XDG_CONFIG_HOME=/etc XDG_DATA_HOME=/etc
+            "$CADDY_BIN" reload --config "$CADDYFILE" --force || systemctl restart caddy.service
+        fi
+    fi
 
-    info "Waiting for new certificate..."
-    count=0
-    max_wait=40
-    until [ -d /etc/caddy/certificates ]; do
+    info "Waiting for certificate material..."
+    local count=0 max_wait=40
+    until find "${CADDY_DIR}/certificates" -name '*.crt' -type f 2>/dev/null | grep -q .; do
         count=$((count + 1))
-        if (( count > max_wait )); then
-            error "Certificate renewal failed. Check: journalctl -u caddy --no-pager -n 30"
+        if [ "$count" -gt "$max_wait" ]; then
+            error "Certificate check failed. Check: journalctl -u caddy --no-pager -n 50"
         fi
         sleep 3
     done
-    ok "Certificate renewed successfully"
+
+    local cert_file expiry
+    cert_file=$(find "${CADDY_DIR}/certificates" -name '*.crt' -type f 2>/dev/null | head -1 || true)
+    if [ -n "$cert_file" ] && check_cmd openssl; then
+        expiry=$(openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | cut -d= -f2 || true)
+        ok "Certificate present (expires: ${expiry:-unknown})"
+    else
+        ok "Certificate material present"
+    fi
     exit 0
 }
 
-# ==================== 子命令：status ====================
 do_status() {
+    local show_link=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --show-link|--link) show_link=1; shift ;;
+            -h|--help) echo "Usage: easytrojan status [--show-link]"; exit 0 ;;
+            *) error "Unknown status argument: $1" ;;
+        esac
+    done
+
     echo ""
     if systemctl is-active --quiet caddy 2>/dev/null; then
         echo -e "  Service: ${GREEN}running${NC}"
     else
         echo -e "  Service: ${RED}stopped${NC}"
     fi
-
-    if [ -f /usr/local/bin/caddy ]; then
-        echo -e "  Version: $(/usr/local/bin/caddy version 2>/dev/null | awk '{print $1}' || echo 'unknown')"
+    if [ -x "$CADDY_BIN" ]; then
+        echo -e "  Version: $($CADDY_BIN version 2>/dev/null | awk '{print $1}' || echo 'unknown')"
+    else
+        echo -e "  Version: ${RED}not installed${NC}"
     fi
-
-    if [ -f /etc/caddy/trojan/passwd.txt ]; then
-        echo -e "  Users  : $(wc -l < /etc/caddy/trojan/passwd.txt)"
+    if [ -f "$PASSWD_FILE" ]; then
+        local user_count
+        user_count=$(grep -cve '^[[:space:]]*$' "$PASSWD_FILE" 2>/dev/null || true)
+        echo -e "  Users  : ${user_count:-0}"
     fi
+    local domain=""
+    domain=$(read_installed_domain 2>/dev/null || true)
+    [ -n "$domain" ] && echo -e "  Domain : ${CYAN}${domain}${NC}"
 
-    # 证书信息
-    local cert_dir="/etc/caddy/certificates"
+    local cert_dir="${CADDY_DIR}/certificates"
     if [ -d "$cert_dir" ]; then
-        local cert_file
+        local cert_file expiry
         cert_file=$(find "$cert_dir" -name "*.crt" -type f 2>/dev/null | head -1)
         if [ -n "$cert_file" ] && check_cmd openssl; then
-            local expiry
             expiry=$(openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | cut -d= -f2)
             echo -e "  Cert   : expires $expiry"
         else
@@ -139,237 +1063,217 @@ do_status() {
         echo -e "  Cert   : ${RED}not found${NC}"
     fi
 
-    # 分享链接
-    if [ -f /etc/caddy/trojan/passwd.txt ] && [ -f /etc/caddy/Caddyfile ]; then
-        local domain passwd
-        domain=$(grep -oP '(?<=:443, )[\w.-]+' /etc/caddy/Caddyfile 2>/dev/null | head -1)
-        passwd=$(head -1 /etc/caddy/trojan/passwd.txt)
-        if [ -n "$domain" ] && [ -n "$passwd" ]; then
-            local encoded_passwd
-            encoded_passwd=$(printf '%s' "$passwd" | sed 's/@/%40/g; s/:/%3A/g; s/!/%21/g; s/#/%23/g')
-            # 检查是否启用了 websocket
-            if grep -q "websocket" /etc/caddy/Caddyfile 2>/dev/null; then
-                echo -e "  Link   : ${CYAN}trojan://${encoded_passwd}@${domain}:443?security=tls&sni=${domain}&type=ws&host=${domain}&path=%2F#${domain}${NC}"
-            else
-                echo -e "  Link   : ${CYAN}trojan://${encoded_passwd}@${domain}:443?security=tls&sni=${domain}&type=tcp#${domain}${NC}"
-            fi
+    if systemctl list-timers --all 2>/dev/null | grep -q caddy-renew.timer; then
+        local next
+        next=$(systemctl list-timers --all 2>/dev/null | awk '/caddy-renew.timer/ {print $1" "$2" "$3" "$4" "$5; exit}')
+        echo -e "  Renew  : timer active (${next:-scheduled})"
+    else
+        echo -e "  Renew  : ${YELLOW}timer not installed${NC}"
+    fi
+
+    if [ "$show_link" = "1" ] && [ -f "$PASSWD_FILE" ] && [ -n "$domain" ]; then
+        local passwd transport="ws"
+        passwd=$(head -1 "$PASSWD_FILE")
+        if [ -f "$CADDYFILE" ] && ! grep -q "websocket" "$CADDYFILE" 2>/dev/null; then
+            transport="tcp"
         fi
+        if [ -n "$passwd" ]; then
+            echo -e "  Link   : ${CYAN}$(build_share_link "$domain" "$passwd" "$transport")${NC}"
+        fi
+    elif [ -f "$PASSWD_FILE" ] && [ -n "$domain" ]; then
+        echo -e "  Link   : ${YELLOW}hidden${NC} (use: easytrojan status --show-link)"
     fi
     echo ""
     exit 0
 }
 
-# ==================== 路由子命令 ====================
-case "${1:-}" in
-    update)  do_update ;;
-    renew)   do_renew ;;
-    status)  do_status ;;
-esac
+do_user() {
+    require_root
+    local sub="${1:-}"
+    [ -n "$sub" ] || error "Usage: easytrojan user {add|list|del} ..."
+    shift || true
 
-# ==================== 参数与环境检查 ====================
-trojan_passwd="${1:-}"
-caddy_domain="${2:-}"
-
-[ -z "$trojan_passwd" ] && error "Usage: bash easytrojan.sh <password> [domain]"
-[ "$(id -u)" != "0" ] && error "You must be root to run this script"
-
-# 检查端口占用（排除已有的 caddy 进程，支持重装场景）
-check_port=$(ss -Hlnp sport = :80 or sport = :443 | grep -v caddy || true)
-if [ -n "$check_port" ]; then
-    # 如果 caddy 正在运行，先停止它
-    if systemctl is-active --quiet caddy 2>/dev/null; then
-        info "Stopping existing Caddy service for reinstall..."
-        systemctl stop caddy
-    else
-        error "Port 80 or 443 is already in use by another process:\n$check_port"
-    fi
-fi
-
-# ==================== 备份已有证书（重装场景） ====================
-cert_backup=""
-if [ -d /etc/caddy/certificates ]; then
-    info "Backing up existing certificates..."
-    cert_backup="/tmp/caddy-cert-backup-$$"
-    mkdir -p "$cert_backup"
-    cp -r /etc/caddy/certificates "$cert_backup/" 2>/dev/null || true
-    cp -r /etc/caddy/acme "$cert_backup/" 2>/dev/null || true
-    ok "Certificates backed up"
-fi
-
-# 获取服务器 IP（多源备用）
-info "Detecting server IP..."
-address_ip=""
-for ip_service in "ipv4.ip.sb" "api.ipify.org" "ifconfig.me"; do
-    address_ip=$(curl -s --connect-timeout 5 --max-time 10 "$ip_service" 2>/dev/null) && break
-done
-[ -z "$address_ip" ] && error "Failed to detect server IP. Check network connectivity."
-nip_domain="${address_ip}.nip.io"
-info "Server IP: $address_ip"
-
-# 验证自定义域名
-if [ -n "$caddy_domain" ]; then
-    domain_ip=$(ping "${caddy_domain}" -c 1 -W 5 2>/dev/null | sed '1{s/[^(]*(//;s/).*//;q}')
-    [ "$domain_ip" != "$address_ip" ] && error "Domain '$caddy_domain' resolves to '$domain_ip', expected '$address_ip'"
-    nip_domain="$caddy_domain"
-    info "Using custom domain: $caddy_domain"
-fi
-
-# ==================== 依赖安装 ====================
-install_pkg() {
-    local pkg="$1"
-    if ! check_cmd "$pkg"; then
-        info "Installing $pkg..."
-        if check_cmd dnf; then
-            dnf install -y "$pkg" &>/dev/null
-        elif check_cmd yum; then
-            yum install -y "$pkg" &>/dev/null
-        elif check_cmd apt-get; then
-            apt-get update -qq &>/dev/null
-            apt-get install -y "$pkg" &>/dev/null
-        else
-            error "Unable to install $pkg: no supported package manager found"
-        fi
-    fi
+    case "$sub" in
+        add)
+            trojan_passwd=""
+            while [ "$#" -gt 0 ]; do
+                case "$1" in
+                    --password)
+                        [ -n "${2:-}" ] || error "--password requires a value"
+                        trojan_passwd="$2"
+                        shift 2
+                        ;;
+                    -h|--help) echo "Usage: easytrojan user add [--password PASSWORD]"; exit 0 ;;
+                    *) error "Unknown argument: $1" ;;
+                esac
+            done
+            prompt_password
+            require_caddy_running
+            add_trojan_user "$trojan_passwd" || error "Failed to add user via Admin API"
+            persist_password "$trojan_passwd"
+            ok "User added ($(mask_secret "$trojan_passwd"))"
+            local domain
+            domain=$(read_installed_domain 2>/dev/null || true)
+            if [ -n "$domain" ]; then
+                echo -e "  Share : ${CYAN}$(build_share_link "$domain" "$trojan_passwd" "ws")${NC}"
+            fi
+            ;;
+        list)
+            local i=0 line
+            if [ -f "$PASSWD_FILE" ]; then
+                echo "  Local passwd.txt (masked):"
+                while IFS= read -r line || [ -n "$line" ]; do
+                    [ -n "$line" ] || continue
+                    i=$((i + 1))
+                    echo -e "    ${i}. $(mask_secret "$line")"
+                done < "$PASSWD_FILE"
+            fi
+            if [ "$i" -eq 0 ]; then
+                echo "  (no local users)"
+            fi
+            # Runtime users via Admin API (key is password hash hex, not plaintext)
+            if systemctl is-active --quiet caddy 2>/dev/null; then
+                local runtime_json runtime_count tmpj
+                tmpj=$(mktemp)
+                if curl -sf "${ADMIN_API}/trojan/users" -o "$tmpj" 2>/dev/null; then
+                    runtime_count=$(grep -o '"key"' "$tmpj" 2>/dev/null | wc -l | tr -d ' ' || echo 0)
+                    echo "  Runtime users (API): ${runtime_count:-0}"
+                fi
+                rm -f "$tmpj"
+            fi
+            exit 0
+            ;;
+        del|delete|rm|remove)
+            trojan_passwd=""
+            while [ "$#" -gt 0 ]; do
+                case "$1" in
+                    --password)
+                        [ -n "${2:-}" ] || error "--password requires a value"
+                        trojan_passwd="$2"
+                        shift 2
+                        ;;
+                    -h|--help) echo "Usage: easytrojan user del --password PASSWORD"; exit 0 ;;
+                    *) error "Unknown argument: $1" ;;
+                esac
+            done
+            if [ -z "$trojan_passwd" ]; then
+                if [ -t 0 ]; then
+                    read -rsp "Password to delete: " trojan_passwd
+                    echo
+                else
+                    error "Password required: easytrojan user del --password PASSWORD"
+                fi
+            fi
+            [ -n "$trojan_passwd" ] || error "Password cannot be empty"
+            require_caddy_running
+            if [ -f "$PASSWD_FILE" ] && ! grep -Fxq -- "$trojan_passwd" "$PASSWD_FILE" 2>/dev/null; then
+                warn "Password not found in local passwd.txt; still trying Admin API"
+            fi
+            if delete_trojan_user "$trojan_passwd"; then
+                remove_password_from_file "$trojan_passwd"
+                ok "User deleted ($(mask_secret "$trojan_passwd"))"
+            else
+                error "Failed to delete user via Admin API (password may not exist in Caddy)"
+            fi
+            ;;
+        -h|--help|help)
+            cat <<'EOF'
+Usage:
+  easytrojan user add [--password PASSWORD]
+  easytrojan user list
+  easytrojan user del --password PASSWORD
+EOF
+            exit 0
+            ;;
+        *)
+            error "Unknown user subcommand: $sub (add|list|del)"
+            ;;
+    esac
+    exit 0
 }
 
-install_pkg tar
-install_pkg curl
+do_install() {
+    require_root
+    prompt_password
+    install_pkg tar
+    install_pkg curl
 
-# ==================== 下载 Caddy ====================
-case $(uname -m) in
-    x86_64)  arch="amd64" ;;
-    aarch64) arch="arm64" ;;
-    *)       error "Unsupported architecture: $(uname -m)" ;;
-esac
+    local check_port=""
+    if check_cmd ss; then
+        check_port=$(ss -Hlnp 'sport = :80 or sport = :443' 2>/dev/null | grep -v caddy || true)
+    elif check_cmd lsof; then
+        check_port=$(lsof -iTCP:80 -iTCP:443 -sTCP:LISTEN 2>/dev/null | grep -v caddy || true)
+    fi
+    if [ -n "${check_port}" ]; then
+        if systemctl is-active --quiet caddy 2>/dev/null; then
+            info "Stopping existing Caddy service for reinstall..."
+            systemctl stop caddy
+        else
+            error "Port 80 or 443 is already in use by another process:\n$check_port"
+        fi
+    fi
 
-caddy_url="https://github.com/zhongtait/caddy-trojan/releases/latest/download/caddy_trojan_linux_${arch}.tar.gz"
+    prompt_domain
 
-info "Downloading Caddy-Trojan (${arch})..."
-if ! curl -fsSL --connect-timeout 15 --max-time 180 "$caddy_url" | tar -zx -C /usr/local/bin caddy; then
-    error "Failed to download Caddy binary. Check network or try again."
-fi
-chmod +x /usr/local/bin/caddy
-ok "Caddy binary installed: $(/usr/local/bin/caddy version 2>/dev/null | awk '{print $1}' || echo 'unknown')"
+    info "Detecting server IP..."
+    address_ip=$(detect_public_ip) || error "Failed to detect public IPv4. Check network connectivity."
+    info "Server IP: $address_ip"
+    site_domain="$caddy_domain"
 
-# ==================== 创建用户与目录 ====================
-if ! id caddy &>/dev/null; then
-    groupadd --system caddy
-    useradd --system -g caddy -s "$(command -v nologin)" caddy
-fi
+    if [ "${skip_domain_check:-0}" = "1" ]; then
+        warn "Skipping domain resolution check for ${site_domain}"
+    else
+        domain_ip=$(resolve_domain_ipv4 "$site_domain")
+        [ -z "$domain_ip" ] && error "Failed to resolve domain '$site_domain'"
+        if ! domain_points_to_ip "$site_domain" "$address_ip"; then
+            error "Domain '$site_domain' does not resolve to this server ($address_ip). Seen: $(resolve_domain_ipv4_list "$site_domain" | tr '\n' ' ')"
+        fi
+        info "Domain verified: $site_domain -> $address_ip"
+    fi
 
-mkdir -p /etc/caddy/trojan
-chown -R caddy:caddy /etc/caddy
-chmod 700 /etc/caddy
+    warn "Ensure cloud security group / firewall allows inbound TCP 80 and 443 from the public Internet (ACME needs 80)."
 
-# 使用自定义域名时清除旧证书以重新申请
-[ -n "$caddy_domain" ] && rm -rf /etc/caddy/certificates
+    local cert_backup="" previous_domain=""
+    previous_domain=$(read_installed_domain 2>/dev/null || true)
+    if [ -d "${CADDY_DIR}/certificates" ]; then
+        info "Backing up existing certificates..."
+        cert_backup=$(mktemp -d /tmp/caddy-cert-backup.XXXXXX)
+        chmod 700 "$cert_backup"
+        cp -a "${CADDY_DIR}/certificates" "$cert_backup/" 2>/dev/null || true
+        cp -a "${CADDY_DIR}/acme" "$cert_backup/" 2>/dev/null || true
+        ok "Certificates backed up"
+    fi
 
-# ==================== 伪装页面 ====================
-# 生成一个看起来像个人技术博客的伪装页面
-mkdir -p /etc/caddy/www
-cat > /etc/caddy/www/index.html <<'HTMLEOF'
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dev Notes - A Personal Blog about Software Engineering</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: Georgia, 'Times New Roman', serif; color: #333; line-height: 1.8; background: #fafafa; }
-        a { color: #2563eb; text-decoration: none; }
-        a:hover { text-decoration: underline; }
-        .container { max-width: 720px; margin: 0 auto; padding: 0 20px; }
-        header { border-bottom: 1px solid #e5e7eb; padding: 40px 0 20px; margin-bottom: 40px; background: #fff; }
-        header .container { display: flex; justify-content: space-between; align-items: baseline; }
-        .site-title { font-size: 28px; font-weight: bold; color: #111; letter-spacing: -0.5px; }
-        .site-title a { color: #111; }
-        nav a { margin-left: 24px; color: #666; font-size: 15px; font-family: -apple-system, sans-serif; }
-        .post { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 32px; margin-bottom: 28px; }
-        .post-meta { font-family: -apple-system, sans-serif; font-size: 13px; color: #999; margin-bottom: 12px; }
-        .post-meta span { margin-right: 16px; }
-        .post h2 { font-size: 22px; margin-bottom: 14px; color: #111; line-height: 1.4; }
-        .post h2 a { color: #111; }
-        .post p { color: #555; font-size: 16px; margin-bottom: 12px; }
-        .read-more { font-family: -apple-system, sans-serif; font-size: 14px; font-weight: 500; }
-        .tag { display: inline-block; background: #f3f4f6; color: #666; padding: 2px 10px; border-radius: 12px; font-size: 12px; font-family: -apple-system, sans-serif; margin-right: 6px; }
-        .sidebar { margin-top: 48px; padding: 24px; background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; }
-        .sidebar h3 { font-size: 16px; margin-bottom: 12px; font-family: -apple-system, sans-serif; }
-        .sidebar p { font-size: 14px; color: #666; font-family: -apple-system, sans-serif; }
-        footer { text-align: center; padding: 40px 0; color: #999; font-size: 13px; font-family: -apple-system, sans-serif; }
-        @media (max-width: 768px) { header .container { flex-direction: column; gap: 12px; } nav a { margin-left: 0; margin-right: 16px; } }
-    </style>
-</head>
-<body>
-    <header>
-        <div class="container">
-            <div class="site-title"><a href="#">Dev Notes</a></div>
-            <nav>
-                <a href="#">Archive</a>
-                <a href="#">Tags</a>
-                <a href="#">About</a>
-            </nav>
-        </div>
-    </header>
-    <main class="container">
-        <article class="post">
-            <div class="post-meta">
-                <span>May 12, 2025</span>
-                <span class="tag">Rust</span>
-                <span class="tag">Performance</span>
-            </div>
-            <h2><a href="#">Understanding Zero-Cost Abstractions in Rust</a></h2>
-            <p>One of Rust's core promises is zero-cost abstractions: you don't pay a runtime penalty for using high-level constructs. But what does this actually mean in practice? Let's look at how the compiler optimizes iterators, closures, and trait objects...</p>
-            <a href="#" class="read-more">Continue reading &rarr;</a>
-        </article>
-        <article class="post">
-            <div class="post-meta">
-                <span>May 5, 2025</span>
-                <span class="tag">Distributed Systems</span>
-                <span class="tag">Architecture</span>
-            </div>
-            <h2><a href="#">Lessons Learned from Building a Multi-Region Database</a></h2>
-            <p>After spending two years working on a globally distributed database, I want to share some hard-won lessons about consistency models, conflict resolution, and why CRDTs aren't always the answer you think they are...</p>
-            <a href="#" class="read-more">Continue reading &rarr;</a>
-        </article>
-        <article class="post">
-            <div class="post-meta">
-                <span>Apr 28, 2025</span>
-                <span class="tag">Go</span>
-                <span class="tag">Concurrency</span>
-            </div>
-            <h2><a href="#">A Practical Guide to Go's Context Package</a></h2>
-            <p>The context package is one of Go's most important but often misunderstood features. In this post, I'll walk through real-world patterns for cancellation propagation, timeout handling, and the common pitfalls that trip up even experienced Go developers...</p>
-            <a href="#" class="read-more">Continue reading &rarr;</a>
-        </article>
-        <article class="post">
-            <div class="post-meta">
-                <span>Apr 19, 2025</span>
-                <span class="tag">Linux</span>
-                <span class="tag">Networking</span>
-            </div>
-            <h2><a href="#">Deep Dive into TCP BBR Congestion Control</a></h2>
-            <p>Google's BBR algorithm fundamentally changed how we think about congestion control. Instead of treating packet loss as the primary signal, BBR models the network path to find the optimal operating point. Here's how it works under the hood...</p>
-            <a href="#" class="read-more">Continue reading &rarr;</a>
-        </article>
-        <div class="sidebar">
-            <h3>About this blog</h3>
-            <p>Hi, I'm a software engineer writing about systems programming, distributed systems, and performance optimization. Views are my own. Feel free to reach out via the contact page.</p>
-        </div>
-    </main>
-    <footer>
-        <p>&copy; 2025 Dev Notes. Built with simplicity in mind.</p>
-    </footer>
-</body>
-</html>
-HTMLEOF
-chown -R caddy:caddy /etc/caddy/www
+    download_caddy
+    ok "Caddy binary installed: $($CADDY_BIN version 2>/dev/null | awk '{print $1}' || echo 'unknown')"
 
-# ==================== 生成 Caddyfile ====================
-# 参考上游 imgk/caddy-trojan 推荐配置
-info "Generating Caddyfile..."
-cat > /etc/caddy/Caddyfile <<EOF
+    if ! id caddy &>/dev/null; then
+        groupadd --system caddy
+        useradd --system -g caddy -s "$(command -v nologin || echo /usr/sbin/nologin)" -d /var/lib/caddy -M caddy 2>/dev/null \
+            || useradd --system -g caddy -s "$(command -v nologin || echo /usr/sbin/nologin)" caddy
+    fi
+    mkdir -p /var/lib/caddy
+    chown caddy:caddy /var/lib/caddy 2>/dev/null || true
+
+    mkdir -p "$TROJAN_DIR" "$WWW_DIR"
+    # Drop certs only when domain changes; same-domain reinstall keeps material to avoid LE rate limits
+    if [ -n "$previous_domain" ] && [ "$previous_domain" = "$site_domain" ] && [ -d "${CADDY_DIR}/certificates" ]; then
+        info "Same domain reinstall; keeping existing certificate material"
+    else
+        if [ -d "${CADDY_DIR}/certificates" ] || [ -d "${CADDY_DIR}/acme" ]; then
+            info "Domain changed or first install; clearing old certificate material for re-issue"
+            rm -rf "${CADDY_DIR}/certificates" "${CADDY_DIR}/acme"
+        fi
+    fi
+    ensure_cert_storage
+    chmod 700 "$TROJAN_DIR"
+
+    write_camouflage_site
+
+    info "Generating Caddyfile..."
+    cat > "$CADDYFILE" <<EOF
 {
+    admin 127.0.0.1:2019
     order trojan before file_server
     https_port 443
     servers :443 {
@@ -386,8 +1290,8 @@ cat > /etc/caddy/Caddyfile <<EOF
         no_proxy
     }
 }
-:443, $nip_domain {
-    tls ${address_ip}@nip.io
+:443, ${site_domain} {
+    tls admin@${site_domain}
     log {
         level ERROR
     }
@@ -395,18 +1299,29 @@ cat > /etc/caddy/Caddyfile <<EOF
         connect_method
         websocket
     }
-    file_server {
-        root /etc/caddy/www
-    }
+    # IT-Tools is a Vue SPA: unknown paths fall back to index.html
+    root * ${WWW_DIR}
+    try_files {path} /index.html
+    file_server
 }
+# HTTP-01 ACME needs port 80; do not blanket-redirect challenge paths
 :80 {
-    redir https://{host}{uri} permanent
+    @not_acme {
+        not path /.well-known/acme-challenge/*
+    }
+    redir @not_acme https://{host}{uri} permanent
+    root * ${WWW_DIR}
+    file_server
 }
 EOF
+    chown caddy:caddy "$CADDYFILE"
+    chmod 600 "$CADDYFILE"
+    printf '%s\n' "$site_domain" > "$DOMAIN_FILE"
+    chown caddy:caddy "$DOMAIN_FILE"
+    chmod 600 "$DOMAIN_FILE"
 
-# ==================== 生成 Systemd 服务 ====================
-info "Creating systemd service..."
-cat > /etc/systemd/system/caddy.service <<EOF
+    info "Creating systemd service..."
+    cat > /etc/systemd/system/caddy.service <<EOF
 [Unit]
 Description=Caddy
 Documentation=https://caddyserver.com/docs/
@@ -417,14 +1332,16 @@ Requires=network-online.target
 Type=notify
 User=caddy
 Group=caddy
-Environment=XDG_CONFIG_HOME=/etc XDG_DATA_HOME=/etc
-ExecStart=/usr/local/bin/caddy run --environ --config /etc/caddy/Caddyfile
-ExecReload=/usr/local/bin/caddy reload --config /etc/caddy/Caddyfile --force
+Environment=XDG_CONFIG_HOME=/etc XDG_DATA_HOME=/etc HOME=/var/lib/caddy
+ExecStart=${CADDY_BIN} run --environ --config ${CADDYFILE}
+ExecReload=${CADDY_BIN} reload --config ${CADDYFILE} --force
 TimeoutStopSec=5s
 LimitNOFILE=1048576
 LimitNPROC=512
 PrivateTmp=true
+NoNewPrivileges=true
 AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 Restart=on-failure
 RestartSec=5
 
@@ -432,218 +1349,137 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-# ==================== 启动服务 ====================
-# 确保 loopback 接口启用
-if ip link show lo | grep -q DOWN; then
-    ip link set lo up
-fi
-
-info "Starting Caddy service..."
-systemctl daemon-reload
-systemctl restart caddy.service
-systemctl enable caddy.service &>/dev/null
-
-# 等待 Caddy Admin API 就绪
-info "Waiting for Caddy API..."
-api_ready=0
-for i in $(seq 1 10); do
-    if curl -sf http://127.0.0.1:2019/config/ &>/dev/null; then
-        api_ready=1
-        break
+    if check_cmd ip && ip link show lo 2>/dev/null | grep -q DOWN; then
+        ip link set lo up || true
     fi
-    sleep 1
-done
-[ "$api_ready" = "0" ] && error "Caddy API not responding. Check: journalctl -u caddy --no-pager -n 20"
 
-# 添加 Trojan 用户
-curl -sf -X POST -H "Content-Type: application/json" \
-    -d "{\"password\": \"$trojan_passwd\"}" \
-    http://127.0.0.1:2019/trojan/users/add || error "Failed to add trojan user via API"
+    info "Starting Caddy service..."
+    systemctl daemon-reload
+    systemctl restart caddy.service
+    systemctl enable caddy.service &>/dev/null
 
-# 持久化密码（去重）
-echo "$trojan_passwd" >> /etc/caddy/trojan/passwd.txt
-sort -u /etc/caddy/trojan/passwd.txt -o /etc/caddy/trojan/passwd.txt
-ok "Trojan user added"
+    info "Waiting for Caddy API..."
+    wait_for_admin_api || error "Caddy API not responding. Check: journalctl -u caddy --no-pager -n 20"
+    assert_admin_local_only
 
-# ==================== 等待 SSL 证书 ====================
-info "Obtaining SSL certificate (this may take up to 2 minutes)..."
-count=0
-max_wait=40
-until [ -d /etc/caddy/certificates ]; do
-    count=$((count + 1))
-    if (( count > max_wait )); then
-        # 尝试从备份恢复证书
-        if [ -n "$cert_backup" ] && [ -d "$cert_backup/certificates" ]; then
-            warn "New certificate request failed. Restoring from backup..."
-            cp -r "$cert_backup/certificates" /etc/caddy/ 2>/dev/null || true
-            cp -r "$cert_backup/acme" /etc/caddy/ 2>/dev/null || true
-            chown -R caddy:caddy /etc/caddy
-            systemctl restart caddy.service
-            ok "Certificates restored from backup"
-        else
-            error "Certificate application failed after $((max_wait * 3))s.\nPlease check:\n  1. TCP ports 80 and 443 are open\n  2. Domain resolves correctly\n  3. journalctl -u caddy --no-pager -n 30"
+    add_trojan_user "$trojan_passwd" || error "Failed to add trojan user via API"
+    persist_password "$trojan_passwd"
+    # Reinstall may leave older passwords in passwd.txt; push them all into Caddy
+    sync_trojan_users_from_file
+    ok "Trojan user added"
+
+    info "Obtaining SSL certificate (this may take up to 2 minutes)..."
+    local count=0 max_wait=40
+    until find "${CADDY_DIR}/certificates" -name '*.crt' -type f 2>/dev/null | grep -q .; do
+        count=$((count + 1))
+        if [ "$count" -gt "$max_wait" ]; then
+            if [ -n "$cert_backup" ] && [ -d "${cert_backup}/certificates" ]; then
+                warn "New certificate request failed. Restoring from backup..."
+                cp -a "${cert_backup}/certificates" "${CADDY_DIR}/" 2>/dev/null || true
+                cp -a "${cert_backup}/acme" "${CADDY_DIR}/" 2>/dev/null || true
+                chown -R caddy:caddy "$CADDY_DIR"
+                systemctl restart caddy.service
+                ok "Certificates restored from backup"
+            else
+                error "Certificate application failed after $((max_wait * 3))s.\nPlease check:\n  1. TCP ports 80 and 443 are open\n  2. Domain A record points to this server\n  3. journalctl -u caddy --no-pager -n 30"
+            fi
+            break
         fi
-        break
+        sleep 3
+    done
+    if find "${CADDY_DIR}/certificates" -name '*.crt' -type f 2>/dev/null | grep -q .; then
+        ok "SSL certificate ready"
     fi
-    sleep 3
-done
-[ -d /etc/caddy/certificates ] && ok "SSL certificate ready"
+    [ -n "$cert_backup" ] && rm -rf "$cert_backup"
 
-# 清理备份
-[ -n "$cert_backup" ] && rm -rf "$cert_backup"
+    apply_sysctl_limits
+    setup_renew_timer
 
-# ==================== 系统优化（使用独立配置文件） ====================
-info "Applying system optimizations..."
+    info "Verifying installation..."
+    sleep 2
+    local check_http
+    check_http=$(curl -sL --max-time 10 "https://${site_domain}" -k 2>/dev/null | head -c 400 || true)
+    if echo "$check_http" | grep -qiE "it-tools|ByteDeck|IT Tools"; then
+        ok "HTTPS verification passed"
+    else
+        warn "HTTPS check inconclusive. Ensure TCP 80/443 are open."
+        warn "Verify by visiting: https://${site_domain}"
+    fi
 
-# 使用 /etc/sysctl.d/ 目录，便于管理和卸载
-cat > /etc/sysctl.d/99-caddy-trojan.conf <<EOF
-# Caddy-Trojan system optimizations
-fs.file-max = 1048576
-fs.inotify.max_user_instances = 8192
-net.core.somaxconn = 32768
-net.core.netdev_max_backlog = 32768
-net.core.rmem_max = 33554432
-net.core.wmem_max = 33554432
-net.ipv4.udp_rmem_min = 8192
-net.ipv4.udp_wmem_min = 8192
-net.ipv4.tcp_rmem = 4096 87380 33554432
-net.ipv4.tcp_wmem = 4096 16384 33554432
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_fin_timeout = 30
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.ip_local_port_range = 1024 65000
-net.ipv4.tcp_max_syn_backlog = 16384
-net.ipv4.tcp_max_tw_buckets = 6000
-net.ipv4.route.gc_timeout = 100
-net.ipv4.tcp_syn_retries = 1
-net.ipv4.tcp_synack_retries = 1
-net.ipv4.tcp_timestamps = 0
-net.ipv4.tcp_max_orphans = 32768
-net.ipv4.tcp_no_metrics_save = 1
-net.ipv4.tcp_ecn = 0
-net.ipv4.tcp_frto = 0
-net.ipv4.tcp_mtu_probing = 0
-net.ipv4.tcp_rfc1337 = 0
-net.ipv4.tcp_sack = 1
-net.ipv4.tcp_fack = 1
-net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_adv_win_scale = 1
-net.ipv4.tcp_moderate_rcvbuf = 1
-net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_notsent_lowat = 16384
-net.ipv4.conf.all.route_localnet = 1
-net.ipv4.ip_forward = 1
-net.ipv4.conf.all.forwarding = 1
-net.ipv4.conf.default.forwarding = 1
-EOF
+    install_self
+    ok "Management command installed: easytrojan / easytrojan.sh"
+    local share_link
+    share_link=$(build_share_link "$site_domain" "$trojan_passwd" "ws")
 
-# BBR 拥塞控制
-modprobe tcp_bbr &>/dev/null || true
-if grep -wq bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
-    echo "net.core.default_qdisc = fq" >> /etc/sysctl.d/99-caddy-trojan.conf
-    echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.d/99-caddy-trojan.conf
-fi
+    echo ""
+    echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║         EasyTrojan Installed Successfully!                  ║${NC}"
+    echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${GREEN}║${NC}  Address  : ${CYAN}${site_domain}${NC}"
+    echo -e "${GREEN}║${NC}  Port     : ${CYAN}443${NC}"
+    echo -e "${GREEN}║${NC}  Password : ${CYAN}${trojan_passwd}${NC}"
+    echo -e "${GREEN}║${NC}  ALPN     : ${CYAN}h2,http/1.1${NC}"
+    echo -e "${GREEN}║${NC}  Transport: ${CYAN}websocket${NC}"
+    echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${GREEN}║${NC}  Manage   : systemctl {start|stop|restart|status} caddy"
+    echo -e "${GREEN}║${NC}  Logs     : journalctl -u caddy --no-pager -n 50"
+    echo -e "${GREEN}║${NC}  Config   : ${CADDYFILE}"
+    echo -e "${GREEN}║${NC}  Update   : easytrojan update"
+    echo -e "${GREEN}║${NC}  Status   : easytrojan status"
+    echo -e "${GREEN}║${NC}  Renew    : easytrojan renew   # or renew --force"
+    echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${GREEN}║${NC}  ${YELLOW}Share Link:${NC}"
+    echo -e "${GREEN}║${NC}  ${CYAN}${share_link}${NC}"
+    echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+}
 
-sysctl --system &>/dev/null
+# -------------------- entry --------------------
+trojan_passwd=""
+caddy_domain=""
+release_version="latest"
+skip_domain_check="0"
 
-# 使用 limits.d 目录，便于管理和卸载
-cat > /etc/security/limits.d/caddy-trojan.conf <<EOF
-# Caddy-Trojan limits optimizations
-*     soft   nofile    1048576
-*     hard   nofile    1048576
-*     soft   nproc     1048576
-*     hard   nproc     1048576
-*     soft   core      1048576
-*     hard   core      1048576
-*     hard   memlock   unlimited
-*     soft   memlock   unlimited
-root  soft   nofile    1048576
-root  hard   nofile    1048576
-root  soft   nproc     1048576
-root  hard   nproc     1048576
-root  soft   core      1048576
-root  hard   core      1048576
-root  hard   memlock   unlimited
-root  soft   memlock   unlimited
-EOF
-
-ok "System optimizations applied (BBR: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 'N/A'))"
-
-# ==================== 证书自动续签定时器 ====================
-# Caddy 本身会自动续签，但添加一个定时重启作为保险
-# 每月 1 号和 15 号凌晨 3 点重启 Caddy 触发证书检查
-info "Setting up certificate renewal timer..."
-
-cat > /etc/systemd/system/caddy-renew.service <<EOF
-[Unit]
-Description=Caddy Certificate Renewal Check
-After=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/caddy reload --config /etc/caddy/Caddyfile --force
-User=caddy
-Group=caddy
-Environment=XDG_CONFIG_HOME=/etc XDG_DATA_HOME=/etc
-EOF
-
-cat > /etc/systemd/system/caddy-renew.timer <<EOF
-[Unit]
-Description=Caddy Certificate Renewal Timer
-
-[Timer]
-OnCalendar=*-*-01,15 03:00:00
-RandomizedDelaySec=3600
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
-
-systemctl daemon-reload
-systemctl enable caddy-renew.timer &>/dev/null
-systemctl start caddy-renew.timer &>/dev/null
-ok "Certificate renewal timer enabled (1st & 15th of each month)"
-
-# ==================== 验证安装 ====================
-info "Verifying installation..."
-sleep 2
-check_http=$(curl -sL --max-time 10 "https://${nip_domain}" -k 2>/dev/null | head -c 200 || echo "")
-if echo "$check_http" | grep -q "Dev Notes"; then
-    ok "HTTPS verification passed"
-else
-    warn "HTTPS check inconclusive. Please ensure TCP ports 80 and 443 are open."
-    warn "Verify by visiting: https://${nip_domain}"
-fi
-
-# ==================== 安装脚本到系统路径 ====================
-# 复制脚本到 /usr/local/bin 方便后续使用 update/renew/status 命令
-cp -f "$0" /usr/local/bin/easytrojan.sh 2>/dev/null || true
-chmod +x /usr/local/bin/easytrojan.sh 2>/dev/null || true
-
-# ==================== 完成 ====================
-# 生成分享链接（兼容 v2rayN / Clash / Shadowrocket 等客户端）
-encoded_passwd=$(printf '%s' "$trojan_passwd" | sed 's/@/%40/g; s/:/%3A/g; s/!/%21/g; s/#/%23/g')
-share_link="trojan://${encoded_passwd}@${nip_domain}:443?security=tls&sni=${nip_domain}&type=ws&host=${nip_domain}&path=%2F#${nip_domain}"
-
-clear
-echo ""
-echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}║         EasyTrojan Installed Successfully!                  ║${NC}"
-echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
-echo -e "${GREEN}║${NC}  Address  : ${CYAN}${nip_domain}${NC}"
-echo -e "${GREEN}║${NC}  Port     : ${CYAN}443${NC}"
-echo -e "${GREEN}║${NC}  Password : ${CYAN}${trojan_passwd}${NC}"
-echo -e "${GREEN}║${NC}  ALPN     : ${CYAN}h2,http/1.1${NC}"
-echo -e "${GREEN}║${NC}  Transport: ${CYAN}websocket${NC}"
-echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
-echo -e "${GREEN}║${NC}  Manage   : systemctl {start|stop|restart|status} caddy"
-echo -e "${GREEN}║${NC}  Logs     : journalctl -u caddy --no-pager -n 50"
-echo -e "${GREEN}║${NC}  Config   : /etc/caddy/Caddyfile"
-echo -e "${GREEN}║${NC}  Update   : bash easytrojan.sh update"
-echo -e "${GREEN}║${NC}  Status   : bash easytrojan.sh status"
-echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
-echo -e "${GREEN}║${NC}  ${YELLOW}Share Link (copy to v2rayN/Clash/Shadowrocket):${NC}"
-echo -e "${GREEN}║${NC}  ${CYAN}${share_link}${NC}"
-echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
-echo ""
+cmd="${1:-}"
+case "$cmd" in
+    install)
+        shift
+        parse_common_args "$@"
+        do_install
+        ;;
+    update)
+        shift
+        parse_common_args "$@"
+        do_update
+        ;;
+    renew)
+        shift
+        do_renew "$@"
+        ;;
+    status)
+        shift
+        do_status "$@"
+        ;;
+    user)
+        shift
+        do_user "$@"
+        ;;
+    help|-h|--help)
+        usage
+        exit 0
+        ;;
+    "")
+        usage
+        error "Missing command. Example: bash easytrojan.sh install"
+        ;;
+    *)
+        # Legacy: bash easytrojan.sh <password> <domain>
+        if [[ "$cmd" == -* ]]; then
+            error "Unknown option: $cmd (try: bash easytrojan.sh install --domain example.com)"
+        fi
+        trojan_passwd="$cmd"
+        caddy_domain="${2:-}"
+        [ -n "$caddy_domain" ] || error "Legacy usage requires domain: bash easytrojan.sh <password> <domain>"
+        do_install
+        ;;
+esac
