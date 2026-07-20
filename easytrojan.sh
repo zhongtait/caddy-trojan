@@ -404,23 +404,96 @@ assert_admin_local_only() {
     fi
 }
 
-add_trojan_user() {
-    local passwd="$1" payload
-    payload=$(printf '{"password":"%s"}' "$(json_escape "$passwd")")
-    curl -sf -X POST -H "Content-Type: application/json" -d "$payload" "${ADMIN_API}/trojan/users/add"
+# Quote a password for Caddyfile tokens (double-quoted string).
+caddyfile_quote() {
+    local s="$1"
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    printf '"%s"' "$s"
 }
 
-# Re-load every password from passwd.txt into the running process (needed after restart/reinstall)
-sync_trojan_users_from_file() {
-    [ -f "$PASSWD_FILE" ] || return 0
-    local line
-    while IFS= read -r line || [ -n "$line" ]; do
-        [ -n "$line" ] || continue
-        add_trojan_user "$line" >/dev/null 2>&1 || true
-    done < "$PASSWD_FILE"
+# Build users directive args: users "p1" "p2"
+build_users_directive() {
+    local line q args=""
+    if [ -f "$PASSWD_FILE" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            [ -n "$line" ] || continue
+            q=$(caddyfile_quote "$line")
+            args="${args} ${q}"
+        done < "$PASSWD_FILE"
+    fi
+    args=${args# }
+    if [ -n "$args" ]; then
+        printf '        users %s\n' "$args"
+    fi
 }
 
-delete_trojan_user() {
+# Generate /etc/caddy/Caddyfile from domain + passwd.txt.
+# Users are declared statically (imgk official style). With `caddy` upstream,
+# keys also live in Caddy storage; delete must clear storage via Admin API.
+generate_caddyfile() {
+    local site_domain="${1:-}"
+    if [ -z "$site_domain" ]; then
+        site_domain=$(read_installed_domain 2>/dev/null || true)
+    fi
+    [ -n "$site_domain" ] || error "Domain not set; cannot generate Caddyfile"
+    mkdir -p "$CADDY_DIR" "$WWW_DIR" "$TROJAN_DIR"
+    local users_block
+    users_block=$(build_users_directive)
+
+    cat > "$CADDYFILE" <<EOF
+{
+    admin 127.0.0.1:2019
+    order trojan before file_server
+    https_port 443
+    servers :443 {
+        listener_wrappers {
+            trojan
+        }
+        protocols h2 h1
+    }
+    servers :80 {
+        protocols h1
+    }
+    trojan {
+        caddy
+        no_proxy
+${users_block}    }
+}
+:443, ${site_domain} {
+    tls admin@${site_domain}
+    log {
+        level ERROR
+    }
+    trojan {
+        connect_method
+        websocket
+    }
+    # IT-Tools is a Vue SPA: unknown paths fall back to index.html
+    root * ${WWW_DIR}
+    try_files {path} /index.html
+    file_server
+}
+# HTTP-01 ACME needs port 80; do not blanket-redirect challenge paths
+:80 {
+    @not_acme {
+        not path /.well-known/acme-challenge/*
+    }
+    redir @not_acme https://{host}{uri} permanent
+    root * ${WWW_DIR}
+    file_server
+}
+EOF
+    chown caddy:caddy "$CADDYFILE"
+    chmod 600 "$CADDYFILE"
+    printf '%s\n' "$site_domain" > "$DOMAIN_FILE"
+    chown caddy:caddy "$DOMAIN_FILE"
+    chmod 600 "$DOMAIN_FILE"
+}
+
+# Best-effort clear of a user from caddy storage (imgk CaddyUpstream).
+# Required on delete: removing from Caddyfile alone does not drop storage keys.
+delete_trojan_user_storage() {
     local passwd="$1" payload
     payload=$(printf '{"password":"%s"}' "$(json_escape "$passwd")")
     # imgk/caddy-trojan: DELETE /trojan/users/delete  body: {"password":"..."}
@@ -439,6 +512,20 @@ remove_password_from_file() {
     chown caddy:caddy "$PASSWD_FILE" 2>/dev/null || true
 }
 
+reload_caddy() {
+    if ! systemctl is-active --quiet caddy 2>/dev/null; then
+        return 0
+    fi
+    if systemctl reload caddy.service 2>/dev/null; then
+        return 0
+    fi
+    if [ -x "$CADDY_BIN" ] && "$CADDY_BIN" reload --config "$CADDYFILE" --force 2>/dev/null; then
+        return 0
+    fi
+    warn "Caddy reload failed; restarting service..."
+    systemctl restart caddy.service
+}
+
 mask_secret() {
     local s="$1" n=${#1}
     if [ "$n" -le 4 ]; then
@@ -446,11 +533,6 @@ mask_secret() {
     else
         printf '%s***%s' "${s:0:2}" "${s: -2}"
     fi
-}
-
-require_caddy_running() {
-    systemctl is-active --quiet caddy 2>/dev/null || error "Caddy service is not running"
-    wait_for_admin_api || error "Caddy Admin API not responding on ${ADMIN_API}"
 }
 
 persist_password() {
@@ -954,7 +1036,7 @@ do_update() {
             systemctl restart caddy.service
             wait_for_admin_api || warn "Caddy API not ready after update"
             assert_admin_local_only || true
-            sync_trojan_users_from_file
+            # Users come from Caddyfile `users` + caddy storage; no API re-inject needed.
         fi
         ok "Caddy updated: $old_version -> $new_version"
     fi
@@ -1108,15 +1190,20 @@ do_user() {
                 esac
             done
             prompt_password
-            require_caddy_running
-            add_trojan_user "$trojan_passwd" || error "Failed to add user via Admin API"
-            persist_password "$trojan_passwd"
-            ok "User added ($(mask_secret "$trojan_passwd"))"
             local domain
             domain=$(read_installed_domain 2>/dev/null || true)
-            if [ -n "$domain" ]; then
-                echo -e "  Share : ${CYAN}$(build_share_link "$domain" "$trojan_passwd" "ws")${NC}"
+            [ -n "$domain" ] || error "Domain not found. Re-run: easytrojan install --domain example.com"
+            persist_password "$trojan_passwd"
+            info "Regenerating Caddyfile with static users..."
+            generate_caddyfile "$domain"
+            if systemctl is-active --quiet caddy 2>/dev/null; then
+                reload_caddy
+                wait_for_admin_api || warn "Caddy Admin API not ready after reload"
+            else
+                warn "Caddy is not running; Caddyfile updated. Start with: systemctl start caddy"
             fi
+            ok "User added ($(mask_secret "$trojan_passwd"))"
+            echo -e "  Share : ${CYAN}$(build_share_link "$domain" "$trojan_passwd" "ws")${NC}"
             ;;
         list)
             local i=0 line
@@ -1131,13 +1218,13 @@ do_user() {
             if [ "$i" -eq 0 ]; then
                 echo "  (no local users)"
             fi
-            # Runtime users via Admin API (key is password hash hex, not plaintext)
+            # Optional: runtime storage keys (hash hex, not plaintext)
             if systemctl is-active --quiet caddy 2>/dev/null; then
-                local runtime_json runtime_count tmpj
+                local runtime_count tmpj
                 tmpj=$(mktemp)
                 if curl -sf "${ADMIN_API}/trojan/users" -o "$tmpj" 2>/dev/null; then
                     runtime_count=$(grep -o '"key"' "$tmpj" 2>/dev/null | wc -l | tr -d ' ' || echo 0)
-                    echo "  Runtime users (API): ${runtime_count:-0}"
+                    echo "  Runtime storage keys (API): ${runtime_count:-0}"
                 fi
                 rm -f "$tmpj"
             fi
@@ -1165,16 +1252,27 @@ do_user() {
                 fi
             fi
             [ -n "$trojan_passwd" ] || error "Password cannot be empty"
-            require_caddy_running
+            local domain
+            domain=$(read_installed_domain 2>/dev/null || true)
+            [ -n "$domain" ] || error "Domain not found. Re-run install first."
             if [ -f "$PASSWD_FILE" ] && ! grep -Fxq -- "$trojan_passwd" "$PASSWD_FILE" 2>/dev/null; then
-                warn "Password not found in local passwd.txt; still trying Admin API"
+                warn "Password not found in local passwd.txt; still clearing storage + Caddyfile"
             fi
-            if delete_trojan_user "$trojan_passwd"; then
-                remove_password_from_file "$trojan_passwd"
-                ok "User deleted ($(mask_secret "$trojan_passwd"))"
+            remove_password_from_file "$trojan_passwd"
+            generate_caddyfile "$domain"
+            # With `caddy` upstream, delete storage key or Validate still succeeds after reload.
+            if systemctl is-active --quiet caddy 2>/dev/null; then
+                wait_for_admin_api || true
+                if delete_trojan_user_storage "$trojan_passwd"; then
+                    ok "Cleared user from Caddy storage"
+                else
+                    warn "Admin API delete failed (user may already be gone from storage)"
+                fi
+                reload_caddy
             else
-                error "Failed to delete user via Admin API (password may not exist in Caddy)"
+                warn "Caddy is not running; passwd/Caddyfile updated only"
             fi
+            ok "User deleted ($(mask_secret "$trojan_passwd"))"
             ;;
         -h|--help|help)
             cat <<'EOF'
@@ -1182,6 +1280,9 @@ Usage:
   easytrojan user add [--password PASSWORD]
   easytrojan user list
   easytrojan user del --password PASSWORD
+
+Users are stored in passwd.txt, declared in Caddyfile (users "..."),
+and (with caddy upstream) keyed in Caddy storage. Delete clears all three.
 EOF
             exit 0
             ;;
@@ -1270,55 +1371,10 @@ do_install() {
 
     write_camouflage_site
 
+    # Source of truth: passwd.txt -> Caddyfile static users (imgk style)
+    persist_password "$trojan_passwd"
     info "Generating Caddyfile..."
-    cat > "$CADDYFILE" <<EOF
-{
-    admin 127.0.0.1:2019
-    order trojan before file_server
-    https_port 443
-    servers :443 {
-        listener_wrappers {
-            trojan
-        }
-        protocols h2 h1
-    }
-    servers :80 {
-        protocols h1
-    }
-    trojan {
-        caddy
-        no_proxy
-    }
-}
-:443, ${site_domain} {
-    tls admin@${site_domain}
-    log {
-        level ERROR
-    }
-    trojan {
-        connect_method
-        websocket
-    }
-    # IT-Tools is a Vue SPA: unknown paths fall back to index.html
-    root * ${WWW_DIR}
-    try_files {path} /index.html
-    file_server
-}
-# HTTP-01 ACME needs port 80; do not blanket-redirect challenge paths
-:80 {
-    @not_acme {
-        not path /.well-known/acme-challenge/*
-    }
-    redir @not_acme https://{host}{uri} permanent
-    root * ${WWW_DIR}
-    file_server
-}
-EOF
-    chown caddy:caddy "$CADDYFILE"
-    chmod 600 "$CADDYFILE"
-    printf '%s\n' "$site_domain" > "$DOMAIN_FILE"
-    chown caddy:caddy "$DOMAIN_FILE"
-    chmod 600 "$DOMAIN_FILE"
+    generate_caddyfile "$site_domain"
 
     info "Creating systemd service..."
     cat > /etc/systemd/system/caddy.service <<EOF
@@ -1361,12 +1417,7 @@ EOF
     info "Waiting for Caddy API..."
     wait_for_admin_api || error "Caddy API not responding. Check: journalctl -u caddy --no-pager -n 20"
     assert_admin_local_only
-
-    add_trojan_user "$trojan_passwd" || error "Failed to add trojan user via API"
-    persist_password "$trojan_passwd"
-    # Reinstall may leave older passwords in passwd.txt; push them all into Caddy
-    sync_trojan_users_from_file
-    ok "Trojan user added"
+    ok "Trojan users loaded from Caddyfile (passwd.txt)"
 
     info "Obtaining SSL certificate (this may take up to 2 minutes)..."
     local count=0 max_wait=40
