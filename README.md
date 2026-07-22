@@ -1,31 +1,55 @@
 # caddy-trojan
 
-一键部署 Caddy + Trojan 代理服务。基于 [imgk/caddy-trojan](https://github.com/imgk/caddy-trojan) 模块构建。
+一键部署 **Caddy + Trojan**。基于 [imgk/caddy-trojan](https://github.com/imgk/caddy-trojan) 构建。
 
-支持系统：CentOS/RedHat 7+、Debian 9+、Ubuntu 16+  
-支持架构：x86_64 (amd64)、aarch64 (arm64)
+| | |
+|--|--|
+| 系统 | CentOS/RHEL 7+、Debian 9+、Ubuntu 16+ |
+| 架构 | x86_64 (amd64)、aarch64 (arm64) |
+
+## 目录
+
+- [前置条件](#前置条件)
+- [特性](#特性)
+- [快速安装](#快速安装)
+- [管理命令](#管理命令)
+- [证书 / TLS](#证书--tls)
+- [Cloudflare](#cloudflare)
+- [节点聚合 Hub](#节点聚合-hub)
+- [客户端](#客户端)
+- [常见问题](#常见问题)
+- [安全](#安全)
+- [重装与卸载](#重装与卸载)
+- [项目结构](#项目结构)
+- [致谢](#致谢)
 
 ## 前置条件
 
-- 已有可用域名，且 **A 记录已指向服务器公网 IP**
-- 防火墙放行 TCP **80** 与 **443**
+- 可用域名（安装必填；不使用 nip.io）
+- 放行 TCP **80**、**443**
 - root 权限
+
+| 接入方式 | 推荐 TLS | 说明 |
+|----------|----------|------|
+| 域名直连 / Cloudflare **灰云** | `auto` | Caddy ACME 自动证书 |
+| Cloudflare **橙云** 长期代理 | `origin` | Cloudflare Origin 证书 |
+
+```bash
+# 放行端口（任选）
+firewall-cmd --permanent --add-port=80/tcp --add-port=443/tcp && firewall-cmd --reload   # RHEL
+sudo ufw allow proto tcp from any to any port 80,443                                     # Debian/Ubuntu
+```
 
 ## 特性
 
-- 一键安装；TLS 支持 **auto（Caddy ACME）** 与 **origin（Cloudflare Origin / 文件证书）**
-- 支持 WebSocket 传输 + CONNECT 方法
-- 伪装站点（file_server）
-- 交互式输入密码，降低 shell history 泄露风险
-- 下载 Release 时校验 `SHA256SUMS`（可用时）
-- Admin API 固定监听 `127.0.0.1:2019`
-- 自动启用 BBR（内核支持时）
-- 可逆的 sysctl / limits 优化
-- 每日检查上游更新并构建最新二进制
+- Trojan：WebSocket + CONNECT；TLS：`auto` / `origin`
+- 伪装站：默认 [IT-Tools](https://github.com/CorentinTh/it-tools)，失败回退内置 ByteDeck
+- 用户：`passwd.txt` → Caddyfile 静态 `users` → reload（与上游一致）
+- Admin API 仅 `127.0.0.1:2019`；Release 校验 `SHA256SUMS`（可用时）
+- 脚本模块化：`easytrojan.sh` + `lib/*.sh`（安装到 `/usr/local/share/easytrojan/lib`）
+- 可选 Hub：多机聚合 base64 订阅；`?server=` / `?port=` 支持优选 IP
 
 ## 快速安装
-
-推荐交互式安装（会提示输入域名与密码）：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/zhongtait/caddy-trojan/main/easytrojan.sh -o easytrojan.sh \
@@ -33,334 +57,294 @@ curl -fsSL https://raw.githubusercontent.com/zhongtait/caddy-trojan/main/easytro
   && sudo bash easytrojan.sh install --domain yourdomain.com
 ```
 
-完整参数示例：
+会提示输入 Trojan 密码。一次写完示例：
 
 ```bash
-# 密码 + 域名
+# 直连 / 灰云（ACME）
 sudo bash easytrojan.sh install --domain yourdomain.com --password 'your-strong-password'
+
+# 橙云 + Origin（跳过「域名 A = 本机 IP」校验）
+sudo bash easytrojan.sh install --domain yourdomain.com --password 'your-strong-password' \
+  --tls-mode origin --origin-cert /path/origin.pem --origin-key /path/origin.key \
+  --skip-domain-check
 
 # 锁定 Release 版本
 sudo bash easytrojan.sh install --domain yourdomain.com --password 'your-strong-password' \
   --version 'v2.11.3+trojan.932ef9b'
 
-# 跳过域名 A 记录校验（仅当你确认 DNS 正确时）
-sudo bash easytrojan.sh install --domain yourdomain.com --password 'your-strong-password' \
-  --skip-domain-check
-
-# Cloudflare Origin 证书（橙云代理长期使用推荐）
-sudo bash easytrojan.sh install --domain yourdomain.com --tls-mode origin \
-  --origin-cert /path/origin.pem --origin-key /path/origin.key --skip-domain-check
-```
-
-兼容旧用法（域名必填）：
-
-```bash
-sudo bash easytrojan.sh 'your-strong-password' yourdomain.com
-```
-
-安装成功后会显示连接参数与分享链接。
-
-## 放行端口
-
-```bash
-# RHEL 系列
-firewall-cmd --permanent --add-port=80/tcp --add-port=443/tcp && firewall-cmd --reload
-
-# Debian / Ubuntu
-sudo ufw allow proto tcp from any to any port 80,443
-```
-
-验证：浏览器访问 `https://yourdomain.com`，应看到 **IT-Tools** 工具站（[CorentinTh/it-tools](https://github.com/CorentinTh/it-tools)）。若 GitHub 不可达，会回退到内置 ByteDeck 工具页。
-
-可选：指定 IT-Tools 版本（默认 latest）：
-
-```bash
+# 指定 IT-Tools 版本（可选）
 sudo IT_TOOLS_VERSION=v2024.10.22-7ca5933 bash easytrojan.sh install --domain yourdomain.com
 ```
 
+兼容旧用法：`sudo bash easytrojan.sh 'password' yourdomain.com`
+
+安装成功后会打印连接参数；分享链接默认隐藏，用 `easytrojan status --show-link`。
+
+> 只下载入口脚本时，会从本仓库 raw 拉取 `lib/*.sh` 并安装到 `/usr/local/share/easytrojan/lib`；完整 clone 时优先用本地 `lib/`。
+
+浏览器访问 `https://yourdomain.com` 应打开 **IT-Tools**。
+
 ## 管理命令
 
-安装后会写入 `/usr/local/bin/easytrojan`（兼容 `easytrojan.sh`）：
+安装后：`/usr/local/bin/easytrojan`（兼容 `easytrojan.sh`）。
+
+| 命令 | 作用 |
+|------|------|
+| `status` / `status --show-link` | 状态；加 `--show-link` 打印链接 |
+| `link --server IP [--port PORT]` | 生成分享链接（优选 IP / 端口） |
+| `update [--version VER]` | 更新脚本模块 + Caddy 二进制 |
+| `renew` / `renew --force` | ACME 续签辅助（**勿**对 origin 用 `--force`） |
+| `cert {auto\|origin\|status}` | 查看 / 切换 TLS 方案 |
+| `user {add\|list\|del}` | 管理 Trojan 用户 |
+| `hub ...` | 节点聚合（见下文） |
 
 ```bash
-sudo easytrojan status                 # 默认不打印分享链接
-sudo easytrojan status --show-link     # 需要时再显示
-sudo easytrojan status --show-link --server 104.16.1.1  # CF 优选 IP
-sudo easytrojan link --server 104.16.1.1
+sudo easytrojan status
+sudo easytrojan status --show-link --server 104.16.1.1 --port 443
+sudo easytrojan link --server 104.16.1.1 --port 2053
 sudo easytrojan update
-sudo easytrojan update --version 'v2.11.3+trojan.932ef9b'
-sudo easytrojan renew
-sudo easytrojan renew --force          # ACME 强制重签（origin 模式不适用）
-
-# TLS 方案
-sudo easytrojan cert status            # 查看 auto / origin
-sudo easytrojan cert auto              # 切回 Caddy ACME
-sudo easytrojan cert origin --cert /path/origin.pem --key /path/origin.key
-
-# 用户管理
-sudo easytrojan user add               # 交互输入密码
+sudo easytrojan cert status
 sudo easytrojan user add --password 'another-strong-password'
-sudo easytrojan user list              # 密码脱敏显示
 sudo easytrojan user del --password 'password-to-remove'
 
-用户写入 `passwd.txt`，并生成 Caddyfile 全局块中的 `users "..."`（与 [imgk/caddy-trojan](https://github.com/imgk/caddy-trojan) 官方示例一致）。
-删除用户会 `reload` 配置，并调用 Admin API 清理 `caddy` upstream 的 storage 键。
-
-systemctl {start|stop|restart|status} caddy
+systemctl status caddy
 journalctl -u caddy --no-pager -n 50
-cat /etc/caddy/Caddyfile
 ```
 
-默认 **auto** 模式下证书由 Caddy ACME 自动续签；另有 systemd 每日 timer（`caddy-renew.timer`）做维护检查。**origin** 模式使用你上传的证书文件，需自行在到期前更换（timer 只会告警）。`status` 会显示 TLS 模式与到期时间；分享链接需加 `--show-link`。
+用户文件：`/etc/caddy/trojan/passwd.txt` → Caddyfile `users "..."`。删除时会 reload，并调用 Admin API 清理 `caddy` upstream 在 storage 中的键。
 
+## 证书 / TLS
 
+状态：`/etc/caddy/trojan/tls-mode.txt`。重装未写 `--tls-mode` 时保留原方案；origin 可复用 `/etc/caddy/certs`。
 
-## 证书 / TLS 方案
+| 方案 | 场景 | 证书 | 续签 |
+|------|------|------|------|
+| **auto**（默认） | 直连 / 灰云 | Caddy ACME | 自动 + `caddy-renew.timer` |
+| **origin** | 橙云长期 | Origin 或任意 cert/key | 手动：`easytrojan cert origin` |
 
-安装脚本支持两种 TLS 方案（写入 `/etc/caddy/trojan/tls-mode.txt`，生成 Caddyfile 时生效）：
-
-| 方案 | 适用场景 | 证书来源 | 续签 |
-|------|----------|----------|------|
-| **auto**（默认） | 域名直连服务器，或 Cloudflare **仅 DNS（灰云）** | Caddy 自动 ACME（Let's Encrypt 等） | 自动；`caddy-renew.timer` 辅助 |
-| **origin** | Cloudflare **橙云代理** 长期使用 | Cloudflare Origin Certificate（或任意 cert/key 文件） | 手动；到期前 `easytrojan cert origin` 替换 |
-
-### 方案 A：auto（推荐入门）
+### auto
 
 ```bash
 sudo bash easytrojan.sh install --domain yourdomain.com
 ```
 
-要求：域名 A 记录指向本机；开放 TCP **80** 与 **443**（ACME HTTP-01 需要 80）。
+域名 A 指本机；开放 80/443（HTTP-01）。
 
-### 方案 B：origin（Cloudflare 代理）
+### origin（Cloudflare）
 
-长期 **橙云** 时推荐：访客用 Cloudflare **边缘证书**，源站用 **Origin Certificate**（只用于 CF 到你的 VPS）。
+**1. 申请 Origin 证书**
 
-| 证书 | 谁签发 | 用途 | 是否要你申请 |
-|------|--------|------|--------------|
-| 边缘证书（Universal SSL 等） | Cloudflare | 浏览器 ↔ Cloudflare | 一般不用，橙云后自动有 |
-| Origin Certificate | Cloudflare | Cloudflare ↔ 源站 Caddy | **需要**，见下方步骤 |
-
-#### 如何申请 Cloudflare Origin 证书
-
-1. 域名已接入 [Cloudflare](https://dash.cloudflare.com/)，DNS A/AAAA 指向源站公网 IP。
-2. 打开域名 → **SSL/TLS** → **Origin Server**（源服务器）→ **Create Certificate**。
-3. 建议选项：
-   - 私钥类型：RSA (2048)
-   - 主机名：至少包含你的域名（如 `yourdomain.com`；需要子域可加 `*.yourdomain.com`）
-   - 有效期：按需选择（最长可数年，到期需自行更换）
-4. 创建后分别复制并保存两段 PEM（**Private Key 通常只显示一次**）：
+1. [Cloudflare Dashboard](https://dash.cloudflare.com/) → 域名 → **SSL/TLS** → **Origin Server** → **Create Certificate**
+2. 主机名含你的域名（可加 `*.yourdomain.com`）
+3. 保存 PEM（**Private Key 通常只显示一次**）：
 
 ```bash
-# 在服务器或本机保存（路径自定）
-nano origin.pem   # 粘贴 Origin Certificate（BEGIN CERTIFICATE）
-nano origin.key   # 粘贴 Private Key（BEGIN PRIVATE KEY / RSA PRIVATE KEY）
+nano origin.pem   # Certificate
+nano origin.key   # Private Key
 chmod 600 origin.key
 ```
 
-5. Cloudflare 面板其它设置：
-   - **SSL/TLS** 加密模式：**Full (strict)**（不要用 Flexible）
-   - 开启 **WebSockets**（详见下方「如何开启 WebSockets」）
-   - 源站代理状态：**已代理（橙云）**
+**2. Cloudflare 面板**
 
-#### 安装到本项目
+| 项 | 值 |
+|----|-----|
+| DNS 代理 | **橙云（已代理）** |
+| SSL/TLS | **Full (strict)** |
+| Network → WebSockets | **On**（Trojan 默认 WS，橙云必开） |
 
-橙云后域名解析到的是 CF IP，安装时通常需要 `--skip-domain-check`：
+**3. 安装或切换**
 
-```bash
-# 安装时指定
-sudo bash easytrojan.sh install --domain yourdomain.com --tls-mode origin \
-  --origin-cert ./origin.pem --origin-key ./origin.key --skip-domain-check
-
-# 已安装后切换 / 更换证书
-sudo easytrojan cert origin --cert ./origin.pem --key ./origin.key
-sudo easytrojan cert auto    # 改回 ACME
-sudo easytrojan cert status
-```
-
-证书会复制到 `/etc/caddy/certs/origin.crt` 与 `origin.key`（权限 600，属主 `caddy`）。  
-Origin 证书**不会**被普通浏览器直接信任；用户经 Cloudflare 访问时看到的是边缘证书，因此正常。
-
-到期前在 Cloudflare 再创建一张 Origin 证书，然后重新执行 `easytrojan cert origin --cert ... --key ...`（不要用 `renew --force`，那是 ACME 用的）。
-
-### 场景一：还没装（直接用 Origin）
-
-1. 域名接入 Cloudflare：A/AAAA 指向 VPS；代理 **橙云**；SSL/TLS **Full (strict)**；开启 **WebSockets**。
-2. 按上文申请 Origin 证书，保存为 `origin.pem` / `origin.key`（私钥只显示一次），并传到服务器。
-3. 安装（橙云解析到 CF IP，通常需要跳过本机 IP 校验）：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/zhongtait/caddy-trojan/main/easytrojan.sh -o easytrojan.sh
-chmod +x easytrojan.sh
-
-sudo bash easytrojan.sh install --domain yourdomain.com --tls-mode origin \
-  --origin-cert /root/origin.pem --origin-key /root/origin.key \
-  --skip-domain-check
-```
-
-4. 检查：
-
-```bash
-sudo easytrojan cert status
-sudo easytrojan status
-# 浏览器访问 https://yourdomain.com 应能打开伪装站
-```
-
-5. 客户端：地址可用域名或 CF 优选 IP；**SNI / WS Host 仍填域名**。
-
-```bash
-sudo easytrojan status --show-link --server 优选IP
-# 或
-sudo easytrojan link --server 优选IP
-```
-
-### 场景二：已装好（默认 ACME），要改成 Origin
-
-前提：已通过 `easytrojan install` 安装且服务可运行。
-
-1. Cloudflare 侧完成橙云、**Full (strict)**、**WebSockets**，并申请 Origin 证书传到服务器（同上）。
-2. 切换 TLS 方案（密码与用户不改，仍用现有 `passwd.txt`）：
-
-```bash
-sudo easytrojan cert origin --cert /root/origin.pem --key /root/origin.key
-sudo easytrojan cert status
-sudo easytrojan status   # TLS 应为 origin
-```
-
-3. 以后只更换到期 Origin 证书时，在 Cloudflare 新建后再次执行 `cert origin`（不要用 `renew --force`，那是 ACME 用的）。
-4. 若要改回 ACME（更适合直连或灰云，且 80/443 可供签发）：
-
-```bash
-sudo easytrojan cert auto
-sudo easytrojan status
-```
-
-| | 还没装 | 已装要改 origin |
-|--|--------|-----------------|
-| 关键命令 | `install --tls-mode origin --origin-cert ... --origin-key ... --skip-domain-check` | `cert origin --cert ... --key ...` |
-| 密码 / 用户 | 安装时设置 | 不用动 |
-| 域名校验 | 橙云建议 `--skip-domain-check` | 不涉及 |
-
-## Cloudflare 与优选 IP
-
-网络较差时可把域名接入 [Cloudflare](https://www.cloudflare.com/)（DNS 橙云代理），在客户端使用 **CF 优选 IP** 作为连接地址，同时 **SNI / WS Host 仍填你的域名**。
-
-**证书建议：** 长期橙云用 **origin** 方案；灰云或直连用 **auto**。若仍用 auto 且橙云，需保证 ACME 挑战可达（通常更麻烦）。
-
-### 如何开启 WebSockets
-
-Trojan 默认走 **WebSocket**。域名走 Cloudflare **橙云代理** 时必须开启，否则握手容易失败。
-
-1. 打开 [Cloudflare Dashboard](https://dash.cloudflare.com/) → 选中域名。
-2. 左侧进入 **Network**（网络）。
-3. 找到 **WebSockets**，开关设为 **On**（开启）。
-4. 一般拨开即生效，无需额外保存（偶发延迟约 1～2 分钟）。
-
-同时建议确认：
-
-| 位置 | 设置 |
+| 场景 | 命令 |
 |------|------|
-| **DNS** | 记录为 **已代理（橙云）** |
-| **SSL/TLS → Overview** | 加密模式 **Full (strict)** |
-| **SSL/TLS → Origin Server** | 使用 origin 方案时已创建 Origin 证书 |
+| 新装 | `sudo bash easytrojan.sh install --domain yourdomain.com --tls-mode origin --origin-cert ./origin.pem --origin-key ./origin.key --skip-domain-check` |
+| 已装改 origin | `sudo easytrojan cert origin --cert ./origin.pem --key ./origin.key` |
+| 改回 ACME | `sudo easytrojan cert auto`（宜灰云/直连） |
+| 查看 | `sudo easytrojan cert status` |
 
-说明：
+文件落在 `/etc/caddy/certs/origin.crt` 与 `origin.key`（600，属主 `caddy`）。
 
-- 该开关为域名级（整区生效），不是按子域单独配置。
-- **灰云（仅 DNS）** 时流量不经 CF 代理，通常不依赖此开关；**橙云代理时必须开启**。
-- 客户端仍需：传输 WebSocket，SNI / Host 填你的域名。
-- 若界面与上述路径不一致，可在域名设置中搜索 **WebSockets**，或在 **Network** 相关页面查找同名开关。
+- 访客浏览器证书：Cloudflare 边缘自动提供
+- Origin 证书：仅 **Cloudflare ↔ 源站**；浏览器不直接信任
+- 到期后在 CF 新建，再执行 `cert origin`；**不要**对 origin 使用 `renew --force`
 
-### Cloudflare 侧
+## Cloudflare
 
-1. 域名接入 CF，A 记录指向源站公网 IP，代理状态为 **已代理（橙云）**。
-2. SSL/TLS 建议 **Full (strict)**；开启 **WebSockets**（见上方「如何开启 WebSockets」）。
-3. 安装脚本默认校验「域名解析 = 本机 IP」。橙云后解析到的是 CF IP，新装可用：
+橙云适合线路差时走 CF 边缘；客户端可用 **优选 IP** 作连接地址，**SNI / WS Host 仍填域名**。
 
-```bash
-sudo bash easytrojan.sh install --domain your.domain.com --skip-domain-check
-```
+### 开启 WebSockets
 
-更稳妥：先灰云（仅 DNS）完成安装与证书，再改为橙云。
+1. Dashboard → 域名 → **Network**
+2. **WebSockets** → **On**（偶发延迟 1～2 分钟）
 
-### 客户端
+灰云/直连通常不依赖此开关。路径若变更，在域名设置中搜索 **WebSockets**。
+
+### 安装注意
+
+橙云后解析到 CF IP，「域名 = 本机 IP」校验会失败，请加 `--skip-domain-check`。也可先灰云装好再改橙云。
+
+### 优选 IP 链接
 
 | 字段 | 值 |
 |------|-----|
-| 地址 | Cloudflare 优选 IP |
-| 端口 | 443 |
-| SNI | 你的域名 |
-| WS Host | 你的域名 |
+| 地址 | CF 优选 IP（或域名） |
+| 端口 | CF HTTPS 端口：443、2053、2083、2087、2096、8443 等（**不必是 443**） |
+| SNI / WS Host | 你的域名 |
 | path | `/` |
 | 传输 | WebSocket |
-| 密码 | 安装时设置的密码 |
-
-### 生成分享链接
-
-在服务器上（把 `104.16.1.1` 换成你测出的优选 IP）：
 
 ```bash
-sudo easytrojan status --show-link --server 104.16.1.1
-sudo easytrojan link --server 104.16.1.1
-sudo easytrojan link --server 104.16.1.1 --password 'your-password'
+sudo easytrojan status --show-link --server 104.16.1.1 --port 443
+sudo easytrojan link --server 104.16.1.1 --port 2053
 ```
 
-链接中 `@` 后面是连接地址（优选 IP），查询参数里的 `sni` / `host` 仍是域名。优选测速在客户端完成，服务器不负责扫描 CF IP。
+链接中 `@` 后为连接地址；`sni` / `host` 仍为域名。优选测速在客户端完成。
 
-## 安全建议
+## 节点聚合 Hub
 
-- 请使用强随机密码：`openssl rand -base64 24`
-- 不建议把密码直接写在 shell 命令中
-- 不要将 Caddy Admin API 端口 `2019` 暴露到公网
-- Release 包建议通过 `SHA256SUMS` 校验完整性
-- 更多说明见 [SECURITY.md](SECURITY.md)
+多台节点注册到**一台 Hub**，统一输出 base64 订阅。Hub 只监听 `127.0.0.1:2099`，经 Caddy 反代 `/sub/*`、`/api/*`（在伪装站 SPA 之前）。依赖 **python3 ≥ 3.8**。
 
-## 重新安装
+### Hub 主机
 
 ```bash
+sudo easytrojan hub enable
+sudo easytrojan hub token      # register_token / sub_token / 订阅 URL
+sudo easytrojan hub status
+sudo easytrojan hub list
+sudo easytrojan hub remove --id NODE_ID
+sudo easytrojan hub disable    # 关服务与反代，保留 nodes.json
+```
+
+`enable` 会安装 `easytrojan-hub` 与 systemd 单元、生成 token、注入 Caddy 反代，并尽量注册本机用户。
+
+### 节点加入
+
+```bash
+sudo easytrojan hub join \
+  --url https://hub.example.com \
+  --token 'REGISTER_TOKEN' \
+  --name hk-01 \
+  --server hk.example.com \
+  --port 443
+
+# 取消本机远端 membership（不清理远端已有条目）
+sudo easytrojan hub leave
+```
+
+- `--server` / `--port`：写入节点默认连接地址
+- 本机 `passwd.txt` 每个用户一条节点（多名用户时名称加 `-2`、`-3`…）
+- join 会保存 `/etc/caddy/trojan/hub-client.json`（600），之后 `user add/del` 会同步远端
+
+### 客户端订阅
+
+```text
+https://hub.example.com/sub/<sub_token>
+https://hub.example.com/sub/<sub_token>?server=104.16.1.1&port=443
+https://hub.example.com/sub/<sub_token>?server=104.16.1.1&port=2053
+```
+
+- 响应：base64 多行 `trojan://`
+- `server` / `port` **只改连接地址**；各节点 SNI / Host 仍是自己的域名
+- 取 URL：`easytrojan hub url` 或 `hub token`
+
+### 数据与同步
+
+| 路径 | 说明 |
+|------|------|
+| `/etc/caddy/trojan/hub/config.json` | register / sub token |
+| `/etc/caddy/trojan/hub/nodes.json` | 已注册节点 |
+| `/etc/caddy/trojan/hub/enabled` | Hub 开关 |
+| `/etc/caddy/trojan/hub-client.json` | 本机 join 的远端 membership |
+| `/usr/local/share/easytrojan/hub_server.py` | Hub 实现 |
+| `easytrojan-hub.service` | systemd 单元 |
+
+| 场景 | 行为 |
+|------|------|
+| 本机 `hub enable` 后 `user add/del` | 同步本机 `nodes.json` |
+| 节点 `hub join` 后 `user add/del` | 按 membership 自动 re-register / unregister |
+| 改密码或换名后远端仍旧 | 再 `hub join`（或 `hub leave` 后重新 join） |
+| 取消远端聚合 | `hub leave`（只删本地 membership） |
+
+> **安全：** 勿公开 `register_token`。订阅 URL 含 `sub_token`，泄露等同泄露全部节点密码。`hub-client.json` 含注册凭证，保持 600。
+
+## 客户端
+
+| 参数 | 值 |
+|------|-----|
+| 协议 | trojan |
+| 地址 | 域名，或 CF 优选 IP |
+| 端口 | 443 或 CF HTTPS 端口 |
+| 密码 | 安装时设置 |
+| TLS | 开启 |
+| ALPN | h2, http/1.1 |
+| 传输 | websocket |
+| SNI / Host | **域名**（用优选 IP 时也填域名） |
+| path | `/` |
+
+## 常见问题
+
+**浏览器提示证书不安全 / 显示 CloudFlare Origin Certificate**  
+直连了源站 IP。橙云 + origin 时应用域名经 Cloudflare 访问，不要用源站 IP。
+
+**`install` 报域名校验失败**  
+橙云解析到 CF IP 属正常，加 `--skip-domain-check`。
+
+**优选 IP 后客户端不通**  
+检查：WebSockets On、SSL **Full (strict)**、客户端 SNI/Host 为域名、端口为 CF 支持的 HTTPS 端口（可用 `link --port`）。
+
+**延迟测试偶发 fail**  
+多与客户端测速 / CF 边缘有关；连上再试几次。优先确认服务 `systemctl is-active caddy` 与 `easytrojan status`。
+
+**`caddy.service` 启动失败，tls 参数错误**  
+执行 `sudo caddy validate --config /etc/caddy/Caddyfile`，查看 `journalctl -u caddy -n 30`。origin 的 `tls cert key` 须单独成行；可 `easytrojan cert status` 后重新 `cert origin`。
+
+**只下载了入口脚本、update 拉模块失败**  
+确认仓库 `main` 已有 `lib/*.sh`，且机器能访问 `raw.githubusercontent.com`。
+
+## 安全
+
+- 强随机密码：`openssl rand -base64 24`；少把密码写进 shell history
+- 勿将 Admin API `2019` 暴露公网
+- Release 建议校验 `SHA256SUMS`；Origin 私钥勿进仓库或公开聊天
+- 详见 [SECURITY.md](SECURITY.md)
+
+## 重装与卸载
+
+```bash
+# 重装
 curl -fsSL https://raw.githubusercontent.com/zhongtait/caddy-trojan/main/easytrojan.sh -o easytrojan.sh \
   && chmod +x easytrojan.sh \
   && sudo bash easytrojan.sh install --domain yourdomain.com
 ```
 
-重装会自动备份已有证书；若新证书申请失败会尝试恢复备份。同域名重装会尽量复用现有证书，换域名时才会清空并重新申请。未指定 `--tls-mode` 时会保留已有 TLS 方案；origin 模式可复用 `/etc/caddy/certs` 中已安装的证书。
-
-## 完全卸载
+- 会备份已有 ACME 证书；新签失败时尝试恢复
+- 同域名尽量复用证书；换域名会清空并重签
+- 未指定 `--tls-mode` 时保留原方案；origin 可复用 `/etc/caddy/certs`
 
 ```bash
+# 卸载
 curl -fsSL https://raw.githubusercontent.com/zhongtait/caddy-trojan/main/uninstall.sh -o uninstall.sh \
   && chmod +x uninstall.sh \
   && sudo bash uninstall.sh
 ```
 
-非交互：`sudo bash uninstall.sh -y`
-
-## 客户端配置
-
-| 参数 | 值 |
-|------|------|
-| 协议 | trojan |
-| 地址 | 你的域名 |
-| 端口 | 443 |
-| 密码 | 安装时设置的密码 |
-| TLS | 开启 |
-| ALPN | h2,http/1.1 |
-| 传输 | websocket |
+非交互：`sudo bash uninstall.sh -y`（删除 `/etc/caddy` 等安装产物）。
 
 ## 项目结构
 
 | 文件 | 说明 |
 |------|------|
-| `easytrojan.sh` | 安装与运维脚本 |
-| `uninstall.sh` | 卸载脚本 |
-| `sha` | 上游 commit hash，变更触发自动构建 |
-| `SECURITY.md` | 安全策略 |
-| `CHANGELOG.md` | 变更记录 |
-| `.github/workflows/release.yml` | 构建并发布二进制 + SHA256SUMS |
-| `.github/workflows/test.yml` | 每日检查上游更新 |
+| `easytrojan.sh` | 入口（常量、模块加载、命令分发） |
+| `lib/*.sh` | 模块：common / tls / caddy / camouflage / system / hub / manage / install |
+| `hub_server.py` | 节点聚合 Hub（可选） |
+| `uninstall.sh` | 卸载 |
+| `sha` | 上游 commit；变更触发构建 |
+| `SECURITY.md` / `CHANGELOG.md` | 安全策略 / 变更记录 |
+| `.github/workflows/release.yml` | 构建发布 + SHA256SUMS |
+| `.github/workflows/test.yml` | 检查上游更新 |
 
 ## 致谢
 
 - [caddyserver/caddy](https://github.com/caddyserver/caddy)
 - [imgk/caddy-trojan](https://github.com/imgk/caddy-trojan)
 - [xcaddy](https://github.com/caddyserver/xcaddy)
+- [CorentinTh/it-tools](https://github.com/CorentinTh/it-tools)（默认伪装站）
