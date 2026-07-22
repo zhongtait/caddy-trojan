@@ -210,7 +210,7 @@ EOF
     echo -e "${GREEN}║${NC}  Address  : ${CYAN}${site_domain}${NC}"
     echo -e "${GREEN}║${NC}  Port     : ${CYAN}443${NC}"
     echo -e "${GREEN}║${NC}  Password : ${CYAN}${trojan_passwd}${NC}"
-    echo -e "${GREEN}║${NC}  ALPN     : ${CYAN}http/1.1${NC}  (WS + Cloudflare stable)"
+    echo -e "${GREEN}║${NC}  ALPN     : ${CYAN}http/1.1 only${NC}  ${YELLOW}(do NOT enable h2)${NC}"
     echo -e "${GREEN}║${NC}  Transport: ${CYAN}websocket${NC}"
     echo -e "${GREEN}║${NC}  TLS mode : ${CYAN}$(read_tls_mode)${NC}  (easytrojan cert status)"
     echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
@@ -223,6 +223,7 @@ EOF
     echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${GREEN}║${NC}  ${YELLOW}Share Link:${NC}"
     echo -e "${GREEN}║${NC}  ${CYAN}${share_link}${NC}"
+    echo -e "${GREEN}║${NC}  ${YELLOW}Client:${NC} ALPN=http/1.1 only; SNI/Host=domain; path=/"
     echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 }
