@@ -30,6 +30,15 @@ if [ "${1:-}" != "-y" ] && [ "${1:-}" != "--yes" ]; then
 fi
 echo ""
 
+if systemctl is-active --quiet easytrojan-hub 2>/dev/null || systemctl is-active --quiet easytrojan-hub.service 2>/dev/null; then
+    info "Stopping EasyTrojan hub..."
+    systemctl stop easytrojan-hub.service 2>/dev/null || true
+    ok "Hub stopped"
+fi
+if systemctl is-enabled --quiet easytrojan-hub.service 2>/dev/null; then
+    systemctl disable easytrojan-hub.service &>/dev/null || true
+fi
+
 if systemctl is-active --quiet caddy 2>/dev/null; then
     info "Stopping Caddy service..."
     systemctl stop caddy || true
@@ -49,12 +58,22 @@ if [ -f /usr/local/bin/caddy ]; then
     ok "Binary /usr/local/bin/caddy removed"
 fi
 
-for f in /usr/local/bin/easytrojan /usr/local/bin/easytrojan.sh /usr/local/bin/caddy-cert-maintain; do
+for f in /usr/local/bin/easytrojan /usr/local/bin/easytrojan.sh /usr/local/bin/caddy-cert-maintain /usr/local/bin/easytrojan-hub; do
     if [ -f "$f" ]; then
         rm -f "$f"
         ok "Removed $f"
     fi
 done
+
+if [ -d /usr/local/share/easytrojan ]; then
+    rm -rf /usr/local/share/easytrojan
+    ok "Removed /usr/local/share/easytrojan"
+fi
+
+if [ -f /etc/systemd/system/easytrojan-hub.service ]; then
+    rm -f /etc/systemd/system/easytrojan-hub.service
+    ok "Hub unit removed"
+fi
 
 if [ -f /etc/systemd/system/caddy.service ]; then
     rm -f /etc/systemd/system/caddy.service

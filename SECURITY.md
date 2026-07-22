@@ -15,6 +15,11 @@
 - `/etc/caddy/Caddyfile`
 - `/etc/caddy/trojan/passwd.txt`
 - `/etc/caddy/trojan/domain.txt`
+- `/etc/caddy/trojan/hub/`
+- `/usr/local/bin/easytrojan-hub`
+- `/usr/local/share/easytrojan/lib/*.sh`
+- `/usr/local/share/easytrojan/hub_server.py`
+- `/etc/systemd/system/easytrojan-hub.service`
 - `/etc/systemd/system/caddy.service`
 - `/etc/systemd/system/caddy-renew.service`
 - `/etc/systemd/system/caddy-renew.timer`
@@ -97,3 +102,21 @@ sha256sum -c SHA256SUMS
 ## 第三方伪装站
 
 默认伪装站使用 [CorentinTh/it-tools](https://github.com/CorentinTh/it-tools) 的 release 静态资源（GPL-3.0）。安装时会从 GitHub 下载 zip 并解压到 `/etc/caddy/www`。请遵守其许可证与上游安全公告。
+
+## 节点聚合 Hub
+
+启用 `easytrojan hub enable` 后：
+
+- Hub 进程默认只监听 `127.0.0.1:2099`，不直接对公网暴露端口。
+- 公网仅通过 Caddy 的 `/sub/<sub_token>` 与 `/api/*`（需 `X-Hub-Token: register_token`）访问。
+- `register_token` 可注册/删除节点，**不要分享或写入公开仓库**。
+- 订阅 URL 中的 `sub_token` 可拉取全部节点密码的 base64 订阅，**按密码同等保管**。
+- `nodes.json` 含明文密码，目录权限应保持 `700`，文件 `600`。
+- 不需要聚合时请 `easytrojan hub disable` 或卸载。
+
+### Hub membership 文件
+
+- `hub join` 会把远端 Hub 的 URL 与 `register_token` 写入 `/etc/caddy/trojan/hub-client.json`（mode 600）。
+- 该文件等同于注册凭证；泄露后他人可向你的 Hub 注册或注销节点。
+- 不再使用远端聚合时执行 `easytrojan hub leave` 删除该文件。
+- Hub 运行时需要 `python3 >= 3.8`。
