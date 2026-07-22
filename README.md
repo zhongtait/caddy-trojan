@@ -289,7 +289,7 @@ https://hub.example.com/sub/<sub_token>?server=104.16.1.1&port=2053
 | 端口 | 443 或 CF HTTPS 端口 |
 | 密码 | 安装时设置 |
 | TLS | 开启 |
-| ALPN | **http/1.1**（分享链接默认；勿优先 h2） |
+| ALPN | **h2, http/1.1**（分享链接默认） |
 | 传输 | websocket |
 | SNI / Host | **域名**（用优选 IP 时也填域名） |
 | path | `/` |
@@ -307,10 +307,11 @@ https://hub.example.com/sub/<sub_token>?server=104.16.1.1&port=2053
 
 **延迟测试失败 / `Client network socket disconnected before secure TLS connection was established`**  
 常见原因与处理：
-1. **ALPN 用 http/1.1**：分享/订阅链接已默认 `alpn=http/1.1`。客户端若手填参数，勿优先 h2（CF 上 Trojan-WS 易握手失败）。
+1. **ALPN**：分享/订阅链接默认 `alpn=h2,http/1.1`。若 Cloudflare 橙云下延迟测试异常，可在客户端改为仅 `http/1.1` 再试。
 2. **Cloudflare**：Network → **WebSockets = On**；SSL/TLS → **Full (strict)**；客户端 SNI/Host 必须是域名（即使用优选 IP）。
 3. **优选 IP 端口**：仅用 CF 支持的 HTTPS 端口（443/2053/2083/2087/2096/8443），`link --port` / 订阅 `?port=`。
 4. **服务**：`systemctl is-active caddy` 与 `easytrojan status`。
+5. **连上却像“假通”/一直 HTML 伪装页**：确认 Caddyfile 全局为 `order trojan before handle`（不要只 `before file_server`），然后 `easytrojan update` 或重装配置并 `systemctl reload caddy`。
 
 **订阅要多次刷新才有节点**  
 Hub `/sub` 已加强制 no-cache 头。仍异常时：`easytrojan hub list` 确认节点已注册；客户端删订阅重加，或 URL 加 `?t=` 时间戳强制拉取。`hub enable` 后改过路由需 `easytrojan update` 或重装 Caddyfile 再生效。

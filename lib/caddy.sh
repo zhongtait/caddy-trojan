@@ -170,13 +170,16 @@ generate_caddyfile() {
     cat > "$CADDYFILE" <<EOF
 {
     admin 127.0.0.1:2019
-    order trojan before file_server
+    # Must run before catch-all SPA `handle` (and hub handle blocks).
+    # `before file_server` is too late: after 9b4c7b0 SPA lives inside handle,
+    # so WS upgrades hit file_server HTML (HTTP 200) and never Trojan.
+    order trojan before handle
     https_port 443
     servers :443 {
         listener_wrappers {
             trojan
         }
-        # HTTP camouflage may use h2; Trojan client ALPN must be http/1.1 for WS
+        # Camouflage + Trojan share the same TLS stack; advertise h2 and h1
         protocols h2 h1
     }
     servers :80 {

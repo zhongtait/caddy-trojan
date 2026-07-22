@@ -131,7 +131,7 @@ sub=$(curl -sf "http://127.0.0.1:${PORT}/sub/${SUB_TOKEN}")
 decoded=$(printf '%s' "$sub" | python3 -c 'import sys,base64; print(base64.b64decode(sys.stdin.read()).decode())')
 echo "$decoded" | grep -q 'trojan://' || fail "subscription missing trojan:// : $decoded"
 echo "$decoded" | grep -q 'hk.example.com' || fail "subscription missing domain: $decoded"
-echo "$decoded" | grep -qE 'alpn=http(%2[Ff]|/)1\.1' || fail "subscription missing alpn=http/1.1: $decoded"
+echo "$decoded" | grep -qE 'alpn=h2(%2[Cc]|,)http(%2[Ff]|/)1\.1' || fail "subscription missing alpn=h2,http/1.1: $decoded"
 pass "subscription base64 -> trojan link"
 
 sub2=$(curl -sf "http://127.0.0.1:${PORT}/sub/${SUB_TOKEN}?server=1.2.3.4&port=2053")
