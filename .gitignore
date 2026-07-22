@@ -12,6 +12,7 @@ Thumbs.db
 # Python leftovers
 __pycache__/
 *.py
+!hub_server.py
 .venv/
 venv/
 

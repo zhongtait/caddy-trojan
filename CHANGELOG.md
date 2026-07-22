@@ -1,9 +1,20 @@
 # Changelog
 
-## Unreleased
+## [Unreleased]
+
+- Hub risk harden: python3>=3.8 check; join 持久化 hub-client.json；user add/del 同步远端 Hub；/api/unregister；update 模块下载失败即中止；hub leave。
+
+- Hub: safe token compare when length mismatches; user add/del sync local hub nodes; Caddyfile hub proxy indent.
+### Changed
+
+- 拆分 `easytrojan.sh` 为入口 + `lib/*.sh` 模块（common/tls/caddy/camouflage/system/hub/manage/install）；安装/更新同步到 `/usr/local/share/easytrojan/lib`。
 
 ### Added
 
+- 节点聚合 Hub：`easytrojan hub enable|disable|status|url|token|list|remove|join`
+- 本地 Python 服务 `hub_server.py`（`127.0.0.1:2099`）经 Caddy 反代 `/sub/*`、`/api/*`
+- 订阅支持 `?server=` / `?port=` 改写连接地址（Cloudflare 优选 IP）
+- `status` / `link` 支持 `--port`；卸载清理 hub 单元与二进制
 - `status --server ADDR` / `link --server ADDR`：分享链接支持 Cloudflare 优选 IP（SNI/Host 仍为域名）。
 - TLS 方案选项：`auto`（Caddy ACME）与 `origin`（Cloudflare Origin / 文件证书）；`install --tls-mode`、`easytrojan cert {auto|origin|status}`。
 
@@ -18,7 +29,6 @@
 - GitHub Actions 构建 Go 版本从 1.23.x 升到 1.25.x（Caddy v2.11.4 要求 go >= 1.25.1）。
 - Check Upstream 在检测到更新后通过 workflow_call 直接触发 Build（规避 GITHUB_TOKEN push 不触发其他 workflow 的限制）。
 - 修正实现计划中“删除 API 不存在/重启必丢用户”等不准确表述对应的实现路径。
-
 
 ### Added
 
