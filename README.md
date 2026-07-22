@@ -329,6 +329,12 @@ curl -fsSL https://raw.githubusercontent.com/zhongtait/caddy-trojan/main/uninsta
 
 非交互：`sudo bash uninstall.sh -y`（删除 `/etc/caddy` 等安装产物）。
 
+本地校验（不装节点）：
+
+```bash
+bash scripts/ci_validate.sh
+```
+
 ## 项目结构
 
 | 文件 | 说明 |
@@ -340,7 +346,9 @@ curl -fsSL https://raw.githubusercontent.com/zhongtait/caddy-trojan/main/uninsta
 | `sha` | 上游 commit；变更触发构建 |
 | `SECURITY.md` / `CHANGELOG.md` | 安全策略 / 变更记录 |
 | `.github/workflows/release.yml` | 构建发布 + SHA256SUMS |
+| `.github/workflows/ci.yml` | 脚本/Hub 校验（不装节点） |
 | `.github/workflows/test.yml` | 检查上游更新 |
+| `scripts/ci_validate.sh` | 本地/CI 校验入口 |
 
 ## 致谢
 
