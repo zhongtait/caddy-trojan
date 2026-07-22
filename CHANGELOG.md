@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+- fix(hub): implement HTTP HEAD so subscription Cache-Control is visible to curl -I / CI.
+- **fix: Caddyfile `order trojan before handle`** so Trojan WebSocket is not swallowed by camouflage SPA `handle` (client got HTTP 200 HTML instead of WS 101). `update` now regenerates Caddyfile.
+- client: share/subscription ALPN back to `h2,http/1.1` (server already enables both).
+
+- fix(hub): detect/link python3.13 and fall back to versioned python in hub service wrapper.
+
+- fix(hub): wait for local hub HTTP ready, fix register/unregister JSON payload, retry with HTTP status body (fixes Failed to register local user right after enable).
+
+- docs/ui: install/status show client ALPN as http/1.1 only (not h2).
+
+- feat(hub): `hub enable --name` / `hub rename` custom display names; `hub url --server/--port` for preferred-IP subscribe URLs.
+
+- docs(hub): clarify subscription `?server=&port=` (all nodes) vs `join --server/--port` (per-node).
+
+- feat(hub): auto-install python3 (>=3.8) via apt/dnf/yum when missing on `hub enable`.
+
+- fix(client): share/subscription links default `alpn=http/1.1` (CF WS latency / TLS disconnect).
+
+- fix(hub): stronger no-cache + Profile-Update-Interval on `/sub` so clients refresh without empty cache.
+
+- fix(hub): wrap camouflage SPA in catch-all handle so /sub and /api are not rewritten to index.html (404).
+
+- fix(hub): skip same-path hub_server.py copy so `hub enable` finishes; fail clearly if service not active.
+
 - ci: add scripts/ci_validate.sh + GitHub Actions CI Validate (shell syntax, module list, hub smoke; no node install).
 
 - docs: README 重组（去重、命令表、FAQ、Hub/优选端口说明）。

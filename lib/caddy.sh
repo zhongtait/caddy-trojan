@@ -149,12 +149,20 @@ generate_caddyfile() {
     # NOTE: $(...) strips trailing newlines; keep ${tls_line} on its own line in the heredoc.
     tls_line=$(tls_directive_line "$site_domain")
     if hub_enabled; then
-        # reverse_proxy hub before SPA try_files so /sub and /api are not swallowed
+        # Sibling handle blocks are mutually exclusive. SPA try_files MUST live in its own
+        # catch-all handle; otherwise it rewrites /sub/* and /api/* to index.html (browser 404).
+        # Force no-cache on proxied /sub so CF/browser do not serve empty/stale body.
         hub_proxy="    handle /sub/* {
-        reverse_proxy ${HUB_LISTEN}
+        reverse_proxy ${HUB_LISTEN} {
+            header_down Cache-Control \"no-store, no-cache, must-revalidate, max-age=0\"
+            header_down Pragma no-cache
+            header_down Expires 0
+        }
     }
     handle /api/* {
-        reverse_proxy ${HUB_LISTEN}
+        reverse_proxy ${HUB_LISTEN} {
+            header_down Cache-Control \"no-store, no-cache, must-revalidate, max-age=0\"
+        }
     }
 "
     fi
@@ -162,12 +170,16 @@ generate_caddyfile() {
     cat > "$CADDYFILE" <<EOF
 {
     admin 127.0.0.1:2019
-    order trojan before file_server
+    # Must run before catch-all SPA `handle` (and hub handle blocks).
+    # `before file_server` is too late: after 9b4c7b0 SPA lives inside handle,
+    # so WS upgrades hit file_server HTML (HTTP 200) and never Trojan.
+    order trojan before handle
     https_port 443
     servers :443 {
         listener_wrappers {
             trojan
         }
+        # Camouflage + Trojan share the same TLS stack; advertise h2 and h1
         protocols h2 h1
     }
     servers :80 {
@@ -187,10 +199,12 @@ ${tls_line}
         connect_method
         websocket
     }
-${hub_proxy}    # IT-Tools is a Vue SPA: unknown paths fall back to index.html
-    root * ${WWW_DIR}
-    try_files {path} /index.html
-    file_server
+${hub_proxy}    # Camouflage SPA (IT-Tools): only when hub routes above did not match
+    handle {
+        root * ${WWW_DIR}
+        try_files {path} /index.html
+        file_server
+    }
 }
 # HTTP-01 ACME needs port 80; do not blanket-redirect challenge paths
 :80 {
