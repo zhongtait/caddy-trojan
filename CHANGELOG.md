@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- ci: add scripts/ci_validate.sh + GitHub Actions CI Validate (shell syntax, module list, hub smoke; no node install).
+
 - docs: README 重组（去重、命令表、FAQ、Hub/优选端口说明）。
 
 - Hub risk harden: python3>=3.8 check; join 持久化 hub-client.json；user add/del 同步远端 Hub；/api/unregister；update 模块下载失败即中止；hub leave。
