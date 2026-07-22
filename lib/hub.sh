@@ -371,7 +371,7 @@ hub_register_local() {
         fi
         local payload
         # Valid JSON template (do NOT backslash-escape quotes inside single quotes).
-        payload=$(printf '{"name":"%s","domain":"%s","password":"%s","server":"%s","port":443,"sni":"%s","host":"%s","path":"/","transport":"%s","alpn":"http/1.1"}' \
+        payload=$(printf '{"name":"%s","domain":"%s","password":"%s","server":"%s","port":443,"sni":"%s","host":"%s","path":"/","transport":"%s","alpn":"h2,http/1.1"}' \
             "$(json_escape "$name")" "$(json_escape "$domain")" "$(json_escape "$passwd")" \
             "$(json_escape "$domain")" "$(json_escape "$domain")" "$(json_escape "$domain")" \
             "$(json_escape "$transport")")
@@ -439,7 +439,7 @@ hub_reregister_to_remote() {
         else
             reg_name="${name}-${i}"
         fi
-        payload=$(printf '{"name":"%s","domain":"%s","password":"%s","server":"%s","port":%s,"sni":"%s","host":"%s","path":"/","transport":"%s","alpn":"http/1.1"}' \
+        payload=$(printf '{"name":"%s","domain":"%s","password":"%s","server":"%s","port":%s,"sni":"%s","host":"%s","path":"/","transport":"%s","alpn":"h2,http/1.1"}' \
             "$(json_escape "$reg_name")" "$(json_escape "$domain")" "$(json_escape "$passwd")" \
             "$(json_escape "$server")" "$port" \
             "$(json_escape "$domain")" "$(json_escape "$domain")" \
@@ -954,7 +954,7 @@ EOF
         else
             reg_name="${name}-${i}"
         fi
-        payload=$(printf '{"name":"%s","domain":"%s","password":"%s","server":"%s","port":%s,"sni":"%s","host":"%s","path":"/","transport":"%s","alpn":"http/1.1"}' \
+        payload=$(printf '{"name":"%s","domain":"%s","password":"%s","server":"%s","port":%s,"sni":"%s","host":"%s","path":"/","transport":"%s","alpn":"h2,http/1.1"}' \
             "$(json_escape "$reg_name")" "$(json_escape "$domain")" "$(json_escape "$passwd")" \
             "$(json_escape "$server")" "$port" \
             "$(json_escape "$domain")" "$(json_escape "$domain")" \

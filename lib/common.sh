@@ -290,12 +290,11 @@ build_share_link() {
     [ -n "$addr" ] || error "Share link needs domain or --server address"
     if [ "$transport" = "ws" ]; then
         # Address may be CF anycast IP; SNI + WS Host must remain the real domain.
-        # Prefer alpn=http/1.1 for WS over Cloudflare: h2 first often breaks latency tests
-        # and yields "socket disconnected before secure TLS connection was established".
-        printf 'trojan://%s@%s:%s?security=tls&sni=%s&alpn=http%%2F1.1&type=ws&host=%s&path=%%2F#%s' \
+        # Advertise both ALPN values; server already enables h2 + h1.
+        printf 'trojan://%s@%s:%s?security=tls&sni=%s&alpn=h2%%2Chttp%%2F1.1&type=ws&host=%s&path=%%2F#%s' \
             "$encoded" "$addr" "$port" "$domain" "$domain" "$domain"
     else
-        printf 'trojan://%s@%s:%s?security=tls&sni=%s&alpn=http%%2F1.1&type=tcp#%s' \
+        printf 'trojan://%s@%s:%s?security=tls&sni=%s&alpn=h2%%2Chttp%%2F1.1&type=tcp#%s' \
             "$encoded" "$addr" "$port" "$domain" "$domain"
     fi
 }

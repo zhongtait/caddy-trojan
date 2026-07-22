@@ -129,7 +129,7 @@ def upsert_node(payload: dict) -> dict:
         "host": str(payload.get("host") or domain).strip(),
         "path": str(payload.get("path") or "/").strip() or "/",
         "transport": str(payload.get("transport") or "ws").strip().lower(),
-        "alpn": str(payload.get("alpn") or "http/1.1").strip(),
+        "alpn": str(payload.get("alpn") or "h2,http/1.1").strip(),
         "enabled": bool(payload.get("enabled", True)),
         "updated_at": _now(),
     }
@@ -206,13 +206,10 @@ def build_link(node: dict, server: str | None = None, port: int | None = None) -
     transport = (node.get("transport") or "ws").lower()
     user = qe(password)
     frag = qe(name)
-    # Prefer http/1.1 for CF WS stability (ignore stored h2-first lists).
-    alpn_raw = str(node.get("alpn") or "http/1.1").strip() or "http/1.1"
+    # Keep configured ALPN list (default both h2 and http/1.1).
+    alpn_raw = str(node.get("alpn") or "h2,http/1.1").strip() or "h2,http/1.1"
     parts = [x.strip() for x in alpn_raw.split(",") if x.strip()]
-    if "http/1.1" in parts:
-        alpn = "http/1.1"
-    else:
-        alpn = parts[0] if parts else "http/1.1"
+    alpn = ",".join(parts) if parts else "h2,http/1.1"
     if transport == "ws":
         return (
             f"trojan://{user}@{addr}:{p}"
