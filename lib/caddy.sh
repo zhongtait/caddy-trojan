@@ -149,7 +149,8 @@ generate_caddyfile() {
     # NOTE: $(...) strips trailing newlines; keep ${tls_line} on its own line in the heredoc.
     tls_line=$(tls_directive_line "$site_domain")
     if hub_enabled; then
-        # reverse_proxy hub before SPA try_files so /sub and /api are not swallowed
+        # Sibling handle blocks are mutually exclusive. SPA try_files MUST live in its own
+        # catch-all handle; otherwise it rewrites /sub/* and /api/* to index.html (browser 404).
         hub_proxy="    handle /sub/* {
         reverse_proxy ${HUB_LISTEN}
     }
@@ -187,10 +188,12 @@ ${tls_line}
         connect_method
         websocket
     }
-${hub_proxy}    # IT-Tools is a Vue SPA: unknown paths fall back to index.html
-    root * ${WWW_DIR}
-    try_files {path} /index.html
-    file_server
+${hub_proxy}    # Camouflage SPA (IT-Tools): only when hub routes above did not match
+    handle {
+        root * ${WWW_DIR}
+        try_files {path} /index.html
+        file_server
+    }
 }
 # HTTP-01 ACME needs port 80; do not blanket-redirect challenge paths
 :80 {
