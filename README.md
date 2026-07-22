@@ -201,20 +201,34 @@ sudo easytrojan link --server 104.16.1.1 --port 2053
 
 ## 节点聚合 Hub
 
-多台节点注册到**一台 Hub**，统一输出 base64 订阅。Hub 只监听 `127.0.0.1:2099`，经 Caddy 反代 `/sub/*`、`/api/*`（在伪装站 SPA 之前）。依赖 **python3 ≥ 3.8**。
+多台节点注册到**一台 Hub**，统一输出 base64 订阅。Hub 只监听 `127.0.0.1:2099`，经 Caddy 反代 `/sub/*`、`/api/*`（在伪装站 SPA 之前）。依赖 **python3 ≥ 3.8**；`hub enable` 时若未安装会尝试用 apt/dnf/yum **自动安装**。
 
 ### Hub 主机
 
 ```bash
-sudo easytrojan hub enable
+sudo easytrojan hub enable                 # 本机显示名默认=域名
+sudo easytrojan hub enable --name 香港-Hub # 自定义本机在订阅里的显示名
+sudo easytrojan hub rename --name 新名字   # 改本机显示名（并重注册）
+sudo easytrojan hub rename --id ID --name 新名字  # 改任意节点名（hub list 看 id）
 sudo easytrojan hub token      # register_token / sub_token / 订阅 URL
+sudo easytrojan hub url        # 订阅 URL
+sudo easytrojan hub url --server 1.2.3.4 --port 443  # 带优选 IP 的订阅 URL
 sudo easytrojan hub status
 sudo easytrojan hub list
 sudo easytrojan hub remove --id NODE_ID
 sudo easytrojan hub disable    # 关服务与反代，保留 nodes.json
 ```
 
-`enable` 会安装 `easytrojan-hub` 与 systemd 单元、生成 token、注入 Caddy 反代，并尽量注册本机用户。
+`enable` 会确保 python3≥3.8（缺失则自动安装）、安装 `easytrojan-hub` 与 systemd 单元、生成 token、注入 Caddy 反代，并尽量注册本机用户（可用 `--name` 自定义显示名）。
+
+### 优选 IP（两种用法）
+
+| 方式 | 作用范围 | 示例 |
+|------|----------|------|
+| **订阅 URL 查询参数** | 本次拉取时改写**全部**节点的连接地址 | `https://hub/sub/<token>?server=CF_IP&port=443` 或 `easytrojan hub url --server CF_IP --port 443` |
+| **join 时 `--server` / `--port`** | 只改**该节点**写入 Hub 的默认连接地址 | `hub join ... --server CF_IP --port 2053` |
+
+两者可同时用：节点可先 `join --server` 写默认地址；客户端用带 `?server=` 的订阅 URL 时会覆盖全部节点地址。SNI/Host 始终是各节点域名。
 
 ### 节点加入
 
@@ -275,7 +289,7 @@ https://hub.example.com/sub/<sub_token>?server=104.16.1.1&port=2053
 | 端口 | 443 或 CF HTTPS 端口 |
 | 密码 | 安装时设置 |
 | TLS | 开启 |
-| ALPN | h2, http/1.1 |
+| ALPN | **http/1.1**（分享链接默认；勿优先 h2） |
 | 传输 | websocket |
 | SNI / Host | **域名**（用优选 IP 时也填域名） |
 | path | `/` |
@@ -291,8 +305,15 @@ https://hub.example.com/sub/<sub_token>?server=104.16.1.1&port=2053
 **优选 IP 后客户端不通**  
 检查：WebSockets On、SSL **Full (strict)**、客户端 SNI/Host 为域名、端口为 CF 支持的 HTTPS 端口（可用 `link --port`）。
 
-**延迟测试偶发 fail**  
-多与客户端测速 / CF 边缘有关；连上再试几次。优先确认服务 `systemctl is-active caddy` 与 `easytrojan status`。
+**延迟测试失败 / `Client network socket disconnected before secure TLS connection was established`**  
+常见原因与处理：
+1. **ALPN 用 http/1.1**：分享/订阅链接已默认 `alpn=http/1.1`。客户端若手填参数，勿优先 h2（CF 上 Trojan-WS 易握手失败）。
+2. **Cloudflare**：Network → **WebSockets = On**；SSL/TLS → **Full (strict)**；客户端 SNI/Host 必须是域名（即使用优选 IP）。
+3. **优选 IP 端口**：仅用 CF 支持的 HTTPS 端口（443/2053/2083/2087/2096/8443），`link --port` / 订阅 `?port=`。
+4. **服务**：`systemctl is-active caddy` 与 `easytrojan status`。
+
+**订阅要多次刷新才有节点**  
+Hub `/sub` 已加强制 no-cache 头。仍异常时：`easytrojan hub list` 确认节点已注册；客户端删订阅重加，或 URL 加 `?t=` 时间戳强制拉取。`hub enable` 后改过路由需 `easytrojan update` 或重装 Caddyfile 再生效。
 
 **`caddy.service` 启动失败，tls 参数错误**  
 执行 `sudo caddy validate --config /etc/caddy/Caddyfile`，查看 `journalctl -u caddy -n 30`。origin 的 `tls cert key` 须单独成行；可 `easytrojan cert status` 后重新 `cert origin`。

@@ -210,7 +210,7 @@ EOF
     echo -e "${GREEN}║${NC}  Address  : ${CYAN}${site_domain}${NC}"
     echo -e "${GREEN}║${NC}  Port     : ${CYAN}443${NC}"
     echo -e "${GREEN}║${NC}  Password : ${CYAN}${trojan_passwd}${NC}"
-    echo -e "${GREEN}║${NC}  ALPN     : ${CYAN}h2,http/1.1${NC}"
+    echo -e "${GREEN}║${NC}  ALPN     : ${CYAN}http/1.1${NC}  (WS + Cloudflare stable)"
     echo -e "${GREEN}║${NC}  Transport: ${CYAN}websocket${NC}"
     echo -e "${GREEN}║${NC}  TLS mode : ${CYAN}$(read_tls_mode)${NC}  (easytrojan cert status)"
     echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"

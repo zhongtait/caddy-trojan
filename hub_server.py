@@ -129,7 +129,7 @@ def upsert_node(payload: dict) -> dict:
         "host": str(payload.get("host") or domain).strip(),
         "path": str(payload.get("path") or "/").strip() or "/",
         "transport": str(payload.get("transport") or "ws").strip().lower(),
-        "alpn": str(payload.get("alpn") or "h2,http/1.1").strip(),
+        "alpn": str(payload.get("alpn") or "http/1.1").strip(),
         "enabled": bool(payload.get("enabled", True)),
         "updated_at": _now(),
     }
@@ -206,12 +206,19 @@ def build_link(node: dict, server: str | None = None, port: int | None = None) -
     transport = (node.get("transport") or "ws").lower()
     user = qe(password)
     frag = qe(name)
+    # Prefer http/1.1 for CF WS stability (ignore stored h2-first lists).
+    alpn_raw = str(node.get("alpn") or "http/1.1").strip() or "http/1.1"
+    parts = [x.strip() for x in alpn_raw.split(",") if x.strip()]
+    if "http/1.1" in parts:
+        alpn = "http/1.1"
+    else:
+        alpn = parts[0] if parts else "http/1.1"
     if transport == "ws":
         return (
             f"trojan://{user}@{addr}:{p}"
-            f"?security=tls&sni={qe(sni)}&type=ws&host={qe(host)}&path={qe(path)}#{frag}"
+            f"?security=tls&sni={qe(sni)}&alpn={qe(alpn)}&type=ws&host={qe(host)}&path={qe(path)}#{frag}"
         )
-    return f"trojan://{user}@{addr}:{p}?security=tls&sni={qe(sni)}&type=tcp#{frag}"
+    return f"trojan://{user}@{addr}:{p}?security=tls&sni={qe(sni)}&alpn={qe(alpn)}&type=tcp#{frag}"
 
 
 def subscription_body(server: str | None = None, port: int | None = None) -> bytes:
@@ -233,20 +240,29 @@ class Handler(BaseHTTPRequestHandler):
         if not sys_stderr:
             super().log_message(fmt, *args)
 
+    def _no_cache_headers(self) -> None:
+        # Strong no-cache for subscription clients and any reverse proxy (Cloudflare).
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+
     def _json(self, code: int, obj: Any) -> None:
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self._no_cache_headers()
         self.end_headers()
         self.wfile.write(body)
 
-    def _text(self, code: int, body: bytes, content_type: str) -> None:
+    def _text(self, code: int, body: bytes, content_type: str, extra_headers: dict | None = None) -> None:
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self._no_cache_headers()
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
@@ -283,8 +299,12 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(400, {"error": "invalid port"})
                     return
             body = subscription_body(server=server, port=port)
-            # clients expect plain base64 text
-            self._text(200, body, "text/plain; charset=utf-8")
+            # clients expect plain base64 text; profile headers help apps refresh reliably
+            extra = {
+                "Profile-Update-Interval": "1",
+                "Subscription-Userinfo": "upload=0; download=0; total=0; expire=0",
+            }
+            self._text(200, body, "text/plain; charset=utf-8", extra_headers=extra)
             return
 
         if path == "/api/nodes":

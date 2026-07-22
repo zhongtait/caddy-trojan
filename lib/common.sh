@@ -19,9 +19,13 @@ Usage:
   bash easytrojan.sh user add [--password PASSWORD]
   bash easytrojan.sh user list
   bash easytrojan.sh user del --password PASSWORD
-  bash easytrojan.sh hub enable|disable|status|url|token|list|remove|join|leave
+  bash easytrojan.sh hub enable [--name NAME]
+  bash easytrojan.sh hub disable|status|token|list|leave
+  bash easytrojan.sh hub url [--server ADDR] [--port PORT]
+  bash easytrojan.sh hub rename --name NEW_NAME
+  bash easytrojan.sh hub rename --id NODE_ID --name NEW_NAME
   bash easytrojan.sh hub join --url URL --token TOKEN [--name NAME] [--server ADDR] [--port PORT]
-  bash easytrojan.sh hub leave
+  bash easytrojan.sh hub remove --id NODE_ID
   bash easytrojan.sh help
 
 Legacy:
@@ -52,9 +56,13 @@ Notes:
   - Reinstall without --tls-mode keeps previous TLS mode; origin reuses /etc/caddy/certs if present
   - Camouflage site defaults to CorentinTh/it-tools (override: IT_TOOLS_VERSION=...)
   - hub: optional node aggregation + base64 subscription on one machine
-  - subscribe with preferred IP: https://hub-domain/sub/<token>?server=IP&port=443
+  - subscribe preferred IP (ALL nodes rewritten for that pull):
+      https://hub-domain/sub/<token>?server=IP&port=443
+      or: easytrojan hub url --server IP --port 443
+  - join --server/--port: per-node default connect address (independent of ?server=)
+  - hub enable --name / hub rename --name: custom display name in subscription
   - hub join saves /etc/caddy/trojan/hub-client.json so user add/del can re-sync remote hub
-  - hub requires python3 >= 3.8
+  - hub requires python3 >= 3.8 (auto-installs via apt/dnf/yum if missing)
 EOF
 }
 
@@ -282,10 +290,12 @@ build_share_link() {
     [ -n "$addr" ] || error "Share link needs domain or --server address"
     if [ "$transport" = "ws" ]; then
         # Address may be CF anycast IP; SNI + WS Host must remain the real domain.
-        printf 'trojan://%s@%s:%s?security=tls&sni=%s&type=ws&host=%s&path=%%2F#%s' \
+        # Prefer alpn=http/1.1 for WS over Cloudflare: h2 first often breaks latency tests
+        # and yields "socket disconnected before secure TLS connection was established".
+        printf 'trojan://%s@%s:%s?security=tls&sni=%s&alpn=http%%2F1.1&type=ws&host=%s&path=%%2F#%s' \
             "$encoded" "$addr" "$port" "$domain" "$domain" "$domain"
     else
-        printf 'trojan://%s@%s:%s?security=tls&sni=%s&type=tcp#%s' \
+        printf 'trojan://%s@%s:%s?security=tls&sni=%s&alpn=http%%2F1.1&type=tcp#%s' \
             "$encoded" "$addr" "$port" "$domain" "$domain"
     fi
 }
