@@ -40,10 +40,11 @@ hub_reregister_local_named() {
     [ -n "$domain" ] && [ -n "$reg_token" ] && [ -f "$PASSWD_FILE" ] || return 0
     [ -n "$name_base" ] || name_base=$(hub_read_local_name)
     [ -n "$name_base" ] || name_base="$domain"
+    wait_for_hub_api || return 1
     while IFS= read -r passwd || [ -n "$passwd" ]; do
         [ -n "$passwd" ] || continue
         curl -sf -X POST -H "Content-Type: application/json" -H "X-Hub-Token: ${reg_token}" \
-            -d "$(printf '{\"domain\":\"%s\",\"password\":\"%s\"}' \
+            -d "$(printf '{"domain":"%s","password":"%s"}' \
                 "$(json_escape "$domain")" "$(json_escape "$passwd")")" \
             "http://${HUB_LISTEN}/api/unregister" >/dev/null 2>&1 || true
     done < "$PASSWD_FILE"
@@ -66,7 +67,7 @@ python3_version_ok() {
 # If only versioned binaries exist (python3.11), expose python3 on PATH for hub wrapper.
 link_python3_from_versioned() {
     local cand path
-    for cand in python3.12 python3.11 python3.10 python3.9 python39 python311 python312; do
+    for cand in python3.13 python3.12 python3.11 python3.10 python3.9 python313 python39 python311 python312; do
         path=$(command -v "$cand" 2>/dev/null || true)
         [ -n "$path" ] || continue
         # Accept only if that binary is >= 3.8
@@ -89,7 +90,7 @@ install_python3_hub() {
         candidates=(python3)
     elif check_cmd dnf || check_cmd yum; then
         # Prefer plain python3; fall back to newer streams on older RHEL/CentOS.
-        candidates=(python3 python39 python3.11 python3.12 python311 python312)
+        candidates=(python3 python3.13 python3.12 python3.11 python39 python313 python312 python311)
     else
         candidates=(python3)
     fi
@@ -228,7 +229,16 @@ install_hub_binary() {
 #!/bin/bash
 export EASYTROJAN_HUB_DIR="${EASYTROJAN_HUB_DIR:-/etc/caddy/trojan/hub}"
 export EASYTROJAN_HUB_LISTEN="${EASYTROJAN_HUB_LISTEN:-127.0.0.1:2099}"
-exec python3 /usr/local/share/easytrojan/hub_server.py
+# Prefer python3; fall back to versioned interpreters (e.g. python3.13 only installs).
+PY=""
+for c in python3 python3.13 python3.12 python3.11 python3.10 python3.9; do
+  if command -v "$c" >/dev/null 2>&1; then
+    PY="$c"
+    break
+  fi
+done
+[ -n "$PY" ] || { echo "easytrojan-hub: python3 not found" >&2; exit 1; }
+exec "$PY" /usr/local/share/easytrojan/hub_server.py
 HUBWRAP
     chmod 755 "$HUB_BIN"
 }
@@ -244,10 +254,15 @@ Wants=network-online.target
 Type=simple
 Environment=EASYTROJAN_HUB_DIR=${HUB_DIR}
 Environment=EASYTROJAN_HUB_LISTEN=${HUB_LISTEN}
+ExecStartPre=/bin/mkdir -p ${HUB_DIR}
+ExecStartPre=/bin/chmod 700 ${HUB_DIR}
 ExecStart=${HUB_BIN}
 Restart=on-failure
-RestartSec=3
+RestartSec=2
+TimeoutStartSec=30
 NoNewPrivileges=true
+# Keep working dir writable for hub nodes.json updates under /etc/caddy
+WorkingDirectory=${HUB_DIR}
 
 [Install]
 WantedBy=multi-user.target
@@ -310,11 +325,38 @@ hub_ensure_runtime() {
     setup_hub_unit
 }
 
+# Wait until local hub HTTP answers /health (or /).
+wait_for_hub_api() {
+    local i=0 code
+    check_cmd curl || return 1
+    # ~6s total: hub process may need a moment after systemd restart
+    while [ "$i" -lt 30 ]; do
+        i=$((i + 1))
+        code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 1 --max-time 2 \
+            "http://${HUB_LISTEN}/health" 2>/dev/null || true)
+        if [ "$code" = "200" ]; then
+            return 0
+        fi
+        code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 1 --max-time 2 \
+            "http://${HUB_LISTEN}/" 2>/dev/null || true)
+        if [ "$code" = "200" ]; then
+            return 0
+        fi
+        sleep 0.2
+    done
+    return 1
+}
+
 hub_register_local() {
-    local domain reg_token passwd name_base name i=0 transport="ws"
+    local domain reg_token passwd name_base name i=0 transport="ws" attempt resp code body
     domain=$(read_installed_domain 2>/dev/null || true)
     reg_token=$(hub_read_cfg_field register_token)
     [ -n "$domain" ] && [ -n "$reg_token" ] && [ -f "$PASSWD_FILE" ] || return 0
+    if ! wait_for_hub_api; then
+        warn "Hub API not ready at http://${HUB_LISTEN} (is ${HUB_UNIT} running?)"
+        warn "Check: systemctl status ${HUB_UNIT}; journalctl -u ${HUB_UNIT} -n 40 --no-pager"
+        return 1
+    fi
     if [ -f "$CADDYFILE" ] && ! grep -q "websocket" "$CADDYFILE" 2>/dev/null; then
         transport="tcp"
     fi
@@ -328,17 +370,33 @@ hub_register_local() {
             name="${name_base}-${i}"
         fi
         local payload
+        # Valid JSON template (do NOT backslash-escape quotes inside single quotes).
         payload=$(printf '{"name":"%s","domain":"%s","password":"%s","server":"%s","port":443,"sni":"%s","host":"%s","path":"/","transport":"%s","alpn":"http/1.1"}' \
             "$(json_escape "$name")" "$(json_escape "$domain")" "$(json_escape "$passwd")" \
             "$(json_escape "$domain")" "$(json_escape "$domain")" "$(json_escape "$domain")" \
             "$(json_escape "$transport")")
-        curl -sf -X POST -H "Content-Type: application/json" -H "X-Hub-Token: ${reg_token}" \
-            -d "$payload" "http://${HUB_LISTEN}/api/register" >/dev/null || \
-            warn "Failed to register local user into hub (${name})"
+        resp=""
+        code="000"
+        body=""
+        for attempt in 1 2 3 4 5; do
+            resp=$(curl -sS -w "\n%{http_code}" --connect-timeout 2 --max-time 8 \
+                -X POST -H "Content-Type: application/json" -H "X-Hub-Token: ${reg_token}" \
+                -d "$payload" "http://${HUB_LISTEN}/api/register" 2>&1) || true
+            code=$(printf '%s' "$resp" | tail -n1 | tr -d '\r')
+            body=$(printf '%s' "$resp" | sed '$d')
+            if [ "$code" = "200" ]; then
+                ok "Registered local user into hub (${name})"
+                break
+            fi
+            sleep 0.3
+        done
+        if [ "$code" != "200" ]; then
+            warn "Failed to register local user into hub (${name}) HTTP ${code}: ${body:-no response}"
+            warn "Hint: TOKEN=$(python3 -c 'import json;print(json.load(open("/etc/caddy/trojan/hub/config.json"))["register_token"])'); curl -sS -H \"X-Hub-Token: $TOKEN\" http://127.0.0.1:2099/api/nodes"
+            return 1
+        fi
     done < "$PASSWD_FILE"
 }
-
-
 # Best-effort: re-seed this host's passwd users into local hub and/or remote joined hub.
 hub_sync_local_users() {
     local domain local_name
@@ -515,8 +573,10 @@ EOF
             fi
             generate_caddyfile "$domain"
             reload_caddy
-            # best-effort: seed this host's users into hub under display name
-            sleep 0.5
+            # Wait for hub HTTP before seeding local users (avoids race after restart)
+            if ! wait_for_hub_api; then
+                warn "Hub unit active but HTTP not ready; try: journalctl -u ${HUB_UNIT} -n 50 --no-pager"
+            fi
             hub_reregister_local_named "$local_name" || hub_register_local "$local_name" || true
 
             local reg_token sub_token
@@ -816,7 +876,7 @@ PY
             while IFS= read -r passwd || [ -n "$passwd" ]; do
                 [ -n "$passwd" ] || continue
                 curl -sf -X POST -H "Content-Type: application/json" -H "X-Hub-Token: ${token}" \
-                    -d "$(printf '{\"domain\":\"%s\",\"password\":\"%s\"}' \
+                    -d "$(printf '{"domain":"%s","password":"%s"}' \
                         "$(json_escape "$domain")" "$(json_escape "$passwd")")" \
                     "${hub_url%/}/api/unregister" >/dev/null 2>&1 || true
             done < "$PASSWD_FILE"

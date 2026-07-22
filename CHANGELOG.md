@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+- fix(hub): detect/link python3.13 and fall back to versioned python in hub service wrapper.
+
+- fix(hub): wait for local hub HTTP ready, fix register/unregister JSON payload, retry with HTTP status body (fixes Failed to register local user right after enable).
+
 - docs/ui: install/status show client ALPN as http/1.1 only (not h2).
 
 - feat(hub): `hub enable --name` / `hub rename` custom display names; `hub url --server/--port` for preferred-IP subscribe URLs.
