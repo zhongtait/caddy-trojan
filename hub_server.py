@@ -250,7 +250,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self._no_cache_headers()
         self.end_headers()
-        self.wfile.write(body)
+        if not getattr(self, "_head_only", False):
+            self.wfile.write(body)
 
     def _text(self, code: int, body: bytes, content_type: str, extra_headers: dict | None = None) -> None:
         self.send_response(code)
@@ -261,7 +262,8 @@ class Handler(BaseHTTPRequestHandler):
             for k, v in extra_headers.items():
                 self.send_header(k, v)
         self.end_headers()
-        self.wfile.write(body)
+        if not getattr(self, "_head_only", False):
+            self.wfile.write(body)
 
     def _auth_register(self) -> bool:
         cfg = ensure_config()
@@ -335,6 +337,14 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         self._json(404, {"error": "not found"})
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        """Same headers as GET (curl -I / proxy probes); no body."""
+        self._head_only = True
+        try:
+            self.do_GET()
+        finally:
+            self._head_only = False
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)

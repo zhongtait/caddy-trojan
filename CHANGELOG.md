@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- fix(hub): implement HTTP HEAD so subscription Cache-Control is visible to curl -I / CI.
 - **fix: Caddyfile `order trojan before handle`** so Trojan WebSocket is not swallowed by camouflage SPA `handle` (client got HTTP 200 HTML instead of WS 101). `update` now regenerates Caddyfile.
 - client: share/subscription ALPN back to `h2,http/1.1` (server already enables both).
 
