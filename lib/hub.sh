@@ -67,31 +67,36 @@ except Exception:
 }
 
 install_hub_binary() {
-    local src=""
-    if [ -f /usr/local/share/easytrojan/hub_server.py ]; then
-        src=/usr/local/share/easytrojan/hub_server.py
-    else
-        local script_src script_dir
-        script_src=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
-        script_dir=$(dirname "$script_src")
-        if [ -f "${script_dir}/hub_server.py" ]; then
-            src="${script_dir}/hub_server.py"
-        fi
+    local src="" dest="${SHARE_DIR}/hub_server.py"
+    # Prefer local repo / source tree, then already-installed share copy, then download.
+    local script_src script_dir
+    script_src=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
+    script_dir=$(dirname "$script_src")
+    if [ -n "${EASYTROJAN_ROOT:-}" ] && [ -f "${EASYTROJAN_ROOT}/hub_server.py" ]; then
+        src="${EASYTROJAN_ROOT}/hub_server.py"
+    elif [ -f "${script_dir}/hub_server.py" ]; then
+        src="${script_dir}/hub_server.py"
+    elif [ -f "$dest" ]; then
+        src="$dest"
     fi
     if [ -z "$src" ]; then
-        mkdir -p /usr/local/share/easytrojan
-        if curl -fsSL --connect-timeout 10 --max-time 30 "${REPO_RAW}/hub_server.py" -o /usr/local/share/easytrojan/hub_server.py; then
-            chmod 644 /usr/local/share/easytrojan/hub_server.py
-            src=/usr/local/share/easytrojan/hub_server.py
+        mkdir -p "$SHARE_DIR"
+        if curl -fsSL --connect-timeout 10 --max-time 30 "${REPO_RAW}/hub_server.py" -o "$dest"; then
+            chmod 644 "$dest"
+            src="$dest"
             ok "Downloaded hub_server.py"
         fi
     fi
     [ -n "$src" ] || error "hub_server.py not found. Re-download repo (easytrojan.sh + hub_server.py) or re-run install/update."
     require_python3_hub
 
-    mkdir -p /usr/local/share/easytrojan
-    cp -f "$src" /usr/local/share/easytrojan/hub_server.py
-    chmod 644 /usr/local/share/easytrojan/hub_server.py
+    mkdir -p "$SHARE_DIR"
+    # Same-path cp fails on GNU coreutils and aborts under set -e (hub enable never finishes).
+    if [ "$(readlink -f "$src" 2>/dev/null || printf '%s' "$src")" != "$(readlink -f "$dest" 2>/dev/null || printf '%s' "$dest")" ]; then
+        cp -f "$src" "$dest"
+    fi
+    [ -f "$dest" ] || error "hub_server.py missing at $dest"
+    chmod 644 "$dest"
 
     cat > "$HUB_BIN" <<'HUBWRAP'
 #!/bin/bash
@@ -349,7 +354,14 @@ do_hub() {
             hub_ensure_runtime
             touch "$HUB_ENABLED_FILE"
             chmod 600 "$HUB_ENABLED_FILE"
-            systemctl restart "$HUB_UNIT"
+            if ! systemctl restart "$HUB_UNIT"; then
+                journalctl -u "$HUB_UNIT" -n 40 --no-pager 2>/dev/null || true
+                error "Failed to start ${HUB_UNIT}. Check: journalctl -u ${HUB_UNIT} -n 50 --no-pager"
+            fi
+            if ! systemctl is-active --quiet "$HUB_UNIT"; then
+                journalctl -u "$HUB_UNIT" -n 40 --no-pager 2>/dev/null || true
+                error "Hub service is not active after restart (${HUB_UNIT})"
+            fi
             generate_caddyfile "$domain"
             reload_caddy
             # best-effort: seed this host's users into hub
