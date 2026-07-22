@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- fix(hub): skip same-path hub_server.py copy so `hub enable` finishes; fail clearly if service not active.
+
 - ci: add scripts/ci_validate.sh + GitHub Actions CI Validate (shell syntax, module list, hub smoke; no node install).
 
 - docs: README 重组（去重、命令表、FAQ、Hub/优选端口说明）。
