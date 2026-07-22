@@ -151,11 +151,18 @@ generate_caddyfile() {
     if hub_enabled; then
         # Sibling handle blocks are mutually exclusive. SPA try_files MUST live in its own
         # catch-all handle; otherwise it rewrites /sub/* and /api/* to index.html (browser 404).
+        # Force no-cache on proxied /sub so CF/browser do not serve empty/stale body.
         hub_proxy="    handle /sub/* {
-        reverse_proxy ${HUB_LISTEN}
+        reverse_proxy ${HUB_LISTEN} {
+            header_down Cache-Control \"no-store, no-cache, must-revalidate, max-age=0\"
+            header_down Pragma no-cache
+            header_down Expires 0
+        }
     }
     handle /api/* {
-        reverse_proxy ${HUB_LISTEN}
+        reverse_proxy ${HUB_LISTEN} {
+            header_down Cache-Control \"no-store, no-cache, must-revalidate, max-age=0\"
+        }
     }
 "
     fi

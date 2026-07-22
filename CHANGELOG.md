@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+- feat(hub): `hub enable --name` / `hub rename` custom display names; `hub url --server/--port` for preferred-IP subscribe URLs.
+
+- docs(hub): clarify subscription `?server=&port=` (all nodes) vs `join --server/--port` (per-node).
+
+- feat(hub): auto-install python3 (>=3.8) via apt/dnf/yum when missing on `hub enable`.
+
+- fix(client): share/subscription links default `alpn=http/1.1` (CF WS latency / TLS disconnect).
+
+- fix(hub): stronger no-cache + Profile-Update-Interval on `/sub` so clients refresh without empty cache.
+
 - fix(hub): wrap camouflage SPA in catch-all handle so /sub and /api are not rewritten to index.html (404).
 
 - fix(hub): skip same-path hub_server.py copy so `hub enable` finishes; fail clearly if service not active.

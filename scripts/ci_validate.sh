@@ -131,6 +131,7 @@ sub=$(curl -sf "http://127.0.0.1:${PORT}/sub/${SUB_TOKEN}")
 decoded=$(printf '%s' "$sub" | python3 -c 'import sys,base64; print(base64.b64decode(sys.stdin.read()).decode())')
 echo "$decoded" | grep -q 'trojan://' || fail "subscription missing trojan:// : $decoded"
 echo "$decoded" | grep -q 'hk.example.com' || fail "subscription missing domain: $decoded"
+echo "$decoded" | grep -qE 'alpn=http(%2[Ff]|/)1\.1' || fail "subscription missing alpn=http/1.1: $decoded"
 pass "subscription base64 -> trojan link"
 
 sub2=$(curl -sf "http://127.0.0.1:${PORT}/sub/${SUB_TOKEN}?server=1.2.3.4&port=2053")
@@ -154,6 +155,10 @@ pass "unregister clears subscription"
 code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${PORT}/sub/not-a-valid-token-xxx" || true)
 [ "$code" = "401" ] || fail "expected 401 for bad sub token, got ${code}"
 pass "subscription rejects bad token"
+
+cc=$(curl -sI "http://127.0.0.1:${PORT}/sub/${SUB_TOKEN}" | tr -d '\r' | awk -F': ' 'tolower($1)=="cache-control"{print tolower($2)}')
+echo "$cc" | grep -q 'no-store' || fail "sub missing Cache-Control no-store: $cc"
+pass "subscription Cache-Control no-store"
 
 info "all checks passed (no node install)"
 pass "ci_validate done"
