@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- docs/ui: install/status show client ALPN as http/1.1 only (not h2).
+
 - feat(hub): `hub enable --name` / `hub rename` custom display names; `hub url --server/--port` for preferred-IP subscribe URLs.
 
 - docs(hub): clarify subscription `?server=&port=` (all nodes) vs `join --server/--port` (per-node).

@@ -245,6 +245,7 @@ EOF
     local domain=""
     domain=$(read_installed_domain 2>/dev/null || true)
     [ -n "$domain" ] && echo -e "  Domain : ${CYAN}${domain}${NC}"
+    echo -e "  ALPN   : ${CYAN}http/1.1 only${NC}  ${YELLOW}(client; do not enable h2)${NC}"
     echo -e "  TLS    : ${CYAN}$(read_tls_mode)${NC}"
 
     local cert_file="" expiry=""
@@ -305,7 +306,7 @@ EOF
             echo -e "  Link   : ${CYAN}$(build_share_link "$domain" "$passwd" "$transport" "$server_addr" "$server_port")${NC}"
         done < "$PASSWD_FILE"
         if [ -n "$server_addr" ]; then
-            echo -e "  Tip    : Client address=${server_addr}:${server_port}, SNI/Host=${domain}, WS path=/"
+            echo -e "  Tip    : Client address=${server_addr}:${server_port}, SNI/Host=${domain}, ALPN=http/1.1, WS path=/"
         fi
     elif [ -f "$PASSWD_FILE" ] && [ -n "$domain" ]; then
         echo -e "  Link   : ${YELLOW}hidden${NC} (use: easytrojan status --show-link [--server CF_IP])"
@@ -369,7 +370,7 @@ EOF
     done < "$PASSWD_FILE"
     [ "$found" -eq 1 ] || error "No matching password in passwd.txt"
     if [ -n "$server_addr" ]; then
-        echo -e "${YELLOW}# address=${server_addr}:${server_port}  sni/host=${domain}  path=/${NC}" >&2
+        echo -e "${YELLOW}# address=${server_addr}:${server_port}  sni/host=${domain}  alpn=http/1.1  path=/${NC}" >&2
     fi
     exit 0
 }

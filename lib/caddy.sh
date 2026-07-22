@@ -176,6 +176,7 @@ generate_caddyfile() {
         listener_wrappers {
             trojan
         }
+        # HTTP camouflage may use h2; Trojan client ALPN must be http/1.1 for WS
         protocols h2 h1
     }
     servers :80 {
