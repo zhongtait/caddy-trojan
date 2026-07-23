@@ -93,9 +93,9 @@ sudo bash easytrojan.sh install --domain yourdomain.com --tune-system
 
 | 命令 | 作用 |
 |------|------|
-| `status` / `status --show-link` | 状态；加 `--show-link` 打印链接 |
+| `status` / `status --show-link` | 状态；加 `--show-link` 打印链接，可用 `--name NAME` 自定义节点名称 |
 | `doctor` | 只读检查 Caddy、TLS、Hub 和管理状态 |
-| `link --server IP [--port PORT]` | 生成分享链接（优选 IP / 端口） |
+| `link --server IP [--port PORT] [--name NAME]` | 生成分享链接（优选 IP / 端口，可自定义节点名称） |
 | `update [--version VER]` | 更新脚本模块 + Caddy 二进制 |
 | `renew` / `renew --force` | ACME 续签辅助（**勿**对 origin 用 `--force`） |
 | `cert {auto\|origin\|status}` | 查看 / 切换 TLS 方案 |
@@ -107,7 +107,8 @@ sudo bash easytrojan.sh install --domain yourdomain.com --tune-system
 ```bash
 sudo easytrojan status
 sudo easytrojan status --show-link --server 104.16.1.1 --port 443
-sudo easytrojan link --server 104.16.1.1 --port 2053
+sudo easytrojan link --server 104.16.1.1 --port 2053 --name hk-01
+# 未指定 --name 时，链接名称默认为安装域名
 sudo easytrojan update
 sudo easytrojan cert status
 sudo easytrojan user add --password 'another-strong-password'

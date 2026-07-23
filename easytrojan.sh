@@ -9,9 +9,9 @@
 #                            [--tune-system]
 #   bash easytrojan.sh update  [--version VER]
 #   bash easytrojan.sh renew [--force]
-#   bash easytrojan.sh status [--show-link] [--server ADDR] [--port PORT]
+#   bash easytrojan.sh status [--show-link] [--server ADDR] [--port PORT] [--name NAME]
 #   bash easytrojan.sh doctor
-#   bash easytrojan.sh link [--server ADDR] [--port PORT] [--password PASS]
+#   bash easytrojan.sh link [--server ADDR] [--port PORT] [--password PASS] [--name NAME]
 #   bash easytrojan.sh cert {auto|origin|status} ...
 #   bash easytrojan.sh user {add|list|del} ...
 #   bash easytrojan.sh hub enable|disable|status|url|token|list|remove|join|leave ...
