@@ -208,11 +208,21 @@ install_hub_binary() {
     fi
     if [ -z "$src" ]; then
         mkdir -p "$SHARE_DIR"
-        if curl -fsSL --connect-timeout 10 --max-time 30 "${REPO_RAW}/hub_server.py" -o "$dest"; then
+        local stage base_url bundle sums
+        stage=$(mktemp -d)
+        base_url=$(release_asset_base "${release_version:-latest}")
+        bundle="${stage}/easytrojan_bundle.tar.gz"
+        sums="${stage}/SHA256SUMS"
+        if curl -fsSL --connect-timeout 15 --max-time 60 "${base_url}/easytrojan_bundle.tar.gz" -o "$bundle" \
+            && curl -fsSL --connect-timeout 10 --max-time 30 "${base_url}/SHA256SUMS" -o "$sums" \
+            && verify_archive_sha256 "$bundle" "$sums" \
+            && tar -xzf "$bundle" -C "$stage" hub_server.py; then
+            cp -f "${stage}/hub_server.py" "$dest"
             chmod 644 "$dest"
             src="$dest"
-            ok "Downloaded hub_server.py"
+            ok "Downloaded hub_server.py from the versioned release bundle"
         fi
+        rm -rf "$stage"
     fi
     [ -n "$src" ] || error "hub_server.py not found. Re-download repo (easytrojan.sh + hub_server.py) or re-run install/update."
     ensure_python3_hub
@@ -243,7 +253,28 @@ HUBWRAP
     chmod 755 "$HUB_BIN"
 }
 
+ensure_hub_user() {
+    if ! getent group easytrojan-hub >/dev/null 2>&1; then
+        groupadd --system easytrojan-hub
+    fi
+    if ! id easytrojan-hub >/dev/null 2>&1; then
+        useradd --system --gid easytrojan-hub --home-dir /var/lib/easytrojan-hub \
+            --shell "$(command -v nologin || echo /usr/sbin/nologin)" --no-create-home easytrojan-hub
+    fi
+    if getent group caddy >/dev/null 2>&1; then
+        usermod -a -G caddy easytrojan-hub 2>/dev/null || true
+    fi
+    mkdir -p "$HUB_DIR"
+    chown root:caddy "$CADDY_DIR" "$TROJAN_DIR" 2>/dev/null || true
+    chmod 750 "$CADDY_DIR" "$TROJAN_DIR" 2>/dev/null || true
+    chown easytrojan-hub:easytrojan-hub "$HUB_DIR"
+    find "$HUB_DIR" -maxdepth 1 -type f -exec chown easytrojan-hub:easytrojan-hub {} \; 2>/dev/null || true
+    find "$HUB_DIR" -maxdepth 1 -type f -exec chmod 600 {} \; 2>/dev/null || true
+    chmod 700 "$HUB_DIR"
+}
+
 setup_hub_unit() {
+    ensure_hub_user
     cat > "/etc/systemd/system/${HUB_UNIT}" <<EOF
 [Unit]
 Description=EasyTrojan Node Hub
@@ -252,15 +283,23 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=easytrojan-hub
+Group=easytrojan-hub
+SupplementaryGroups=caddy
 Environment=EASYTROJAN_HUB_DIR=${HUB_DIR}
 Environment=EASYTROJAN_HUB_LISTEN=${HUB_LISTEN}
-ExecStartPre=/bin/mkdir -p ${HUB_DIR}
-ExecStartPre=/bin/chmod 700 ${HUB_DIR}
 ExecStart=${HUB_BIN}
 Restart=on-failure
 RestartSec=2
 TimeoutStartSec=30
 NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=${HUB_DIR}
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 # Keep working dir writable for hub nodes.json updates under /etc/caddy
 WorkingDirectory=${HUB_DIR}
 
@@ -298,7 +337,9 @@ if cfg_p.is_file():
     try:
         cfg = json.loads(cfg_p.read_text(encoding="utf-8"))
     except Exception:
-        cfg = {}
+        raise SystemExit(f"invalid hub config: {cfg_p}; restore {cfg_p}.bak or remove it deliberately")
+    if not isinstance(cfg, dict):
+        raise SystemExit(f"invalid hub config object: {cfg_p}")
 changed = False
 if not cfg.get("register_token"):
     cfg["register_token"] = secrets.token_urlsafe(24)
@@ -452,31 +493,20 @@ hub_reregister_to_remote() {
 
 # Best-effort: remove one password from local hub nodes and remote joined hub.
 hub_remove_local_password() {
-    local passwd="$1" domain reg_token hub_url token
+    local passwd="$1" domain reg_token hub_url token payload
     [ -n "$passwd" ] || return 0
     domain=$(read_installed_domain 2>/dev/null || true)
     [ -n "$domain" ] || return 0
 
-    # Local hub: edit nodes.json by domain+password
-    if hub_enabled && [ -f "$HUB_NODES" ]; then
-        python3 - "$HUB_NODES" "$domain" "$passwd" <<'PY' 2>/dev/null || true
-import json, os, sys
-path, domain, password = sys.argv[1], sys.argv[2], sys.argv[3]
-try:
-    with open(path, encoding="utf-8") as f:
-        data = json.load(f)
-except Exception:
-    sys.exit(0)
-nodes = data.get("nodes") or []
-new = [n for n in nodes if not (n.get("domain") == domain and n.get("password") == password)]
-if len(new) != len(nodes):
-    data["nodes"] = new
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-    os.replace(tmp, path)
-PY
+    # Local hub: mutate through the authenticated API so writes remain serialized.
+    if hub_enabled && systemctl is-active --quiet "$HUB_UNIT" 2>/dev/null; then
+        reg_token=$(hub_read_cfg_field register_token)
+        if [ -n "$reg_token" ]; then
+            payload=$(printf '{"domain":"%s","password":"%s"}' \
+                "$(json_escape "$domain")" "$(json_escape "$passwd")")
+            curl -sf -X POST -H "Content-Type: application/json" -H "X-Hub-Token: ${reg_token}" \
+                -d "$payload" "http://${HUB_LISTEN}/api/unregister" >/dev/null 2>&1 || true
+        fi
     fi
 
     # Remote hub membership: unregister by domain+password (fallback: DELETE by computed node id)
@@ -745,15 +775,7 @@ for n in nodes:
                 curl -sf -X DELETE -H "X-Hub-Token: ${reg_token}" "http://${HUB_LISTEN}/api/nodes/${nid}" >/dev/null \
                     || error "Delete failed (id not found or hub down)"
             else
-                python3 -c 'import json,sys
-p,nid=sys.argv[1],sys.argv[2]
-d=json.load(open(p,encoding="utf-8"))
-nodes=[n for n in d.get("nodes") or [] if n.get("id")!=nid]
-if len(nodes)==len(d.get("nodes") or []):
-    raise SystemExit(1)
-d["nodes"]=nodes
-open(p,"w",encoding="utf-8").write(json.dumps(d,ensure_ascii=False,indent=2)+"\n")
-' "$HUB_NODES" "$nid" || error "Delete failed"
+                error "Hub service is not running; start ${HUB_UNIT} before removing a node"
             fi
             ok "Removed node ${nid}"
             exit 0
@@ -818,38 +840,16 @@ EOF
         [ -f "$HUB_NODES" ] || error "No nodes yet. Run hub enable first."
         hub_enabled || error "Hub not enabled. Run: easytrojan hub enable"
         systemctl is-active --quiet "$HUB_UNIT" 2>/dev/null || error "Hub service not running"
-        python3 - "$HUB_NODES" "$nid" "$new_name" <<'PY' || error "Rename failed (id not found?)"
-import json, os, sys, base64, time
-path, nid, new_name = sys.argv[1], sys.argv[2], sys.argv[3].strip()
-if not new_name:
-    raise SystemExit('empty name')
-with open(path, encoding='utf-8') as f:
-    data = json.load(f)
-nodes = data.get('nodes') or []
-found = False
-target = None
-for n in nodes:
-    if n.get('id') == nid:
-        domain = n.get('domain') or ''
-        password = n.get('password') or ''
-        n['name'] = new_name
-        raw = f"{domain}|{password}|{new_name}".encode('utf-8')
-        n['id'] = base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')[:32]
-        n['updated_at'] = int(time.time())
-        found = True
-        target = n
-        break
-if not found:
-    raise SystemExit('id not found')
-data['nodes'] = nodes
-data['updated_at'] = int(time.time())
-tmp = path + '.tmp'
-with open(tmp, 'w', encoding='utf-8') as f:
-    json.dump(data, f, ensure_ascii=False, indent=2)
-    f.write('\n')
-os.replace(tmp, path)
-print(target.get('id'), target.get('name'))
-PY
+        local reg_token payload resp
+        reg_token=$(hub_read_cfg_field register_token)
+        [ -n "$reg_token" ] || error "Hub register token missing"
+        payload=$(printf '{"id":"%s","name":"%s"}' \
+            "$(json_escape "$nid")" "$(json_escape "$new_name")")
+        resp=$(curl -sS -X POST -H "Content-Type: application/json" -H "X-Hub-Token: ${reg_token}" \
+            -d "$payload" "http://${HUB_LISTEN}/api/rename" 2>&1) \
+            || error "Rename failed: ${resp}"
+        echo "$resp" | grep -q '"ok"[[:space:]]*:[[:space:]]*true' \
+            || error "Rename failed (id not found?): ${resp}"
         ok "Renamed node ${nid} -> ${new_name} (hub list to verify)"
         exit 0
     fi

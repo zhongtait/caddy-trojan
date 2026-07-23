@@ -14,6 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       updated: ${{ steps.check.outputs.updated }}
+      remote_sha: ${{ steps.check.outputs.remote_sha }}
     steps:
       - uses: actions/checkout@v5
 
@@ -34,6 +35,7 @@ jobs:
             echo "Failed to fetch upstream SHA"
             exit 1
           fi
+          echo "remote_sha=${REMOTE_SHA}" >> "$GITHUB_OUTPUT"
 
           LOCAL_SHA=$(cat sha 2>/dev/null || echo "")
 
@@ -62,4 +64,6 @@ jobs:
     needs: check
     if: needs.check.outputs.updated == 'true'
     uses: ./.github/workflows/release.yml
+    with:
+      upstream_sha: ${{ needs.check.outputs.remote_sha }}
     secrets: inherit
