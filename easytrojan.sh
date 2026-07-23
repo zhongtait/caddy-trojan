@@ -117,25 +117,39 @@ _easytrojan_fetch_module() {
         EASYTROJAN_BOOTSTRAP_STAGE="$stage"
         export EASYTROJAN_BOOTSTRAP_STAGE
         local bundle="${stage}/easytrojan_bundle.tar.gz" sums="${stage}/SHA256SUMS"
-        local expected actual base_url
+        local expected actual base_url repo_ref="" repo_meta="${stage}/repo.json"
         base_url="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/latest/download"
-        if ! curl -fsSL --connect-timeout 15 --max-time 60 "${base_url}/easytrojan_bundle.tar.gz" -o "$bundle" \
-            || ! curl -fsSL --connect-timeout 10 --max-time 30 "${base_url}/SHA256SUMS" -o "$sums"; then
-            return 1
-        fi
-        expected=$(awk '$2 == "easytrojan_bundle.tar.gz" {print $1; exit}' "$sums")
-        if [ -z "$expected" ]; then
-            return 1
-        fi
-        if check_cmd sha256sum; then actual=$(sha256sum "$bundle" | awk '{print $1}')
-        elif check_cmd shasum; then actual=$(shasum -a 256 "$bundle" | awk '{print $1}')
-        elif check_cmd openssl; then actual=$(openssl dgst -sha256 "$bundle" | awk '{print $NF}')
-        else return 1
-        fi
-        [ "$actual" = "$expected" ] || return 1
-        tar -tzf "$bundle" | awk '!/^(easytrojan\.sh|hub_server\.py|lib\/?|lib\/[A-Za-z0-9._-]+)$/ {bad=1} END {exit bad}' || return 1
         mkdir -p "${stage}/unpack"
-        tar -xzf "$bundle" -C "${stage}/unpack" || return 1
+        if curl -fsSL --connect-timeout 15 --max-time 60 \
+            "${base_url}/easytrojan_bundle.tar.gz" -o "$bundle" 2>/dev/null \
+            && curl -fsSL --connect-timeout 10 --max-time 30 \
+                "${base_url}/SHA256SUMS" -o "$sums" 2>/dev/null; then
+            expected=$(awk '$2 == "easytrojan_bundle.tar.gz" {print $1; exit}' "$sums")
+            [ -n "$expected" ] || return 1
+            if check_cmd sha256sum; then actual=$(sha256sum "$bundle" | awk '{print $1}')
+            elif check_cmd shasum; then actual=$(shasum -a 256 "$bundle" | awk '{print $1}')
+            elif check_cmd openssl; then actual=$(openssl dgst -sha256 "$bundle" | awk '{print $NF}')
+            else return 1
+            fi
+            [ "$actual" = "$expected" ] || return 1
+            tar -tzf "$bundle" | awk '!/^(easytrojan\.sh|hub_server\.py|lib\/?|lib\/[A-Za-z0-9._-]+)$/ {bad=1} END {exit bad}' || return 1
+            tar -xzf "$bundle" -C "${stage}/unpack" || return 1
+        else
+            rm -f "$bundle" "$sums"
+            curl -fsSL --connect-timeout 10 --max-time 30 \
+                -H "Accept: application/vnd.github+json" \
+                -H "User-Agent: easytrojan" \
+                "${REPO_API}/commits/main" -o "$repo_meta" || return 1
+            repo_ref=$(sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-fA-F]\{40\}\)".*/\1/p' "$repo_meta" | head -1)
+            printf '%s' "$repo_ref" | grep -Eq '^[0-9a-fA-F]{40}$' || return 1
+            info "Latest Release has no script bundle; using repository commit ${repo_ref:0:7}"
+            bundle="${stage}/repository.tar.gz"
+            curl -fsSL --connect-timeout 15 --max-time 120 \
+                "https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/${repo_ref}.tar.gz" -o "$bundle" || return 1
+            tar -tzf "$bundle" | awk '/^\// || /(^|\/)\.\.($|\/)/ {bad=1} END {exit bad}' || return 1
+            tar -xzf "$bundle" --strip-components=1 --no-same-owner --no-same-permissions \
+                -C "${stage}/unpack" || return 1
+        fi
     fi
     [ -f "${stage}/unpack/lib/${name}" ] || return 1
     cp -f "${stage}/unpack/lib/${name}" "$dest"
