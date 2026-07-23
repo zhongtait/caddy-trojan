@@ -39,15 +39,16 @@ normalize_tls_mode() {
 persist_tls_config() {
     local mode="$1" cert_path="${2:-}" key_path="${3:-}"
     mkdir -p "$TROJAN_DIR"
-    chmod 700 "$TROJAN_DIR"
+    chown root:caddy "$TROJAN_DIR" 2>/dev/null || true
+    chmod 750 "$TROJAN_DIR"
     printf '%s\n' "$mode" > "$TLS_MODE_FILE"
-    chown caddy:caddy "$TLS_MODE_FILE" 2>/dev/null || true
-    chmod 600 "$TLS_MODE_FILE"
+    chown root:caddy "$TLS_MODE_FILE" 2>/dev/null || true
+    chmod 640 "$TLS_MODE_FILE"
     if [ "$mode" = "origin" ]; then
         printf '%s\n' "$cert_path" > "$TLS_CERT_FILE_REC"
         printf '%s\n' "$key_path" > "$TLS_KEY_FILE_REC"
-        chown caddy:caddy "$TLS_CERT_FILE_REC" "$TLS_KEY_FILE_REC" 2>/dev/null || true
-        chmod 600 "$TLS_CERT_FILE_REC" "$TLS_KEY_FILE_REC"
+        chown root:caddy "$TLS_CERT_FILE_REC" "$TLS_KEY_FILE_REC" 2>/dev/null || true
+        chmod 640 "$TLS_CERT_FILE_REC" "$TLS_KEY_FILE_REC"
     else
         rm -f "$TLS_CERT_FILE_REC" "$TLS_KEY_FILE_REC"
     fi
@@ -59,20 +60,30 @@ install_origin_material() {
     [ -n "$src_cert" ] && [ -f "$src_cert" ] || error "Origin certificate not found: ${src_cert:-<empty>}"
     [ -n "$src_key" ] && [ -f "$src_key" ] || error "Origin private key not found: ${src_key:-<empty>}"
 
+    check_cmd openssl || install_pkg openssl
+    check_cmd openssl || error "OpenSSL is required to validate origin certificate material"
+    openssl x509 -in "$src_cert" -noout -subject >/dev/null 2>&1 \
+        || error "Invalid certificate file: $src_cert"
+    openssl pkey -in "$src_key" -check -noout >/dev/null 2>&1 \
+        || error "Invalid private key file: $src_key"
+    local cert_pub key_pub
+    cert_pub=$(openssl x509 -in "$src_cert" -pubkey -noout 2>/dev/null \
+        | openssl pkey -pubin -outform DER 2>/dev/null \
+        | openssl dgst -sha256 | awk '{print $NF}')
+    key_pub=$(openssl pkey -in "$src_key" -pubout -outform DER 2>/dev/null \
+        | openssl dgst -sha256 | awk '{print $NF}')
+    [ -n "$cert_pub" ] && [ "$cert_pub" = "$key_pub" ] \
+        || error "Certificate and private key do not match"
+
     mkdir -p "$ORIGIN_CERT_DIR"
     cp -f "$src_cert" "$ORIGIN_CERT_DEFAULT"
     cp -f "$src_key" "$ORIGIN_KEY_DEFAULT"
-    chown caddy:caddy "$ORIGIN_CERT_DEFAULT" "$ORIGIN_KEY_DEFAULT"
-    chmod 600 "$ORIGIN_CERT_DEFAULT" "$ORIGIN_KEY_DEFAULT"
+    chown root:caddy "$ORIGIN_CERT_DEFAULT" "$ORIGIN_KEY_DEFAULT"
+    chmod 640 "$ORIGIN_CERT_DEFAULT" "$ORIGIN_KEY_DEFAULT"
     chmod 700 "$ORIGIN_CERT_DIR"
-    chown caddy:caddy "$ORIGIN_CERT_DIR"
+    chown root:caddy "$ORIGIN_CERT_DIR"
+    chmod 750 "$ORIGIN_CERT_DIR"
 
-    if check_cmd openssl; then
-        openssl x509 -in "$ORIGIN_CERT_DEFAULT" -noout -subject >/dev/null 2>&1             || error "Invalid certificate file: $ORIGIN_CERT_DEFAULT"
-        if ! openssl pkey -in "$ORIGIN_KEY_DEFAULT" -check -noout >/dev/null 2>&1             && ! openssl rsa -in "$ORIGIN_KEY_DEFAULT" -check -noout >/dev/null 2>&1; then
-            warn "Could not fully validate private key format (continuing)"
-        fi
-    fi
     ok "Origin certificate installed at $ORIGIN_CERT_DEFAULT"
 }
 

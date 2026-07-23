@@ -6,9 +6,11 @@
 # Usage:
 #   bash easytrojan.sh install --domain DOMAIN [--password PASS] [--version VER] [--skip-domain-check]
 #                            [--tls-mode auto|origin] [--origin-cert PATH] [--origin-key PATH]
+#                            [--tune-system]
 #   bash easytrojan.sh update  [--version VER]
 #   bash easytrojan.sh renew [--force]
 #   bash easytrojan.sh status [--show-link] [--server ADDR] [--port PORT]
+#   bash easytrojan.sh doctor
 #   bash easytrojan.sh link [--server ADDR] [--port PORT] [--password PASS]
 #   bash easytrojan.sh cert {auto|origin|status} ...
 #   bash easytrojan.sh user {add|list|del} ...
@@ -22,7 +24,6 @@ set -euo pipefail
 
 REPO_OWNER="zhongtait"
 REPO_NAME="caddy-trojan"
-REPO_RAW="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main"
 REPO_API="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}"
 CADDY_BIN="/usr/local/bin/caddy"
 SCRIPT_BIN="/usr/local/bin/easytrojan"
@@ -30,6 +31,9 @@ SCRIPT_LEGACY="/usr/local/bin/easytrojan.sh"
 SHARE_DIR="/usr/local/share/easytrojan"
 LIB_SHARE_DIR="${SHARE_DIR}/lib"
 CADDY_DIR="/etc/caddy"
+CADDY_XDG_DATA_HOME="/var/lib"
+CADDY_DATA_DIR="${CADDY_XDG_DATA_HOME}/caddy"
+CADDY_DATA_MARKER="${CADDY_DATA_DIR}/.easytrojan-managed"
 TROJAN_DIR="${CADDY_DIR}/trojan"
 PASSWD_FILE="${TROJAN_DIR}/passwd.txt"
 DOMAIN_FILE="${TROJAN_DIR}/domain.txt"
@@ -49,11 +53,12 @@ HUB_BIN="/usr/local/bin/easytrojan-hub"
 HUB_LISTEN="127.0.0.1:2099"
 HUB_UNIT="easytrojan-hub.service"
 CADDYFILE="${CADDY_DIR}/Caddyfile"
+MANAGED_MARKER="${CADDY_DIR}/.easytrojan-managed"
 WWW_DIR="${CADDY_DIR}/www"
 ADMIN_API="http://127.0.0.1:2019"
 # Static camouflage site: CorentinTh/it-tools release zip (Vue SPA)
 IT_TOOLS_REPO="CorentinTh/it-tools"
-IT_TOOLS_VERSION="${IT_TOOLS_VERSION:-latest}"
+IT_TOOLS_VERSION="${IT_TOOLS_VERSION:-v2024.10.22-7ca5933}"
 
 EASYTROJAN_LIB_MODULES=(
     common.sh
@@ -106,7 +111,46 @@ EASYTROJAN_ROOT="${EASYTROJAN_ROOT:-$(_easytrojan_root_from_script)}"
 _easytrojan_fetch_module() {
     local name="$1" dest="$2"
     check_cmd curl || return 1
-    curl -fsSL --connect-timeout 10 --max-time 30 "${REPO_RAW}/lib/${name}" -o "$dest"
+    local stage="${EASYTROJAN_BOOTSTRAP_STAGE:-}"
+    if [ -z "$stage" ]; then
+        stage=$(mktemp -d)
+        EASYTROJAN_BOOTSTRAP_STAGE="$stage"
+        export EASYTROJAN_BOOTSTRAP_STAGE
+        local bundle="${stage}/easytrojan_bundle.tar.gz" sums="${stage}/SHA256SUMS"
+        local expected actual base_url
+        base_url="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/latest/download"
+        if ! curl -fsSL --connect-timeout 15 --max-time 60 "${base_url}/easytrojan_bundle.tar.gz" -o "$bundle" \
+            || ! curl -fsSL --connect-timeout 10 --max-time 30 "${base_url}/SHA256SUMS" -o "$sums"; then
+            return 1
+        fi
+        expected=$(awk '$2 == "easytrojan_bundle.tar.gz" {print $1; exit}' "$sums")
+        if [ -z "$expected" ]; then
+            return 1
+        fi
+        if check_cmd sha256sum; then actual=$(sha256sum "$bundle" | awk '{print $1}')
+        elif check_cmd shasum; then actual=$(shasum -a 256 "$bundle" | awk '{print $1}')
+        elif check_cmd openssl; then actual=$(openssl dgst -sha256 "$bundle" | awk '{print $NF}')
+        else return 1
+        fi
+        [ "$actual" = "$expected" ] || return 1
+        tar -tzf "$bundle" | awk '!/^(easytrojan\.sh|hub_server\.py|lib\/?|lib\/[A-Za-z0-9._-]+)$/ {bad=1} END {exit bad}' || return 1
+        mkdir -p "${stage}/unpack"
+        tar -xzf "$bundle" -C "${stage}/unpack" || return 1
+    fi
+    [ -f "${stage}/unpack/lib/${name}" ] || return 1
+    cp -f "${stage}/unpack/lib/${name}" "$dest"
+}
+
+_easytrojan_fetch_bundle_file() {
+    local name="$1" dest="$2" seed
+    if [ -z "${EASYTROJAN_BOOTSTRAP_STAGE:-}" ]; then
+        seed=$(mktemp)
+        _easytrojan_fetch_module common.sh "$seed" || { rm -f "$seed"; return 1; }
+        rm -f "$seed"
+    fi
+    local stage="${EASYTROJAN_BOOTSTRAP_STAGE}"
+    [ -f "${stage}/unpack/${name}" ] || return 1
+    cp -f "${stage}/unpack/${name}" "$dest"
 }
 
 # Source one module: prefer EASYTROJAN_ROOT/lib, then SHARE_DIR/lib, else download to SHARE_DIR
@@ -126,7 +170,7 @@ easytrojan_source() {
                 EASYTROJAN_ROOT="$SHARE_DIR"
             fi
         else
-            error "Missing module lib/${name}. Place repo lib/ next to easytrojan.sh or ensure network to ${REPO_RAW}/lib/${name}"
+            error "Missing module lib/${name}. Place the complete repo beside easytrojan.sh or ensure the latest Release bundle is available"
         fi
     fi
     # shellcheck disable=SC1090
@@ -174,7 +218,7 @@ install_self() {
         cp -f "${src_dir}/hub_server.py" "${SHARE_DIR}/hub_server.py"
         chmod 644 "${SHARE_DIR}/hub_server.py"
     elif [ ! -f "${SHARE_DIR}/hub_server.py" ]; then
-        curl -fsSL --connect-timeout 10 --max-time 30 "${REPO_RAW}/hub_server.py" -o "${SHARE_DIR}/hub_server.py" 2>/dev/null || true
+        _easytrojan_fetch_bundle_file hub_server.py "${SHARE_DIR}/hub_server.py" 2>/dev/null || true
         [ -f "${SHARE_DIR}/hub_server.py" ] && chmod 644 "${SHARE_DIR}/hub_server.py"
     fi
 }
@@ -190,6 +234,7 @@ skip_domain_check="0"
 tls_mode=""
 origin_cert_src=""
 origin_key_src=""
+tune_system="0"
 
 cmd="${1:-}"
 case "$cmd" in
@@ -210,6 +255,10 @@ case "$cmd" in
     status)
         shift
         do_status "$@"
+        ;;
+    doctor)
+        shift
+        do_doctor "$@"
         ;;
     link|share)
         shift

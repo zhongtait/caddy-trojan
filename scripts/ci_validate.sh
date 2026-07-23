@@ -127,6 +127,15 @@ resp=$(curl -sf -X POST -H "Content-Type: application/json" -H "X-Hub-Token: ${R
 echo "$resp" | grep -qE '"ok"[[:space:]]*:[[:space:]]*true' || fail "register failed: $resp"
 pass "register node"
 
+nid=$(printf '%s' "$resp" | python3 -c 'import json,sys; print(json.load(sys.stdin)["node"]["id"])')
+renamed=$(curl -sf -X POST -H "Content-Type: application/json" -H "X-Hub-Token: ${REG_TOKEN}" \
+  -d "{\"id\":\"${nid}\",\"name\":\"n1-renamed\"}" \
+  "http://127.0.0.1:${PORT}/api/rename")
+echo "$renamed" | grep -qE '"ok"[[:space:]]*:[[:space:]]*true' || fail "rename failed: $renamed"
+renamed_id=$(printf '%s' "$renamed" | python3 -c 'import json,sys; print(json.load(sys.stdin)["node"]["id"])')
+[ "$renamed_id" = "$nid" ] || fail "rename changed stable node id: ${nid} -> ${renamed_id}"
+pass "rename node through API"
+
 sub=$(curl -sf "http://127.0.0.1:${PORT}/sub/${SUB_TOKEN}")
 decoded=$(printf '%s' "$sub" | python3 -c 'import sys,base64; print(base64.b64decode(sys.stdin.read()).decode())')
 echo "$decoded" | grep -q 'trojan://' || fail "subscription missing trojan:// : $decoded"
@@ -159,6 +168,44 @@ pass "subscription rejects bad token"
 cc=$(curl -sI "http://127.0.0.1:${PORT}/sub/${SUB_TOKEN}" | tr -d '\r' | awk -F': ' 'tolower($1)=="cache-control"{print tolower($2)}')
 echo "$cc" | grep -q 'no-store' || fail "sub missing Cache-Control no-store: $cc"
 pass "subscription Cache-Control no-store"
+
+# ---------- hub input limits ----------
+code=$(curl -s -o /dev/null -w "%{http_code}" \
+  -X POST -H "Content-Type: application/json" -H "X-Hub-Token: ${REG_TOKEN}" \
+  -d '{"domain":"bad.example.com","password":"secret-pass","port":70000}' \
+  "http://127.0.0.1:${PORT}/api/register" || true)
+[ "$code" = "400" ] || fail "expected 400 for invalid port, got ${code}"
+pass "register rejects invalid port"
+
+python3 -c 'import json,sys; json.dump({"domain":"large.example.com","password":"x"*70000},open(sys.argv[1],"w"))' "${HUB_TMP}/large.json"
+code=$(curl -s -o /dev/null -w "%{http_code}" \
+  -X POST -H "Content-Type: application/json" -H "X-Hub-Token: ${REG_TOKEN}" \
+  --data-binary "@${HUB_TMP}/large.json" "http://127.0.0.1:${PORT}/api/register" || true)
+[ "$code" = "413" ] || fail "expected 413 for oversized request, got ${code}"
+pass "register limits request body"
+
+# ---------- concurrent writes ----------
+info "hub concurrent registration"
+pids=()
+for i in $(seq 1 25); do
+  curl -sf -X POST -H "Content-Type: application/json" -H "X-Hub-Token: ${REG_TOKEN}" \
+    -d "{\"name\":\"n${i}\",\"domain\":\"n${i}.example.com\",\"password\":\"secret-pass-${i}\"}" \
+    "http://127.0.0.1:${PORT}/api/register" >"${HUB_TMP}/concurrent-${i}.json" &
+  pids+=("$!")
+done
+for pid in "${pids[@]}"; do
+  wait "$pid" || fail "concurrent registration request failed (pid=${pid})"
+done
+node_count=$(curl -sf -H "X-Hub-Token: ${REG_TOKEN}" "http://127.0.0.1:${PORT}/api/nodes" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["count"])')
+[ "$node_count" = "25" ] || fail "concurrent registration lost nodes: expected 25, got ${node_count}"
+pass "concurrent registration keeps all nodes"
+
+# ---------- corrupt state must fail closed ----------
+printf '{broken\n' > "${HUB_TMP}/nodes.json"
+code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${PORT}/health" || true)
+[ "$code" = "503" ] || fail "expected 503 for corrupt node state, got ${code}"
+pass "corrupt node state fails closed"
 
 info "all checks passed (no node install)"
 pass "ci_validate done"

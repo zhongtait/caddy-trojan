@@ -8,10 +8,11 @@ EasyTrojan - One-click Caddy-Trojan installer
 
 Usage:
   bash easytrojan.sh install --domain DOMAIN [--password PASSWORD] [--version VERSION] [--skip-domain-check]
-                             [--tls-mode auto|origin] [--origin-cert PATH] [--origin-key PATH]
+                             [--tls-mode auto|origin] [--origin-cert PATH] [--origin-key PATH] [--tune-system]
   bash easytrojan.sh update  [--version VERSION]
   bash easytrojan.sh renew [--force]
   bash easytrojan.sh status [--show-link] [--server ADDR] [--port PORT]
+  bash easytrojan.sh doctor
   bash easytrojan.sh link [--server ADDR] [--port PORT] [--password PASSWORD]
   bash easytrojan.sh cert auto
   bash easytrojan.sh cert origin --cert PATH --key PATH
@@ -53,6 +54,7 @@ Notes:
   - --server ADDR: share-link address for Cloudflare preferred IP (SNI/Host still use domain)
   - --port PORT: connect port for share links / subscription (default 443; CF HTTPS ports ok)
   - --tls-mode auto: Caddy ACME (default). origin: Cloudflare Origin / file certs
+  - --tune-system: opt in to global sysctl and security limit tuning
   - Reinstall without --tls-mode keeps previous TLS mode; origin reuses /etc/caddy/certs if present
   - Camouflage site defaults to CorentinTh/it-tools (override: IT_TOOLS_VERSION=...)
   - hub: optional node aggregation + base64 subscription on one machine
@@ -201,6 +203,10 @@ parse_common_args() {
                 [ -n "${2:-}" ] || error "--origin-key requires a path"
                 origin_key_src="$2"
                 shift 2
+                ;;
+            --tune-system)
+                tune_system="1"
+                shift
                 ;;
             -h|--help)
                 usage

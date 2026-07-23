@@ -2,6 +2,14 @@
 # EasyTrojan module: camouflage.sh
 # shellcheck shell=bash
 
+camouflage_fallback_or_keep() {
+    if [ -f "${WWW_DIR}/index.html" ]; then
+        warn "Keeping the existing camouflage site"
+    else
+        write_camouflage_fallback
+    fi
+}
+
 write_camouflage_site() {
     mkdir -p "$WWW_DIR"
     if ! check_cmd unzip; then
@@ -16,7 +24,8 @@ write_camouflage_site() {
     check_cmd curl || install_pkg curl
 
     local version="${IT_TOOLS_VERSION:-latest}"
-    local api_url asset_url tmp_dir zip_path tag name extract_root
+    local api_url asset_url="" asset_digest="" asset_meta="" tmp_dir zip_path tag name extract_root
+    local staged_site old_site expected_digest actual_digest
     tmp_dir=$(mktemp -d)
     trap 'rm -rf "$tmp_dir"' RETURN
 
@@ -35,41 +44,43 @@ write_camouflage_site() {
 
     if ! check_cmd unzip; then
         warn "unzip not available; using built-in fallback tools page"
-        write_camouflage_fallback
+        camouflage_fallback_or_keep
         trap - RETURN
         rm -rf "$tmp_dir"
         return 0
     fi
 
-    # Resolve zip asset URL from GitHub API (fallback to known latest pattern if API blocked)
-    asset_url=""
+    # Resolve one release asset and its GitHub-provided digest together.
     if curl -fsSL --connect-timeout 10 --max-time 30 \
         -H "Accept: application/vnd.github+json" \
         -H "User-Agent: easytrojan" \
         "$api_url" -o "${tmp_dir}/release.json" 2>/dev/null; then
-        asset_url=$(python3 -c '
+        asset_meta=$(python3 -c '
 import json,sys
 try:
   d=json.load(open(sys.argv[1],encoding="utf-8"))
   for a in d.get("assets") or []:
     n=a.get("name") or ""
     if n.endswith(".zip") and "it-tools" in n:
-      print(a.get("browser_download_url",""))
+      print((a.get("browser_download_url") or "") + "\t" + (a.get("digest") or ""))
       break
 except Exception:
   pass
 ' "${tmp_dir}/release.json" 2>/dev/null || true)
+        asset_url=${asset_meta%%$'\t'*}
+        asset_digest=${asset_meta#*$'\t'}
         if [ -z "$asset_url" ]; then
             asset_url=$(grep -oE 'https://github.com/[^"]+it-tools[^"]+\.zip' "${tmp_dir}/release.json" 2>/dev/null | head -1 || true)
         fi
         tag=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("tag_name",""))' "${tmp_dir}/release.json" 2>/dev/null || true)
     fi
 
-    if [ -z "$asset_url" ]; then
-        # Last-known public release zip (updated when project bumps default)
-        asset_url="https://github.com/CorentinTh/it-tools/releases/download/v2024.10.22-7ca5933/it-tools-2024.10.22-7ca5933.zip"
-        tag="v2024.10.22-7ca5933"
-        warn "GitHub API unavailable; using pinned IT-Tools release ${tag}"
+    if [ -z "$asset_url" ] || ! printf '%s' "$asset_digest" | grep -Eq '^sha256:[0-9a-fA-F]{64}$'; then
+        warn "IT-Tools release URL or SHA256 digest unavailable"
+        camouflage_fallback_or_keep
+        trap - RETURN
+        rm -rf "$tmp_dir"
+        return 0
     fi
 
     zip_path="${tmp_dir}/it-tools.zip"
@@ -77,18 +88,34 @@ except Exception:
         -H "User-Agent: easytrojan" \
         "$asset_url" -o "$zip_path"; then
         warn "Failed to download IT-Tools zip; using built-in fallback tools page"
-        write_camouflage_fallback
+        camouflage_fallback_or_keep
         trap - RETURN
         rm -rf "$tmp_dir"
         return 0
     fi
 
-    # Clear previous site (keep dir)
-    find "$WWW_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+    expected_digest=${asset_digest#sha256:}
+    actual_digest=$(sha256_file "$zip_path") || error "No SHA256 tool available for IT-Tools verification"
+    if [ "$actual_digest" != "$expected_digest" ]; then
+        warn "IT-Tools SHA256 mismatch; refusing the downloaded archive"
+        camouflage_fallback_or_keep
+        trap - RETURN
+        rm -rf "$tmp_dir"
+        return 0
+    fi
+    if ! unzip -Z1 "$zip_path" > "${tmp_dir}/entries.txt" 2>/dev/null \
+        || awk '/(^\/)|(^|\/)\.\.($|\/)|\\/ {bad=1} END {exit bad}' "${tmp_dir}/entries.txt"; then
+        warn "IT-Tools archive contains unsafe paths"
+        camouflage_fallback_or_keep
+        trap - RETURN
+        rm -rf "$tmp_dir"
+        return 0
+    fi
+
     mkdir -p "${tmp_dir}/extract"
     if ! unzip -q "$zip_path" -d "${tmp_dir}/extract"; then
         warn "Failed to unzip IT-Tools; using built-in fallback tools page"
-        write_camouflage_fallback
+        camouflage_fallback_or_keep
         trap - RETURN
         rm -rf "$tmp_dir"
         return 0
@@ -104,15 +131,19 @@ except Exception:
     fi
     if [ -z "${extract_root:-}" ] || [ ! -f "${extract_root}/index.html" ]; then
         warn "IT-Tools archive layout unexpected; using fallback tools page"
-        write_camouflage_fallback
+        camouflage_fallback_or_keep
         trap - RETURN
         rm -rf "$tmp_dir"
         return 0
     fi
 
-    cp -a "${extract_root}/." "$WWW_DIR/"
+    staged_site="${CADDY_DIR}/.www.new.$$"
+    old_site="${CADDY_DIR}/.www.old.$$"
+    rm -rf "$staged_site" "$old_site"
+    mkdir -p "$staged_site"
+    cp -a "${extract_root}/." "$staged_site/"
     # Attribution for operators
-    cat > "${WWW_DIR}/.it-tools-source.txt" <<EOF
+    cat > "${staged_site}/.it-tools-source.txt" <<EOF
 source=https://github.com/${IT_TOOLS_REPO}
 tag=${tag:-$version}
 license=GPL-3.0
@@ -120,9 +151,17 @@ homepage=https://it-tools.tech
 installed_by=easytrojan
 EOF
 
-    chown -R caddy:caddy "$WWW_DIR" 2>/dev/null || true
-    find "$WWW_DIR" -type d -exec chmod 755 {} \; 2>/dev/null || true
-    find "$WWW_DIR" -type f -exec chmod 644 {} \; 2>/dev/null || true
+    chown -R root:caddy "$staged_site" 2>/dev/null || true
+    find "$staged_site" -type d -exec chmod 755 {} \; 2>/dev/null || true
+    find "$staged_site" -type f -exec chmod 644 {} \; 2>/dev/null || true
+    if [ -d "$WWW_DIR" ]; then
+        mv "$WWW_DIR" "$old_site"
+    fi
+    if ! mv "$staged_site" "$WWW_DIR"; then
+        [ -d "$old_site" ] && mv "$old_site" "$WWW_DIR"
+        error "Failed to activate the staged camouflage site"
+    fi
+    rm -rf "$old_site"
     ok "IT-Tools site installed to ${WWW_DIR} (${tag:-$version})"
     trap - RETURN
     rm -rf "$tmp_dir"
@@ -279,7 +318,7 @@ EOF
 </body>
 </html>
 EOF
-    chown -R caddy:caddy "$WWW_DIR" 2>/dev/null || true
+    chown -R root:caddy "$WWW_DIR" 2>/dev/null || true
     find "$WWW_DIR" -type d -exec chmod 755 {} \; 2>/dev/null || true
     find "$WWW_DIR" -type f -exec chmod 644 {} \; 2>/dev/null || true
     ok "Fallback tools site written to ${WWW_DIR}"

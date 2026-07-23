@@ -4,6 +4,16 @@
 
 do_install() {
     require_root
+    if [ -f "$CADDYFILE" ] && ! grep -qF '# Managed by EasyTrojan' "$CADDYFILE" 2>/dev/null; then
+        if [ ! -f "$DOMAIN_FILE" ] || [ ! -f "$PASSWD_FILE" ]; then
+            error "Existing Caddy configuration detected at $CADDYFILE. Back it up or remove it before installing EasyTrojan."
+        fi
+        warn "Adopting an existing EasyTrojan state without a management marker"
+    fi
+    if [ -f /etc/systemd/system/caddy.service ] && ! grep -qF 'Managed by EasyTrojan' /etc/systemd/system/caddy.service 2>/dev/null \
+        && [ ! -f "$DOMAIN_FILE" ]; then
+        error "Existing Caddy systemd unit detected. Refusing to overwrite it."
+    fi
     prompt_password
     install_pkg tar
     install_pkg curl
@@ -45,12 +55,12 @@ do_install() {
 
     local cert_backup="" previous_domain=""
     previous_domain=$(read_installed_domain 2>/dev/null || true)
-    if [ -d "${CADDY_DIR}/certificates" ]; then
+    if [ -d "${CADDY_DATA_DIR}/certificates" ]; then
         info "Backing up existing certificates..."
         cert_backup=$(mktemp -d /tmp/caddy-cert-backup.XXXXXX)
         chmod 700 "$cert_backup"
-        cp -a "${CADDY_DIR}/certificates" "$cert_backup/" 2>/dev/null || true
-        cp -a "${CADDY_DIR}/acme" "$cert_backup/" 2>/dev/null || true
+        cp -a "${CADDY_DATA_DIR}/certificates" "$cert_backup/" 2>/dev/null || true
+        cp -a "${CADDY_DATA_DIR}/acme" "$cert_backup/" 2>/dev/null || true
         ok "Certificates backed up"
     fi
 
@@ -67,16 +77,16 @@ do_install() {
 
     mkdir -p "$TROJAN_DIR" "$WWW_DIR"
     # Drop certs only when domain changes; same-domain reinstall keeps material to avoid LE rate limits
-    if [ -n "$previous_domain" ] && [ "$previous_domain" = "$site_domain" ] && [ -d "${CADDY_DIR}/certificates" ]; then
+    if [ -n "$previous_domain" ] && [ "$previous_domain" = "$site_domain" ] && [ -d "${CADDY_DATA_DIR}/certificates" ]; then
         info "Same domain reinstall; keeping existing certificate material"
     else
-        if [ -d "${CADDY_DIR}/certificates" ] || [ -d "${CADDY_DIR}/acme" ]; then
+        if [ -d "${CADDY_DATA_DIR}/certificates" ] || [ -d "${CADDY_DATA_DIR}/acme" ]; then
             info "Domain changed or first install; clearing old certificate material for re-issue"
-            rm -rf "${CADDY_DIR}/certificates" "${CADDY_DIR}/acme"
+            rm -rf "${CADDY_DATA_DIR}/certificates" "${CADDY_DATA_DIR}/acme"
         fi
     fi
     ensure_cert_storage
-    chmod 700 "$TROJAN_DIR"
+    chmod 750 "$TROJAN_DIR"
 
     write_camouflage_site
 
@@ -111,33 +121,7 @@ do_install() {
     generate_caddyfile "$site_domain"
 
     info "Creating systemd service..."
-    cat > /etc/systemd/system/caddy.service <<EOF
-[Unit]
-Description=Caddy
-Documentation=https://caddyserver.com/docs/
-After=network.target network-online.target
-Requires=network-online.target
-
-[Service]
-Type=notify
-User=caddy
-Group=caddy
-Environment=XDG_CONFIG_HOME=/etc XDG_DATA_HOME=/etc HOME=/var/lib/caddy
-ExecStart=${CADDY_BIN} run --environ --config ${CADDYFILE}
-ExecReload=${CADDY_BIN} reload --config ${CADDYFILE} --force
-TimeoutStopSec=5s
-LimitNOFILE=1048576
-LimitNPROC=512
-PrivateTmp=true
-NoNewPrivileges=true
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    write_caddy_unit
 
     if check_cmd ip && ip link show lo 2>/dev/null | grep -q DOWN; then
         ip link set lo up || true
@@ -161,14 +145,14 @@ EOF
     else
         info "Obtaining SSL certificate (this may take up to 2 minutes)..."
         local count=0 max_wait=40
-        until find "${CADDY_DIR}/certificates" -name '*.crt' -type f 2>/dev/null | grep -q .; do
+        until find "${CADDY_DATA_DIR}/certificates" -name '*.crt' -type f 2>/dev/null | grep -q .; do
             count=$((count + 1))
             if [ "$count" -gt "$max_wait" ]; then
                 if [ -n "$cert_backup" ] && [ -d "${cert_backup}/certificates" ]; then
                     warn "New certificate request failed. Restoring from backup..."
-                    cp -a "${cert_backup}/certificates" "${CADDY_DIR}/" 2>/dev/null || true
-                    cp -a "${cert_backup}/acme" "${CADDY_DIR}/" 2>/dev/null || true
-                    chown -R caddy:caddy "$CADDY_DIR"
+                    cp -a "${cert_backup}/certificates" "${CADDY_DATA_DIR}/" 2>/dev/null || true
+                    cp -a "${cert_backup}/acme" "${CADDY_DATA_DIR}/" 2>/dev/null || true
+                    chown -R caddy:caddy "$CADDY_DATA_DIR"
                     systemctl restart caddy.service
                     ok "Certificates restored from backup"
                 else
@@ -178,13 +162,17 @@ EOF
             fi
             sleep 3
         done
-        if find "${CADDY_DIR}/certificates" -name '*.crt' -type f 2>/dev/null | grep -q .; then
+        if find "${CADDY_DATA_DIR}/certificates" -name '*.crt' -type f 2>/dev/null | grep -q .; then
             ok "SSL certificate ready"
         fi
     fi
     [ -n "$cert_backup" ] && rm -rf "$cert_backup"
 
-    apply_sysctl_limits
+    if [ "${tune_system:-0}" = "1" ]; then
+        apply_sysctl_limits
+    else
+        info "Skipping global sysctl tuning (use --tune-system to enable)"
+    fi
     setup_renew_timer
 
     info "Verifying installation..."
