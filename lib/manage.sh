@@ -343,7 +343,7 @@ do_renew() {
 }
 
 do_status() {
-    local show_link=0 server_addr="" server_port="443"
+    local show_link=0 server_addr="" server_port="443" link_name=""
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --show-link|--link) show_link=1; shift ;;
@@ -358,14 +358,21 @@ do_status() {
                 server_port="$2"
                 shift 2
                 ;;
+            --name)
+                [ -n "${2:-}" ] || error "--name requires a value"
+                link_name="$2"
+                show_link=1
+                shift 2
+                ;;
             -h|--help)
                 cat <<'EOF'
-Usage: easytrojan status [--show-link] [--server ADDR] [--port PORT]
+Usage: easytrojan status [--show-link] [--server ADDR] [--port PORT] [--name NAME]
 
   --show-link       Print trojan share links (passwords in URL)
   --server ADDR     Connect address for share links (e.g. Cloudflare preferred IP).
                     SNI and WS Host stay as the installed domain.
   --port PORT       Connect port for share links (default 443; CF HTTPS ports ok).
+  --name NAME       Display name in the share-link fragment (URL encoded).
 EOF
                 exit 0
                 ;;
@@ -450,7 +457,7 @@ EOF
         fi
         while IFS= read -r passwd || [ -n "$passwd" ]; do
             [ -n "$passwd" ] || continue
-            echo -e "  Link   : ${CYAN}$(build_share_link "$domain" "$passwd" "$transport" "$server_addr" "$server_port")${NC}"
+            echo -e "  Link   : ${CYAN}$(build_share_link "$domain" "$passwd" "$transport" "$server_addr" "$server_port" "$link_name")${NC}"
         done < "$PASSWD_FILE"
         if [ -n "$server_addr" ]; then
             echo -e "  Tip    : Client address=${server_addr}:${server_port}, SNI/Host=${domain}, ALPN=h2/http1.1, WS path=/"
@@ -463,7 +470,7 @@ EOF
 }
 
 do_link() {
-    local server_addr="" server_port="443" pass_filter=""
+    local server_addr="" server_port="443" pass_filter="" link_name=""
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --server|--addr|--address)
@@ -481,15 +488,21 @@ do_link() {
                 pass_filter="$2"
                 shift 2
                 ;;
+            --name)
+                [ -n "${2:-}" ] || error "--name requires a value"
+                link_name="$2"
+                shift 2
+                ;;
             -h|--help)
                 cat <<'EOF'
-Usage: easytrojan link [--server ADDR] [--port PORT] [--password PASSWORD]
+Usage: easytrojan link [--server ADDR] [--port PORT] [--password PASSWORD] [--name NAME]
 
 Print trojan share links for installed users.
   --server ADDR   Use ADDR as connect host (Cloudflare preferred IP).
                   SNI and WS Host remain the installed domain.
   --port PORT     Connect port (default 443; CF HTTPS ports e.g. 2053).
   --password PASS Only print link for this password.
+  --name NAME     Display name in the share-link fragment (URL encoded).
 EOF
                 exit 0
                 ;;
@@ -512,7 +525,7 @@ EOF
             continue
         fi
         found=1
-        build_share_link "$domain" "$passwd" "$transport" "$server_addr" "$server_port"
+        build_share_link "$domain" "$passwd" "$transport" "$server_addr" "$server_port" "$link_name"
         printf '\n'
     done < "$PASSWD_FILE"
     [ "$found" -eq 1 ] || error "No matching password in passwd.txt"

@@ -11,9 +11,9 @@ Usage:
                              [--tls-mode auto|origin] [--origin-cert PATH] [--origin-key PATH] [--tune-system]
   bash easytrojan.sh update  [--version VERSION]
   bash easytrojan.sh renew [--force]
-  bash easytrojan.sh status [--show-link] [--server ADDR] [--port PORT]
+  bash easytrojan.sh status [--show-link] [--server ADDR] [--port PORT] [--name NAME]
   bash easytrojan.sh doctor
-  bash easytrojan.sh link [--server ADDR] [--port PORT] [--password PASSWORD]
+  bash easytrojan.sh link [--server ADDR] [--port PORT] [--password PASSWORD] [--name NAME]
   bash easytrojan.sh cert auto
   bash easytrojan.sh cert origin --cert PATH --key PATH
   bash easytrojan.sh cert status
@@ -288,9 +288,10 @@ read_installed_domain() {
 }
 
 build_share_link() {
-    local domain="$1" passwd="$2" transport="${3:-ws}" server="${4:-}" port="${5:-443}"
-    local encoded addr
+    local domain="$1" passwd="$2" transport="${3:-ws}" server="${4:-}" port="${5:-443}" name="${6:-$1}"
+    local encoded display_name addr
     encoded=$(urlencode "$passwd")
+    display_name=$(urlencode "$name")
     addr="${server:-$domain}"
     port="${port:-443}"
     [ -n "$addr" ] || error "Share link needs domain or --server address"
@@ -298,9 +299,9 @@ build_share_link() {
         # Address may be CF anycast IP; SNI + WS Host must remain the real domain.
         # Advertise both ALPN values; server already enables h2 + h1.
         printf 'trojan://%s@%s:%s?security=tls&sni=%s&alpn=h2%%2Chttp%%2F1.1&type=ws&host=%s&path=%%2F#%s' \
-            "$encoded" "$addr" "$port" "$domain" "$domain" "$domain"
+            "$encoded" "$addr" "$port" "$domain" "$domain" "$display_name"
     else
         printf 'trojan://%s@%s:%s?security=tls&sni=%s&alpn=h2%%2Chttp%%2F1.1&type=tcp#%s' \
-            "$encoded" "$addr" "$port" "$domain" "$domain"
+            "$encoded" "$addr" "$port" "$domain" "$display_name"
     fi
 }
