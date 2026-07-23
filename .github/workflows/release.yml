@@ -3,6 +3,11 @@ name: Build Caddy-Trojan
 on:
   workflow_dispatch:
   workflow_call:
+    inputs:
+      upstream_sha:
+        description: 'Upstream imgk/caddy-trojan commit to build'
+        required: false
+        type: string
   push:
     paths:
       - 'sha'
@@ -43,10 +48,17 @@ jobs:
           GOOS: ${{ matrix.os }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: '0'
+          UPSTREAM_SHA: ${{ inputs.upstream_sha || '' }}
         run: |
           mkdir -p output
           cd output
-          xcaddy build --with github.com/imgk/caddy-trojan
+          UPSTREAM_SHA="${UPSTREAM_SHA:-$(tr -d '[:space:]' < ../sha)}"
+          if ! printf '%s' "$UPSTREAM_SHA" | grep -Eq '^[0-9a-fA-F]{40}$'; then
+            echo "Invalid upstream SHA: ${UPSTREAM_SHA:-<empty>}" >&2
+            exit 1
+          fi
+          echo "Building imgk/caddy-trojan at ${UPSTREAM_SHA}"
+          xcaddy build --with "github.com/imgk/caddy-trojan@${UPSTREAM_SHA}"
           FILENAME="caddy_trojan_${{ matrix.os }}_${{ matrix.arch }}.tar.gz"
           tar -czvf "../${FILENAME}" caddy
 
@@ -71,19 +83,27 @@ jobs:
 
       - name: Prepare checksums and tag
         id: meta
+        env:
+          UPSTREAM_SHA: ${{ inputs.upstream_sha || '' }}
         run: |
           set -euo pipefail
           tar -xzf artifacts/caddy_trojan_linux_amd64.tar.gz -C /tmp
           VERSION=$(/tmp/caddy version | awk '{print $1}')
-          SHORT_SHA=$(cut -c1-7 sha)
+          UPSTREAM_SHA="${UPSTREAM_SHA:-$(tr -d '[:space:]' < sha)}"
+          if ! printf '%s' "$UPSTREAM_SHA" | grep -Eq '^[0-9a-fA-F]{40}$'; then
+            echo "Invalid upstream SHA: ${UPSTREAM_SHA:-<empty>}" >&2
+            exit 1
+          fi
+          SHORT_SHA=$(printf '%s' "$UPSTREAM_SHA" | cut -c1-7)
           TAG="${VERSION}+trojan.${SHORT_SHA}"
+          tar -czf artifacts/easytrojan_bundle.tar.gz easytrojan.sh hub_server.py lib
           (
             cd artifacts
             sha256sum *.tar.gz > SHA256SUMS
           )
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "sha=$(cat sha)" >> "$GITHUB_OUTPUT"
+          echo "sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
           cat artifacts/SHA256SUMS
 
       - name: Create Release
@@ -94,7 +114,8 @@ jobs:
 
             - Upstream plugin SHA: `${{ steps.meta.outputs.sha }}`
             - Built with [imgk/caddy-trojan](https://github.com/imgk/caddy-trojan)
-            - Verify downloads with `SHA256SUMS`
+            - EasyTrojan scripts are shipped as one versioned bundle
+            - Verify every download with `SHA256SUMS`
           tag_name: ${{ steps.meta.outputs.tag }}
           name: ${{ steps.meta.outputs.tag }}
           draft: false

@@ -44,13 +44,58 @@ EOF
     ok "System optimizations applied (BBR: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 'N/A'))"
 }
 
+write_caddy_unit() {
+    cat > /etc/systemd/system/caddy.service <<EOF
+[Unit]
+# Managed by EasyTrojan
+Description=Caddy
+Documentation=https://caddyserver.com/docs/
+After=network.target network-online.target
+Requires=network-online.target
+
+[Service]
+Type=notify
+User=caddy
+Group=caddy
+Environment=XDG_CONFIG_HOME=/etc XDG_DATA_HOME=/var/lib HOME=/var/lib/caddy
+ExecStart=${CADDY_BIN} run --environ --config ${CADDYFILE}
+ExecReload=${CADDY_BIN} reload --config ${CADDYFILE} --force
+TimeoutStopSec=5s
+LimitNOFILE=1048576
+LimitNPROC=512
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/caddy
+NoNewPrivileges=true
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
 ensure_cert_storage() {
-    # Caddy with XDG_DATA_HOME=/etc stores ACME data under /etc/caddy
-    mkdir -p "${CADDY_DIR}/certificates" "${CADDY_DIR}/acme"
-    chown -R caddy:caddy "$CADDY_DIR"
-    chmod 700 "$CADDY_DIR"
-    # keep parent writable by caddy for renewals
-    find "$CADDY_DIR" -type d -exec chmod 700 {} \; 2>/dev/null || true
+    # Keep runtime/ACME state writable by Caddy, while configuration stays root-owned.
+    local data_dir="${CADDY_DATA_DIR:-/var/lib/caddy}"
+    if [ -d "${CADDY_DIR}/certificates" ] && [ ! -d "${data_dir}/certificates" ]; then
+        mkdir -p "$data_dir"
+        cp -a "${CADDY_DIR}/certificates" "$data_dir/"
+    fi
+    if [ -d "${CADDY_DIR}/acme" ] && [ ! -d "${data_dir}/acme" ]; then
+        mkdir -p "$data_dir"
+        cp -a "${CADDY_DIR}/acme" "$data_dir/"
+    fi
+    mkdir -p "$data_dir/certificates" "$data_dir/acme" "$CADDY_DIR" "$TROJAN_DIR"
+    chown root:caddy "$CADDY_DIR" "$TROJAN_DIR" 2>/dev/null || true
+    chmod 750 "$CADDY_DIR" "$TROJAN_DIR"
+    chown caddy:caddy "$data_dir" "$data_dir/certificates" "$data_dir/acme" 2>/dev/null || true
+    chmod 700 "$data_dir" "$data_dir/certificates" "$data_dir/acme"
+    printf 'managed_by=easytrojan\nversion=1\n' > "${CADDY_DATA_MARKER:-$data_dir/.easytrojan-managed}"
+    chown root:caddy "${CADDY_DATA_MARKER:-$data_dir/.easytrojan-managed}" 2>/dev/null || true
+    chmod 640 "${CADDY_DATA_MARKER:-$data_dir/.easytrojan-managed}"
 }
 
 setup_renew_timer() {
@@ -61,25 +106,20 @@ setup_renew_timer() {
 #!/bin/bash
 set -uo pipefail
 export XDG_CONFIG_HOME=/etc
-export XDG_DATA_HOME=/etc
+export XDG_DATA_HOME=/var/lib
 export HOME=/var/lib/caddy
 
 TLS_MODE_FILE=/etc/caddy/trojan/tls-mode.txt
 TLS_CERT_REC=/etc/caddy/trojan/tls-cert.path
 ORIGIN_CERT=/etc/caddy/certs/origin.crt
 
-mkdir -p /etc/caddy/certificates /etc/caddy/acme /var/lib/caddy
-chown -R caddy:caddy /etc/caddy /var/lib/caddy 2>/dev/null || true
-find /etc/caddy -type d -exec chmod 700 {} \; 2>/dev/null || true
+mkdir -p /var/lib/caddy/certificates /var/lib/caddy/acme
+chown caddy:caddy /var/lib/caddy /var/lib/caddy/certificates /var/lib/caddy/acme 2>/dev/null || true
+chmod 700 /var/lib/caddy /var/lib/caddy/certificates /var/lib/caddy/acme 2>/dev/null || true
 
 mode=auto
 if [ -f "$TLS_MODE_FILE" ]; then
   mode=$(tr -d '[:space:]' < "$TLS_MODE_FILE" | tr '[:upper:]' '[:lower:]')
-fi
-
-if ! systemctl is-active --quiet caddy; then
-  systemctl start caddy || true
-  sleep 2
 fi
 
 if systemctl is-active --quiet caddy; then
@@ -105,7 +145,7 @@ if [ "$mode" = "origin" ]; then
   exit 0
 fi
 
-CERT_FILE=$(find /etc/caddy/certificates -name '*.crt' -type f 2>/dev/null | head -1 || true)
+CERT_FILE=$(find /var/lib/caddy/certificates -name '*.crt' -type f 2>/dev/null | head -1 || true)
 if [ -n "${CERT_FILE}" ] && command -v openssl >/dev/null 2>&1; then
   if ! openssl x509 -checkend $((30 * 86400)) -noout -in "$CERT_FILE" 2>/dev/null; then
     END_RAW=$(openssl x509 -enddate -noout -in "$CERT_FILE" 2>/dev/null | cut -d= -f2 || true)

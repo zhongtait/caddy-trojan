@@ -26,15 +26,19 @@ permissions:
 
 jobs:
   validate:
-    name: scripts + hub (no install)
+    name: scripts + hub (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.8', '3.12', '3.13']
     steps:
       - uses: actions/checkout@v5
 
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
-          python-version: '3.12'
+          python-version: ${{ matrix.python-version }}
 
       - name: Install tools
         run: |

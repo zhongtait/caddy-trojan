@@ -2,34 +2,123 @@
 # EasyTrojan module: manage.sh
 # shellcheck shell=bash
 
+do_doctor() {
+    require_root
+    [ "$#" -eq 0 ] || error "Usage: easytrojan doctor"
+
+    local failures=0 domain mode cert_file key_file
+    doctor_ok() { ok "doctor: $*"; }
+    doctor_fail() { warn "doctor: $*"; failures=$((failures + 1)); }
+
+    if [ -f "$MANAGED_MARKER" ] || { [ -f "$DOMAIN_FILE" ] && [ -f "$PASSWD_FILE" ]; }; then
+        doctor_ok "EasyTrojan management marker/state found"
+    else
+        doctor_fail "managed state not found; install first or inspect /etc/caddy"
+    fi
+
+    domain=$(read_installed_domain 2>/dev/null || true)
+    if [ -n "$domain" ]; then
+        doctor_ok "domain: ${domain}"
+    else
+        doctor_fail "domain record missing"
+    fi
+
+    if [ -x "$CADDY_BIN" ]; then
+        if XDG_CONFIG_HOME=/etc XDG_DATA_HOME=/var/lib HOME=/var/lib/caddy \
+            "$CADDY_BIN" validate --config "$CADDYFILE" --adapter caddyfile >/dev/null 2>&1; then
+            doctor_ok "Caddyfile validates"
+        else
+            doctor_fail "Caddyfile validation failed"
+        fi
+    else
+        doctor_fail "Caddy binary missing: $CADDY_BIN"
+    fi
+
+    if check_cmd systemctl; then
+        if systemctl is-active --quiet caddy 2>/dev/null; then
+            doctor_ok "caddy.service is active"
+        else
+            doctor_fail "caddy.service is not active"
+        fi
+    fi
+
+    mode=$(read_tls_mode)
+    case "$mode" in
+        origin)
+            cert_file=$(read_tls_cert_path)
+            key_file=$(read_tls_key_path)
+            if [ -f "$cert_file" ] && [ -f "$key_file" ]; then
+                doctor_ok "origin certificate and key files exist"
+            else
+                doctor_fail "origin certificate/key missing"
+            fi
+            ;;
+        auto)
+            if [ -d "${CADDY_DATA_DIR}/certificates" ]; then
+                doctor_ok "ACME certificate storage exists"
+            else
+                doctor_fail "ACME certificate storage missing"
+            fi
+            ;;
+        *) doctor_fail "invalid TLS mode: ${mode:-<empty>}" ;;
+    esac
+
+    if hub_enabled; then
+        if check_cmd systemctl && systemctl is-active --quiet "$HUB_UNIT" 2>/dev/null; then
+            doctor_ok "Hub service is active"
+        else
+            doctor_fail "Hub is enabled but service is not active"
+        fi
+        if check_cmd curl && curl -fsS --connect-timeout 2 --max-time 5 "http://${HUB_LISTEN}/health" >/dev/null 2>&1; then
+            doctor_ok "Hub health endpoint responds"
+        else
+            doctor_fail "Hub health endpoint is unavailable"
+        fi
+    else
+        doctor_ok "Hub is disabled"
+    fi
+
+    if [ "$failures" -gt 0 ]; then
+        warn "doctor found ${failures} issue(s)"
+        return 1
+    fi
+    ok "doctor: no blocking issues found"
+}
+
 do_update() {
     require_root
+    if [ -f "$CADDYFILE" ] && [ ! -f "$MANAGED_MARKER" ] \
+        && { [ ! -f "$DOMAIN_FILE" ] || [ ! -f "$PASSWD_FILE" ]; }; then
+        error "Existing non-EasyTrojan Caddy configuration detected; refusing to update it"
+    fi
     install_pkg curl
     install_pkg tar
 
-    # Stage 0: refresh script from GitHub then re-exec so binary update uses latest logic
+    # Stage 0: refresh the complete, checksummed script bundle from the same release.
     if [ "${EASYTROJAN_UPDATE_STAGE:-0}" != "1" ]; then
         info "Updating easytrojan script..."
-        local tmp dest
-        tmp=$(mktemp)
-        if curl -fsSL --connect-timeout 10 --max-time 30 "${REPO_RAW}/easytrojan.sh" -o "$tmp"; then
-            chmod +x "$tmp"
+        local update_stage entry_stage dest bundle sums base_url bundle_root
+        update_stage=$(mktemp -d)
+        bundle="${update_stage}/easytrojan_bundle.tar.gz"
+        sums="${update_stage}/SHA256SUMS"
+        base_url=$(release_asset_base "${release_version:-latest}")
+        if curl -fsSL --connect-timeout 15 --max-time 60 "${base_url}/easytrojan_bundle.tar.gz" -o "$bundle" \
+            && curl -fsSL --connect-timeout 10 --max-time 30 "${base_url}/SHA256SUMS" -o "$sums" \
+            && verify_archive_sha256 "$bundle" "$sums"; then
+            mkdir -p "${update_stage}/unpack"
+            if ! tar -tzf "$bundle" | awk '!/^(easytrojan\.sh|hub_server\.py|lib\/?|lib\/[A-Za-z0-9._-]+)$/ {bad=1} END {exit bad}' \
+                || ! tar -xzf "$bundle" -C "${update_stage}/unpack"; then
+                rm -rf "$update_stage"
+                error "Downloaded EasyTrojan bundle contains unexpected paths"
+            fi
+            entry_stage="${update_stage}/unpack/easytrojan.sh"
+            bundle_root="${update_stage}/unpack"
+            [ -f "$entry_stage" ] || { rm -rf "$update_stage"; error "EasyTrojan bundle is incomplete"; }
+            chmod +x "$entry_stage"
             dest="$SCRIPT_BIN"
             if [ -f "$0" ] && [ -w "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" ] 2>/dev/null; then
                 dest=$(readlink -f "$0" 2>/dev/null || echo "$SCRIPT_BIN")
             fi
-            # Prefer installing to standard paths always
-            cp -f "$tmp" "$SCRIPT_BIN"
-            cp -f "$tmp" "$SCRIPT_LEGACY"
-            chmod 755 "$SCRIPT_BIN" "$SCRIPT_LEGACY"
-            # Also replace source path if it is a real file outside SCRIPT_BIN
-            if [ -n "${dest:-}" ] && [ "$dest" != "$SCRIPT_BIN" ] && [ -f "$dest" ]; then
-                cp -f "$tmp" "$dest" 2>/dev/null || true
-                chmod 755 "$dest" 2>/dev/null || true
-            fi
-            rm -f "$tmp"
-            # Sync lib modules + hub runtime
-            mkdir -p "${LIB_SHARE_DIR:-/usr/local/share/easytrojan/lib}" /usr/local/share/easytrojan
             local _m
             local _mods=("${EASYTROJAN_LIB_MODULES[@]}")
             if [ "${#_mods[@]}" -eq 0 ]; then
@@ -37,21 +126,44 @@ do_update() {
             fi
             local _failed=0
             for _m in "${_mods[@]}"; do
-                if curl -fsSL --connect-timeout 10 --max-time 30 "${REPO_RAW}/lib/${_m}" -o "${LIB_SHARE_DIR}/${_m}"; then
-                    chmod 644 "${LIB_SHARE_DIR}/${_m}"
-                else
-                    warn "Failed to fetch lib/${_m}"
+                if [ ! -f "${bundle_root}/lib/${_m}" ]; then
+                    warn "Bundle is missing lib/${_m}"
                     _failed=$((_failed + 1))
                 fi
             done
-            if curl -fsSL --connect-timeout 10 --max-time 30 "${REPO_RAW}/hub_server.py" -o /usr/local/share/easytrojan/hub_server.py; then
-                chmod 644 /usr/local/share/easytrojan/hub_server.py
-            else
-                warn "Failed to fetch hub_server.py (hub update may lag until next success)"
+            if [ ! -f "${bundle_root}/hub_server.py" ]; then
+                warn "Bundle is missing hub_server.py"
+                _failed=$((_failed + 1))
             fi
             if [ "$_failed" -gt 0 ]; then
-                error "Script entry updated but ${_failed} lib module(s) failed to download from ${REPO_RAW}/lib/. Fix network or push lib/ to main, then re-run: easytrojan update"
+                rm -rf "$update_stage"
+                error "Update staging failed (${_failed} file(s)); installed files were not changed"
             fi
+            bash -n "$entry_stage" || { rm -rf "$update_stage"; error "Downloaded entry script failed syntax validation"; }
+            for _m in "${_mods[@]}"; do
+                bash -n "${bundle_root}/lib/${_m}" || { rm -rf "$update_stage"; error "Downloaded lib/${_m} failed syntax validation"; }
+            done
+            if check_cmd python3; then
+                python3 -c 'import ast,sys; ast.parse(open(sys.argv[1],encoding="utf-8").read())' "${bundle_root}/hub_server.py" \
+                    || { rm -rf "$update_stage"; error "Downloaded hub_server.py failed syntax validation"; }
+            fi
+
+            # Deploy the validated bundle; install the entry last so it never leads older modules.
+            mkdir -p "${LIB_SHARE_DIR:-/usr/local/share/easytrojan/lib}" /usr/local/share/easytrojan
+            for _m in "${_mods[@]}"; do
+                cp -f "${bundle_root}/lib/${_m}" "${LIB_SHARE_DIR}/${_m}"
+                chmod 644 "${LIB_SHARE_DIR}/${_m}"
+            done
+            cp -f "${bundle_root}/hub_server.py" /usr/local/share/easytrojan/hub_server.py
+            chmod 644 /usr/local/share/easytrojan/hub_server.py
+            cp -f "$entry_stage" "$SCRIPT_BIN"
+            cp -f "$entry_stage" "$SCRIPT_LEGACY"
+            chmod 755 "$SCRIPT_BIN" "$SCRIPT_LEGACY"
+            if [ -n "${dest:-}" ] && [ "$dest" != "$SCRIPT_BIN" ] && [ -f "$dest" ]; then
+                cp -f "$entry_stage" "$dest" 2>/dev/null || true
+                chmod 755 "$dest" 2>/dev/null || true
+            fi
+            rm -rf "$update_stage"
             ok "Script updated -> re-executing with new version"
             local reexec_args=(update)
             if [ -n "${release_version:-}" ] && [ "$release_version" != "latest" ]; then
@@ -60,21 +172,29 @@ do_update() {
             export EASYTROJAN_UPDATE_STAGE=1
             exec bash "$SCRIPT_BIN" "${reexec_args[@]}"
         else
-            warn "Script update failed, continuing with current script for Caddy update..."
-            rm -f "$tmp"
+            warn "Versioned EasyTrojan bundle unavailable; continuing with current script for Caddy update..."
+            rm -rf "$update_stage"
         fi
     fi
 
-    local old_version new_version backup=""
+    local old_version new_version old_digest="" new_digest backup="" unit_refresh=0
+    if [ -f "$MANAGED_MARKER" ] || [ -f "$DOMAIN_FILE" ]; then
+        ensure_cert_storage
+        write_caddy_unit
+        systemctl daemon-reload 2>/dev/null || true
+        unit_refresh=1
+    fi
     old_version=$("$CADDY_BIN" version 2>/dev/null | awk '{print $1}' || echo "not-installed")
     info "Current Caddy version: $old_version"
     if [ -x "$CADDY_BIN" ]; then
+        old_digest=$(sha256_file "$CADDY_BIN") || error "Cannot hash installed Caddy binary"
         backup=$(mktemp)
         cp -f "$CADDY_BIN" "$backup"
     fi
 
     download_caddy
     new_version=$("$CADDY_BIN" version 2>/dev/null | awk '{print $1}' || echo "unknown")
+    new_digest=$(sha256_file "$CADDY_BIN") || error "Cannot hash downloaded Caddy binary"
     if ! "$CADDY_BIN" version &>/dev/null; then
         if [ -n "$backup" ] && [ -f "$backup" ]; then
             mv -f "$backup" "$CADDY_BIN"
@@ -83,20 +203,33 @@ do_update() {
         fi
         error "New Caddy binary is invalid"
     fi
-    [ -n "$backup" ] && rm -f "$backup"
-
-    if [ "$old_version" = "$new_version" ]; then
-        ok "Caddy already up to date: $new_version"
+    if [ -n "$old_digest" ] && [ "$old_digest" = "$new_digest" ]; then
+        if [ "$unit_refresh" = "1" ] && systemctl is-active --quiet caddy 2>/dev/null; then
+            info "Restarting Caddy to apply the current hardened service unit..."
+            systemctl restart caddy.service
+            wait_for_admin_api || error "Caddy did not become healthy after service unit refresh"
+        fi
+        ok "Caddy binary already up to date: $new_version"
     else
         if systemctl is-active --quiet caddy 2>/dev/null; then
-            info "Restarting Caddy service..."
-            systemctl restart caddy.service
-            wait_for_admin_api || warn "Caddy API not ready after update"
+            info "Caddy binary changed; restarting service..."
+            if ! systemctl restart caddy.service || ! wait_for_admin_api; then
+                if [ -n "$backup" ] && [ -f "$backup" ]; then
+                    warn "Caddy update failed health check; restoring previous binary..."
+                    cp -f "$backup" "$CADDY_BIN"
+                    chmod 755 "$CADDY_BIN"
+                    systemctl restart caddy.service || true
+                    rm -f "$backup"
+                    error "Caddy update rolled back because the service did not become healthy"
+                fi
+                error "Caddy update failed and no previous binary was available"
+            fi
             assert_admin_local_only || true
             # Users come from Caddyfile `users` + caddy storage; no API re-inject needed.
         fi
-        ok "Caddy updated: $old_version -> $new_version"
+        ok "Caddy updated: $old_version -> $new_version (binary changed)"
     fi
+    [ -n "$backup" ] && rm -f "$backup"
     if [ -x "$CADDY_BIN" ]; then
         setup_renew_timer
     fi
@@ -173,7 +306,7 @@ do_renew() {
 
     if [ "$force_reissue" = "1" ]; then
         warn "Force re-issue: deleting existing certificate material"
-        rm -rf "${CADDY_DIR}/certificates" "${CADDY_DIR}/acme"
+        rm -rf "${CADDY_DATA_DIR}/certificates" "${CADDY_DATA_DIR}/acme"
         ensure_cert_storage
         systemctl restart caddy.service
     else
@@ -182,14 +315,15 @@ do_renew() {
             /usr/local/bin/caddy-cert-maintain || true
         else
             # fallback if helper not installed yet
-            export XDG_CONFIG_HOME=/etc XDG_DATA_HOME=/etc
-            "$CADDY_BIN" reload --config "$CADDYFILE" --force || systemctl restart caddy.service
+            export XDG_CONFIG_HOME=/etc XDG_DATA_HOME=/var/lib
+            XDG_CONFIG_HOME=/etc XDG_DATA_HOME=/var/lib HOME=/var/lib/caddy \
+                "$CADDY_BIN" reload --config "$CADDYFILE" --force || systemctl restart caddy.service
         fi
     fi
 
     info "Waiting for certificate material..."
     local count=0 max_wait=40
-    until find "${CADDY_DIR}/certificates" -name '*.crt' -type f 2>/dev/null | grep -q .; do
+    until find "${CADDY_DATA_DIR}/certificates" -name '*.crt' -type f 2>/dev/null | grep -q .; do
         count=$((count + 1))
         if [ "$count" -gt "$max_wait" ]; then
             error "Certificate check failed. Check: journalctl -u caddy --no-pager -n 50"
@@ -198,7 +332,7 @@ do_renew() {
     done
 
     local cert_file expiry
-    cert_file=$(find "${CADDY_DIR}/certificates" -name '*.crt' -type f 2>/dev/null | head -1 || true)
+    cert_file=$(find "${CADDY_DATA_DIR}/certificates" -name '*.crt' -type f 2>/dev/null | head -1 || true)
     if [ -n "$cert_file" ] && check_cmd openssl; then
         expiry=$(openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | cut -d= -f2 || true)
         ok "Certificate present (expires: ${expiry:-unknown})"
@@ -275,7 +409,7 @@ EOF
             echo -e "  Cert   : ${RED}origin file missing${NC}"
         fi
     else
-        local cert_dir="${CADDY_DIR}/certificates"
+        local cert_dir="${CADDY_DATA_DIR}/certificates"
         if [ -d "$cert_dir" ]; then
             cert_file=$(find "$cert_dir" -name "*.crt" -type f 2>/dev/null | head -1)
             if [ -n "$cert_file" ] && check_cmd openssl; then

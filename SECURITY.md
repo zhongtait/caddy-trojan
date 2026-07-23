@@ -95,9 +95,9 @@ sha256sum -c SHA256SUMS
 
 ## TLS 证书材料
 
-- **auto**：证书与 ACME 账户材料位于 `/etc/caddy/certificates` 与 `/etc/caddy/acme`，属主应为 `caddy`，目录权限宜收紧。
+- **auto**：证书与 ACME 账户材料位于 `/var/lib/caddy/certificates` 与 `/var/lib/caddy/acme`，属主应为 `caddy`，目录权限宜收紧；`/etc/caddy/Caddyfile` 与 Trojan 状态由 `root:caddy` 管理并只读给 Caddy。
 - **origin**：私钥位于 `/etc/caddy/certs/origin.key`（600）。请勿把 Origin 私钥提交到公开仓库或聊天记录。
-- 卸载脚本会删除整个 `/etc/caddy`（含证书与 `trojan/` 状态文件）。
+- 卸载脚本只删除带 EasyTrojan 管理标记的 Caddy 资源；检测不到标记时会保留现有 `/etc/caddy`、Caddy 服务和二进制。
 
 ## 第三方伪装站
 
@@ -120,3 +120,4 @@ sha256sum -c SHA256SUMS
 - 该文件等同于注册凭证；泄露后他人可向你的 Hub 注册或注销节点。
 - 不再使用远端聚合时执行 `easytrojan hub leave` 删除该文件。
 - Hub 运行时需要 `python3 >= 3.8`。
+- Hub 进程使用独立的 `easytrojan-hub` 系统用户；状态文件更新采用原子替换并保留 `.bak`。

@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- security: update scripts from a checksummed Release bundle; detect Caddy plugin changes by binary digest and restart safely.
+- security: validate Caddyfile before atomic activation, isolate Caddy runtime data under `/var/lib/caddy`, and keep configuration root-owned.
+- security: pin and verify the camouflage archive, use stable opaque Hub node IDs, and preserve the previous site/config on failed updates.
 - fix(hub): implement HTTP HEAD so subscription Cache-Control is visible to curl -I / CI.
 - **fix: Caddyfile `order trojan before handle`** so Trojan WebSocket is not swallowed by camouflage SPA `handle` (client got HTTP 200 HTML instead of WS 101). `update` now regenerates Caddyfile.
 - client: share/subscription ALPN back to `h2,http/1.1` (server already enables both).
@@ -100,3 +103,10 @@
 - `/etc/caddy/trojan/passwd.txt` 权限设置为 `600`。
 - `/etc/caddy/trojan` 权限设置为 `700`。
 - 增加 Caddy Admin API 监听地址检查。
+# Unreleased
+
+- fix: keep `sha` as the upstream-change marker while pinning release builds to that commit.
+- fix(hub): serialize node mutations, fail closed on corrupt state, add backups, request limits, field validation, and bounded worker threads.
+- harden(hub): run the Hub as `easytrojan-hub` with a restricted systemd unit.
+- fix: make sysctl tuning opt-in, validate origin certificate/key pairs, and stop the renewal timer from starting Caddy.
+- fix: stage script updates, roll back unhealthy Caddy upgrades, and protect unrelated Caddy installations during install/uninstall.
