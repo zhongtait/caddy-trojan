@@ -60,8 +60,7 @@ sudo ufw allow 443/tcp
 下载入口脚本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zhongtait/caddy-trojan/main/easytrojan.sh -o easytrojan.sh
-chmod +x easytrojan.sh
+curl -fsSL https://raw.githubusercontent.com/zhongtait/caddy-trojan/main/easytrojan.sh -o easytrojan.sh && chmod +x easytrojan.sh
 ```
 
 ### 直连或 Cloudflare 灰云
@@ -125,7 +124,7 @@ sudo IT_TOOLS_VERSION=v2024.10.22-7ca5933 \
 sudo IT_TOOLS_VERSION=v2024.10.22-7ca5933 IT_TOOLS_SHA256='<64位SHA256>' \
   bash easytrojan.sh install --domain example.com
 
-# 显式启用全局 sysctl 和 limits 调优
+# 安装时会在内核支持的情况下自动启用 BBR；以下选项额外启用全局 sysctl 和 limits 调优
 sudo bash easytrojan.sh install --domain example.com --tune-system
 ```
 

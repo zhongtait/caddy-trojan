@@ -92,6 +92,32 @@ if echo "$share_link" | grep -qE 'alpn=h2(%2[Cc]|,)'; then
 fi
 pass "pinned camouflage URL; WebSocket ALPN=http/1.1"
 
+info "BBR install helper"
+bbr_test_file=$(mktemp)
+if ! BBR_SYSCTL_FILE="$bbr_test_file" bash -c '
+  check_cmd() { return 0; }
+  modprobe() { return 0; }
+  sysctl() {
+    case "$*" in
+      "-n net.ipv4.tcp_available_congestion_control") echo "reno cubic bbr" ;;
+      "-n net.ipv4.tcp_congestion_control") echo "bbr" ;;
+      -w\ *) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+  info() { :; }
+  warn() { :; }
+  ok() { :; }
+  . lib/system.sh
+  enable_bbr
+  grep -q "net.ipv4.tcp_congestion_control = bbr" "$BBR_SYSCTL_FILE"
+'; then
+  rm -f "$bbr_test_file"
+  fail "BBR helper did not persist the expected configuration"
+fi
+rm -f "$bbr_test_file"
+pass "BBR helper enables and persists supported kernels"
+
 # ---------- python compile ----------
 info "python3 -m py_compile hub_server.py"
 python3 -m py_compile hub_server.py || fail "py_compile failed"

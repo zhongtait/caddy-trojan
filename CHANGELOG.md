@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- feat(system): enable and persist `fq` + BBR during installation when supported; keep broader sysctl/limits tuning opt-in.
 - security: update scripts from a checksummed Release bundle; detect Caddy plugin changes by binary digest and restart safely.
 - security: validate Caddyfile before atomic activation, isolate Caddy runtime data under `/var/lib/caddy`, and keep configuration root-owned.
 - security: pin the camouflage release, verify SHA256 when published or explicitly configured, validate archive paths, and preserve the previous site on failure.

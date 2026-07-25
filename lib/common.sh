@@ -54,7 +54,8 @@ Notes:
   - --server ADDR: share-link address for Cloudflare preferred IP (SNI/Host still use domain)
   - --port PORT: connect port for share links / subscription (default 443; CF HTTPS ports ok)
   - --tls-mode auto: Caddy ACME (default). origin: Cloudflare Origin / file certs
-  - --tune-system: opt in to global sysctl and security limit tuning
+  - BBR is enabled automatically when supported by the host kernel
+  - --tune-system: opt in to additional global sysctl and security limit tuning
   - Reinstall without --tls-mode keeps previous TLS mode; origin reuses /etc/caddy/certs if present
   - Trojan WebSocket client ALPN must be http/1.1 only (do not add h2)
   - Camouflage site defaults to CorentinTh/it-tools (override: IT_TOOLS_VERSION=..., IT_TOOLS_SHA256=...)

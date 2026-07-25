@@ -109,10 +109,16 @@ elif [ "$managed_caddy" != "1" ]; then
     warn "No EasyTrojan Caddy marker found; preserving Caddy service, binary, account, and /etc/caddy"
 fi
 
-if [ -f /etc/sysctl.d/99-caddy-trojan.conf ]; then
-    rm -f /etc/sysctl.d/99-caddy-trojan.conf
+sysctl_removed=0
+for sysctl_file in /etc/sysctl.d/99-caddy-trojan.conf /etc/sysctl.d/99-easytrojan-bbr.conf; do
+    if [ -f "$sysctl_file" ]; then
+        rm -f "$sysctl_file"
+        sysctl_removed=1
+    fi
+done
+if [ "$sysctl_removed" = "1" ]; then
     sysctl --system &>/dev/null || true
-    ok "Sysctl optimizations removed"
+    ok "EasyTrojan sysctl configuration removed"
 fi
 
 if [ -f /etc/security/limits.d/caddy-trojan.conf ]; then

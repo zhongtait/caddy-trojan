@@ -23,6 +23,7 @@
 - `/etc/systemd/system/caddy.service`
 - `/etc/systemd/system/caddy-renew.service`
 - `/etc/systemd/system/caddy-renew.timer`
+- `/etc/sysctl.d/99-easytrojan-bbr.conf`
 - `/etc/sysctl.d/99-caddy-trojan.conf`
 - `/etc/security/limits.d/caddy-trojan.conf`
 

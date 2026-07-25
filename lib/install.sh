@@ -52,6 +52,7 @@ do_install() {
     fi
 
     warn "Ensure cloud security group / firewall allows inbound TCP 80 and 443 from the public Internet (ACME needs 80)."
+    enable_bbr
 
     local cert_backup="" previous_domain=""
     previous_domain=$(read_installed_domain 2>/dev/null || true)
