@@ -121,6 +121,10 @@ sudo bash easytrojan.sh install \
 sudo IT_TOOLS_VERSION=v2024.10.22-7ca5933 \
   bash easytrojan.sh install --domain example.com
 
+# 可选：为不发布 digest 的旧版 IT-Tools 显式指定 SHA256
+sudo IT_TOOLS_VERSION=v2024.10.22-7ca5933 IT_TOOLS_SHA256='<64位SHA256>' \
+  bash easytrojan.sh install --domain example.com
+
 # 显式启用全局 sysctl 和 limits 调优
 sudo bash easytrojan.sh install --domain example.com --tune-system
 ```
@@ -297,7 +301,7 @@ Hub 相关数据：
 | 地址 | 部署域名，或 Cloudflare 优选 IP |
 | 端口 | 443，或 Cloudflare 支持的 HTTPS 端口 |
 | TLS | 开启 |
-| ALPN | `h2,http/1.1` |
+| ALPN | `http/1.1`（仅此一项） |
 | 传输 | WebSocket |
 | SNI / Host | 部署域名 |
 | Path | `/` |
@@ -324,8 +328,8 @@ Cloudflare Origin 证书只用于 Cloudflare 到源站的连接，浏览器不�
 4. 端口是 Cloudflare 支持的 HTTPS 端口。
 5. `sudo easytrojan doctor` 和 `systemctl is-active caddy` 无异常。
 
-部分客户端在橙云下进行延迟测试时，可能无法正确协商 ALPN。可在客户端临时将
-ALPN 改为仅 `http/1.1` 排查。
+WebSocket Upgrade 使用 HTTP/1.1。分享链接和 Hub 订阅默认只设置
+`alpn=http/1.1`；不要添加或优先设置 `h2`，否则延迟测试和连接可能间歇失败。
 
 ### 客户端连上后返回伪装站 HTML
 

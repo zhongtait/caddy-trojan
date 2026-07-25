@@ -167,6 +167,14 @@ _easytrojan_fetch_bundle_file() {
     cp -f "${stage}/unpack/${name}" "$dest"
 }
 
+_easytrojan_copy_if_different() {
+    local src="$1" dest="$2"
+    if [ -e "$dest" ] && [ "$src" -ef "$dest" ]; then
+        return 0
+    fi
+    cp -f "$src" "$dest"
+}
+
 # Source one module: prefer EASYTROJAN_ROOT/lib, then SHARE_DIR/lib, else download to SHARE_DIR
 easytrojan_source() {
     local name="$1" path=""
@@ -204,8 +212,8 @@ install_self() {
     if [ ! -f "$src" ]; then
         return 0
     fi
-    cp -f "$src" "$SCRIPT_BIN"
-    cp -f "$src" "$SCRIPT_LEGACY"
+    _easytrojan_copy_if_different "$src" "$SCRIPT_BIN"
+    _easytrojan_copy_if_different "$src" "$SCRIPT_LEGACY"
     chmod 755 "$SCRIPT_BIN" "$SCRIPT_LEGACY"
 
     src_dir=$(dirname "$src")

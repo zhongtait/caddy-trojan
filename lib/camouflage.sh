@@ -10,6 +10,18 @@ camouflage_fallback_or_keep() {
     fi
 }
 
+it_tools_direct_asset_url() {
+    local version="$1" tag
+    [ "$version" != "latest" ] || return 1
+    case "$version" in
+        v*) tag="$version" ;;
+        *) tag="v${version}" ;;
+    esac
+    printf '%s' "$tag" | grep -Eq '^v[A-Za-z0-9][A-Za-z0-9._-]*$' || return 1
+    printf 'https://github.com/%s/releases/download/%s/it-tools-%s.zip' \
+        "$IT_TOOLS_REPO" "$tag" "${tag#v}"
+}
+
 write_camouflage_site() {
     mkdir -p "$WWW_DIR"
     if ! check_cmd unzip; then
@@ -24,8 +36,8 @@ write_camouflage_site() {
     check_cmd curl || install_pkg curl
 
     local version="${IT_TOOLS_VERSION:-latest}"
-    local api_url asset_url="" asset_digest="" asset_meta="" tmp_dir zip_path tag name extract_root
-    local staged_site old_site expected_digest actual_digest
+    local api_url asset_url="" asset_digest="" asset_meta="" tmp_dir zip_path tag extract_root
+    local staged_site old_site expected_digest actual_digest configured_digest download_ok=0 attempt
     tmp_dir=$(mktemp -d)
     trap 'rm -rf "$tmp_dir"' RETURN
 
@@ -75,18 +87,41 @@ except Exception:
         tag=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("tag_name",""))' "${tmp_dir}/release.json" 2>/dev/null || true)
     fi
 
-    if [ -z "$asset_url" ] || ! printf '%s' "$asset_digest" | grep -Eq '^sha256:[0-9a-fA-F]{64}$'; then
-        warn "IT-Tools release URL or SHA256 digest unavailable"
+    if [ -z "$asset_url" ] && [ "$version" != "latest" ]; then
+        asset_url=$(it_tools_direct_asset_url "$version" || true)
+        if [ -n "$asset_url" ]; then
+            warn "GitHub API asset metadata unavailable; using pinned release URL (${tag})"
+        fi
+    fi
+    if [ -z "$asset_url" ]; then
+        warn "IT-Tools release URL unavailable"
         camouflage_fallback_or_keep
         trap - RETURN
         rm -rf "$tmp_dir"
         return 0
     fi
 
+    configured_digest=${IT_TOOLS_SHA256:-}
+    configured_digest=${configured_digest#sha256:}
+    if [ -n "$configured_digest" ]; then
+        if ! printf '%s' "$configured_digest" | grep -Eq '^[0-9a-fA-F]{64}$'; then
+            error "IT_TOOLS_SHA256 must be a 64-character SHA256 digest"
+        fi
+        asset_digest="sha256:${configured_digest}"
+    fi
+
     zip_path="${tmp_dir}/it-tools.zip"
-    if ! curl -fsSL --connect-timeout 15 --max-time 300 -L \
-        -H "User-Agent: easytrojan" \
-        "$asset_url" -o "$zip_path"; then
+    for attempt in 1 2 3; do
+        if curl -fsSL --connect-timeout 15 --max-time 300 -L \
+            -H "User-Agent: easytrojan" \
+            "$asset_url" -o "$zip_path"; then
+            download_ok=1
+            break
+        fi
+        warn "IT-Tools download attempt ${attempt}/3 failed"
+        [ "$attempt" -eq 3 ] || sleep $((attempt * 2))
+    done
+    if [ "$download_ok" != "1" ]; then
         warn "Failed to download IT-Tools zip; using built-in fallback tools page"
         camouflage_fallback_or_keep
         trap - RETURN
@@ -94,14 +129,19 @@ except Exception:
         return 0
     fi
 
-    expected_digest=${asset_digest#sha256:}
-    actual_digest=$(sha256_file "$zip_path") || error "No SHA256 tool available for IT-Tools verification"
-    if [ "$actual_digest" != "$expected_digest" ]; then
-        warn "IT-Tools SHA256 mismatch; refusing the downloaded archive"
-        camouflage_fallback_or_keep
-        trap - RETURN
-        rm -rf "$tmp_dir"
-        return 0
+    if printf '%s' "$asset_digest" | grep -Eq '^sha256:[0-9a-fA-F]{64}$'; then
+        expected_digest=$(printf '%s' "${asset_digest#sha256:}" | tr '[:upper:]' '[:lower:]')
+        actual_digest=$(sha256_file "$zip_path") || error "No SHA256 tool available for IT-Tools verification"
+        if [ "$actual_digest" != "$expected_digest" ]; then
+            warn "IT-Tools SHA256 mismatch; refusing the downloaded archive"
+            camouflage_fallback_or_keep
+            trap - RETURN
+            rm -rf "$tmp_dir"
+            return 0
+        fi
+        ok "IT-Tools SHA256 verified"
+    else
+        warn "This pinned IT-Tools release does not publish SHA256 metadata; validating archive paths only"
     fi
     if ! unzip -Z1 "$zip_path" > "${tmp_dir}/entries.txt" 2>/dev/null \
         || awk '/(^\/)|(^|\/)\.\.($|\/)|\\/ {bad=1} END {exit bad}' "${tmp_dir}/entries.txt"; then

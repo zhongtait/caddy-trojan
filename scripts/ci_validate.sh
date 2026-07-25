@@ -31,7 +31,10 @@ pass "shell syntax (easytrojan.sh, uninstall.sh, ${#mods[@]} modules)"
 
 # ---------- module list consistency ----------
 info "EASYTROJAN_LIB_MODULES vs lib/"
-mapfile -t declared < <(
+declared=()
+while IFS= read -r module; do
+  declared+=("$module")
+done < <(
   awk '
     /^EASYTROJAN_LIB_MODULES=\(/ {inarr=1; next}
     inarr && /^\)/ {exit}
@@ -59,7 +62,7 @@ pass "modules: ${declared[*]}"
 # ---------- LF only ----------
 info "LF line endings"
 has_cr() { LC_ALL=C grep -q $'\r' "$1"; }
-for f in easytrojan.sh uninstall.sh hub_server.py lib/*.sh scripts/ci_validate.sh; do
+for f in easytrojan.sh uninstall.sh hub_server.py lib/*.sh scripts/ci_validate.sh tests/test_*.py; do
   [ -f "$f" ] || continue
   if has_cr "$f"; then
     fail "CR/CRLF found in $f (must be LF)"
@@ -74,10 +77,30 @@ echo "$help_out" | grep -qiE 'install|EasyTrojan|Usage' || fail "help output une
 echo "$help_out" | grep -qi 'hub' || fail "help missing hub command"
 pass "modules load; --help works"
 
+# ---------- deterministic client/link helpers ----------
+info "camouflage fallback URL + WebSocket ALPN"
+asset_url=$(IT_TOOLS_REPO=CorentinTh/it-tools bash -c \
+  '. lib/camouflage.sh; it_tools_direct_asset_url v2024.10.22-7ca5933')
+[ "$asset_url" = "https://github.com/CorentinTh/it-tools/releases/download/v2024.10.22-7ca5933/it-tools-2024.10.22-7ca5933.zip" ] \
+  || fail "unexpected pinned IT-Tools URL: $asset_url"
+share_link=$(bash -c \
+  'error() { exit 1; }; . lib/common.sh; build_share_link example.com secret-pass ws')
+echo "$share_link" | grep -qE 'alpn=http(%2[Ff]|/)1\.1' \
+  || fail "WebSocket share link missing alpn=http/1.1: $share_link"
+if echo "$share_link" | grep -qE 'alpn=h2(%2[Cc]|,)'; then
+  fail "WebSocket share link must not advertise h2 first: $share_link"
+fi
+pass "pinned camouflage URL; WebSocket ALPN=http/1.1"
+
 # ---------- python compile ----------
 info "python3 -m py_compile hub_server.py"
 python3 -m py_compile hub_server.py || fail "py_compile failed"
 pass "hub_server.py compiles"
+
+# ---------- python unit tests (no sockets) ----------
+info "python3 -m unittest"
+python3 -m unittest discover -s tests -v || fail "python unit tests failed"
+pass "python unit tests"
 
 # ---------- hub smoke (temp dir, ephemeral port, no caddy) ----------
 info "hub_server smoke (no caddy / no node install)"
@@ -121,6 +144,12 @@ code=$(curl -s -o "${HUB_TMP}/bad.json" -w "%{http_code}" \
 [ "$code" = "401" ] || fail "expected 401 for bad register token, got ${code}"
 pass "register rejects bad token"
 
+code=$(curl -s -o /dev/null -w "%{http_code}" \
+  -X POST -H "Content-Type: application/json" -H "X-Hub-Token: wrong-token-length-xx" \
+  -d '{broken' "http://127.0.0.1:${PORT}/api/register" || true)
+[ "$code" = "401" ] || fail "expected auth before JSON parsing, got ${code}"
+pass "register authenticates before reading body"
+
 resp=$(curl -sf -X POST -H "Content-Type: application/json" -H "X-Hub-Token: ${REG_TOKEN}" \
   -d '{"name":"n1","domain":"hk.example.com","password":"secret-pass","server":"hk.example.com","port":443,"transport":"ws"}' \
   "http://127.0.0.1:${PORT}/api/register")
@@ -140,7 +169,10 @@ sub=$(curl -sf "http://127.0.0.1:${PORT}/sub/${SUB_TOKEN}")
 decoded=$(printf '%s' "$sub" | python3 -c 'import sys,base64; print(base64.b64decode(sys.stdin.read()).decode())')
 echo "$decoded" | grep -q 'trojan://' || fail "subscription missing trojan:// : $decoded"
 echo "$decoded" | grep -q 'hk.example.com' || fail "subscription missing domain: $decoded"
-echo "$decoded" | grep -qE 'alpn=h2(%2[Cc]|,)http(%2[Ff]|/)1\.1' || fail "subscription missing alpn=h2,http/1.1: $decoded"
+echo "$decoded" | grep -qE 'alpn=http(%2[Ff]|/)1\.1' || fail "subscription missing alpn=http/1.1: $decoded"
+if echo "$decoded" | grep -qE 'alpn=h2(%2[Cc]|,)'; then
+  fail "WebSocket subscription must not advertise h2 first: $decoded"
+fi
 pass "subscription base64 -> trojan link"
 
 sub2=$(curl -sf "http://127.0.0.1:${PORT}/sub/${SUB_TOKEN}?server=1.2.3.4&port=2053")
@@ -200,6 +232,32 @@ node_count=$(curl -sf -H "X-Hub-Token: ${REG_TOKEN}" "http://127.0.0.1:${PORT}/a
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["count"])')
 [ "$node_count" = "25" ] || fail "concurrent registration lost nodes: expected 25, got ${node_count}"
 pass "concurrent registration keeps all nodes"
+
+# ---------- semantic state validation ----------
+cp "${HUB_TMP}/nodes.json" "${HUB_TMP}/nodes.valid.json"
+python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["nodes"][0]["password"]=42; json.dump(d,open(p,"w"))' \
+  "${HUB_TMP}/nodes.json"
+code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${PORT}/sub/${SUB_TOKEN}" || true)
+[ "$code" = "503" ] || fail "expected 503 for invalid node field, got ${code}"
+pass "invalid node fields fail closed"
+cp "${HUB_TMP}/nodes.valid.json" "${HUB_TMP}/nodes.json"
+
+cp "${HUB_TMP}/config.json" "${HUB_TMP}/config.valid.json"
+python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["register_token"]=42; json.dump(d,open(p,"w"))' \
+  "${HUB_TMP}/config.json"
+code=$(curl -s -o /dev/null -w "%{http_code}" -H "X-Hub-Token: ${REG_TOKEN}" \
+  "http://127.0.0.1:${PORT}/api/nodes" || true)
+[ "$code" = "503" ] || fail "expected 503 for invalid config field, got ${code}"
+pass "invalid config fields fail closed"
+cp "${HUB_TMP}/config.valid.json" "${HUB_TMP}/config.json"
+
+python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["register_token"]=""; json.dump(d,open(p,"w"))' \
+  "${HUB_TMP}/config.json"
+code=$(curl -s -o /dev/null -w "%{http_code}" -H "X-Hub-Token: ${REG_TOKEN}" \
+  "http://127.0.0.1:${PORT}/api/nodes" || true)
+[ "$code" = "503" ] || fail "expected 503 for empty persisted token, got ${code}"
+pass "empty persisted tokens are not silently rotated"
+cp "${HUB_TMP}/config.valid.json" "${HUB_TMP}/config.json"
 
 # ---------- corrupt state must fail closed ----------
 printf '{broken\n' > "${HUB_TMP}/nodes.json"

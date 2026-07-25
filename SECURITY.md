@@ -101,7 +101,7 @@ sha256sum -c SHA256SUMS
 
 ## 第三方伪装站
 
-默认伪装站使用 [CorentinTh/it-tools](https://github.com/CorentinTh/it-tools) 的 release 静态资源（GPL-3.0）。安装时会从 GitHub 下载 zip 并解压到 `/etc/caddy/www`。请遵守其许可证与上游安全公告。
+默认伪装站使用 [CorentinTh/it-tools](https://github.com/CorentinTh/it-tools) 的固定 release 静态资源（GPL-3.0）。安装时会从 GitHub 下载 zip，检查归档路径后原子替换 `/etc/caddy/www`。GitHub 提供 asset digest 时脚本会校验 SHA256；旧 release 未提供 digest 时，可通过 `IT_TOOLS_SHA256` 显式固定校验值。请遵守其许可证与上游安全公告。
 
 ## 节点聚合 Hub
 
