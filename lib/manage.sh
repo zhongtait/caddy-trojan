@@ -94,23 +94,23 @@ do_update() {
     install_pkg curl
     install_pkg tar
 
-    # Stage 0: refresh the complete, checksummed script bundle from the same release.
+    # Stage 0: refresh a coherent script snapshot before updating Caddy.
     if [ "${EASYTROJAN_UPDATE_STAGE:-0}" != "1" ]; then
         info "Updating easytrojan script..."
-        local update_stage entry_stage dest bundle sums base_url bundle_root
+        local update_stage entry_stage dest base_url bundle_root script_source_ready=0
         update_stage=$(mktemp -d)
-        bundle="${update_stage}/easytrojan_bundle.tar.gz"
-        sums="${update_stage}/SHA256SUMS"
         base_url=$(release_asset_base "${release_version:-latest}")
-        if curl -fsSL --connect-timeout 15 --max-time 60 "${base_url}/easytrojan_bundle.tar.gz" -o "$bundle" \
-            && curl -fsSL --connect-timeout 10 --max-time 30 "${base_url}/SHA256SUMS" -o "$sums" \
-            && verify_archive_sha256 "$bundle" "$sums"; then
-            mkdir -p "${update_stage}/unpack"
-            if ! tar -tzf "$bundle" | awk '!/^(easytrojan\.sh|hub_server\.py|lib\/?|lib\/[A-Za-z0-9._-]+)$/ {bad=1} END {exit bad}' \
-                || ! tar -xzf "$bundle" -C "${update_stage}/unpack"; then
-                rm -rf "$update_stage"
-                error "Downloaded EasyTrojan bundle contains unexpected paths"
+        if declare -F _easytrojan_fetch_repository_snapshot >/dev/null \
+            && _easytrojan_fetch_repository_snapshot "$update_stage"; then
+            script_source_ready=1
+        else
+            warn "Current repository snapshot unavailable; trying the selected Release bundle"
+            if declare -F _easytrojan_fetch_release_snapshot >/dev/null \
+                && _easytrojan_fetch_release_snapshot "$update_stage" "$base_url"; then
+                script_source_ready=1
             fi
+        fi
+        if [ "$script_source_ready" = "1" ]; then
             entry_stage="${update_stage}/unpack/easytrojan.sh"
             bundle_root="${update_stage}/unpack"
             [ -f "$entry_stage" ] || { rm -rf "$update_stage"; error "EasyTrojan bundle is incomplete"; }
@@ -172,7 +172,7 @@ do_update() {
             export EASYTROJAN_UPDATE_STAGE=1
             exec bash "$SCRIPT_BIN" "${reexec_args[@]}"
         else
-            warn "Versioned EasyTrojan bundle unavailable; continuing with current script for Caddy update..."
+            warn "EasyTrojan script snapshot unavailable; continuing with current script for Caddy update..."
             rm -rf "$update_stage"
         fi
     fi

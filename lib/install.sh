@@ -51,7 +51,7 @@ do_install() {
         info "Domain verified: $site_domain -> $address_ip"
     fi
 
-    warn "Ensure cloud security group / firewall allows inbound TCP 80 and 443 from the public Internet (ACME needs 80)."
+    info "Ensure cloud security group / firewall allows inbound TCP 80 and 443 from the public Internet (ACME needs 80)."
     enable_bbr
 
     local cert_backup="" previous_domain=""

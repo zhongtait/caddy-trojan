@@ -2,8 +2,10 @@
 
 ## [Unreleased]
 
+- fix(bootstrap): make standalone installs and updates load one current repository snapshot instead of stale installed/Release modules, so camouflage fallback and WebSocket ALPN fixes take effect.
+- fix(ui): report expected firewall and pinned-asset integrity notices as informational messages; reserve warnings for actual failures.
 - feat(system): enable and persist `fq` + BBR during installation when supported; keep broader sysctl/limits tuning opt-in.
-- security: update scripts from a checksummed Release bundle; detect Caddy plugin changes by binary digest and restart safely.
+- security: update scripts from a pinned repository snapshot with checksummed Release fallback; detect Caddy plugin changes by binary digest and restart safely.
 - security: validate Caddyfile before atomic activation, isolate Caddy runtime data under `/var/lib/caddy`, and keep configuration root-owned.
 - security: pin the camouflage release, verify SHA256 when published or explicitly configured, validate archive paths, and preserve the previous site on failure.
 - fix(camouflage): retry downloads and use the pinned release asset URL when old GitHub releases do not expose asset digest metadata.

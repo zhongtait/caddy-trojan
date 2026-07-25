@@ -134,8 +134,9 @@ sudo bash easytrojan.sh install --domain example.com --tune-system
 sudo bash easytrojan.sh 'password' example.com
 ```
 
-仅下载入口脚本时，脚本会获取并校验最新 Release 的完整模块包；从仓库运行时，
-优先使用本地 `lib/`。
+仅下载入口脚本时，脚本会优先获取当前 `main` 提交的完整模块快照，并覆盖机器上
+可能残留的旧模块；仓库快照不可用时才回退到校验过的 Release 模块包。从完整仓库
+运行时优先使用同目录的 `lib/`。
 
 ## 管理命令
 
@@ -389,9 +390,7 @@ ACME 材料并重新申请。未指定 TLS 模式时会保留当前设置。
 卸载：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zhongtait/caddy-trojan/main/uninstall.sh -o uninstall.sh
-chmod +x uninstall.sh
-sudo bash uninstall.sh
+curl -fsSL https://raw.githubusercontent.com/zhongtait/caddy-trojan/main/uninstall.sh -o uninstall.sh && chmod +x uninstall.sh && sudo bash uninstall.sh
 ```
 
 非交互卸载使用 `sudo bash uninstall.sh -y`。卸载脚本只删除带 EasyTrojan

@@ -28,7 +28,7 @@ REPO_API="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}"
 CADDY_BIN="/usr/local/bin/caddy"
 SCRIPT_BIN="/usr/local/bin/easytrojan"
 SCRIPT_LEGACY="/usr/local/bin/easytrojan.sh"
-SHARE_DIR="/usr/local/share/easytrojan"
+SHARE_DIR="${EASYTROJAN_SHARE_DIR:-/usr/local/share/easytrojan}"
 LIB_SHARE_DIR="${SHARE_DIR}/lib"
 CADDY_DIR="/etc/caddy"
 CADDY_XDG_DATA_HOME="/var/lib"
@@ -98,8 +98,10 @@ _easytrojan_root_from_script() {
         printf '%s' "$dir"
         return 0
     fi
-    # installed entry under /usr/local/bin -> modules in SHARE_DIR
-    if [ -d "${LIB_SHARE_DIR}" ]; then
+    # Only installed entries may reuse installed modules. A newly downloaded
+    # entry must refresh the complete module set instead of mixing versions.
+    if { [ "$src" = "$SCRIPT_BIN" ] || [ "$src" = "$SCRIPT_LEGACY" ]; } \
+        && [ -d "${LIB_SHARE_DIR}" ]; then
         printf '%s' "$SHARE_DIR"
         return 0
     fi
@@ -107,6 +109,69 @@ _easytrojan_root_from_script() {
 }
 
 EASYTROJAN_ROOT="${EASYTROJAN_ROOT:-$(_easytrojan_root_from_script)}"
+
+_easytrojan_is_installed_entry() {
+    local src
+    src=$(_easytrojan_script_path)
+    [ "$src" = "$SCRIPT_BIN" ] || [ "$src" = "$SCRIPT_LEGACY" ]
+}
+
+_easytrojan_fetch_repository_snapshot() {
+    local stage="$1" repo_meta="${stage}/repo.json" archive="${stage}/repository.tar.gz"
+    local repo_ref="" archive_ref="refs/heads/main" source_label="main branch"
+
+    mkdir -p "$stage"
+    if curl -fsSL --connect-timeout 10 --max-time 30 \
+        -H "Accept: application/vnd.github+json" \
+        -H "User-Agent: easytrojan" \
+        "${REPO_API}/commits/main" -o "$repo_meta" 2>/dev/null; then
+        repo_ref=$(sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-fA-F]\{40\}\)".*/\1/p' "$repo_meta" | head -1)
+        if printf '%s' "$repo_ref" | grep -Eq '^[0-9a-fA-F]{40}$'; then
+            archive_ref="$repo_ref"
+            source_label="repository commit ${repo_ref:0:7}"
+        fi
+    fi
+
+    if ! curl -fsSL --connect-timeout 15 --max-time 120 \
+        "https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/${archive_ref}.tar.gz" -o "$archive"; then
+        return 1
+    fi
+    tar -tzf "$archive" | awk '/^\// || /(^|\/)\.\.($|\/)/ {bad=1} END {exit bad}' || return 1
+    rm -rf "${stage}/unpack"
+    mkdir -p "${stage}/unpack"
+    tar -xzf "$archive" --strip-components=1 --no-same-owner --no-same-permissions \
+        -C "${stage}/unpack" || return 1
+    [ -f "${stage}/unpack/easytrojan.sh" ] || return 1
+    [ -f "${stage}/unpack/lib/common.sh" ] || return 1
+    info "Loading EasyTrojan modules from ${source_label}"
+}
+
+_easytrojan_fetch_release_snapshot() {
+    local stage="$1" base_url="${2:-https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/latest/download}"
+    local bundle="${stage}/easytrojan_bundle.tar.gz" sums="${stage}/SHA256SUMS"
+    local expected actual
+
+    mkdir -p "$stage"
+    if ! curl -fsSL --connect-timeout 15 --max-time 60 \
+        "${base_url}/easytrojan_bundle.tar.gz" -o "$bundle" 2>/dev/null \
+        || ! curl -fsSL --connect-timeout 10 --max-time 30 \
+            "${base_url}/SHA256SUMS" -o "$sums" 2>/dev/null; then
+        return 1
+    fi
+    expected=$(awk '$2 == "easytrojan_bundle.tar.gz" {print $1; exit}' "$sums")
+    [ -n "$expected" ] || return 1
+    if check_cmd sha256sum; then actual=$(sha256sum "$bundle" | awk '{print $1}')
+    elif check_cmd shasum; then actual=$(shasum -a 256 "$bundle" | awk '{print $1}')
+    elif check_cmd openssl; then actual=$(openssl dgst -sha256 "$bundle" | awk '{print $NF}')
+    else return 1
+    fi
+    [ "$actual" = "$expected" ] || return 1
+    tar -tzf "$bundle" | awk '!/^(easytrojan\.sh|hub_server\.py|lib\/?|lib\/[A-Za-z0-9._-]+)$/ {bad=1} END {exit bad}' || return 1
+    rm -rf "${stage}/unpack"
+    mkdir -p "${stage}/unpack"
+    tar -xzf "$bundle" -C "${stage}/unpack" || return 1
+    info "Loading EasyTrojan modules from the checksummed Release bundle"
+}
 
 _easytrojan_fetch_module() {
     local name="$1" dest="$2"
@@ -116,39 +181,9 @@ _easytrojan_fetch_module() {
         stage=$(mktemp -d)
         EASYTROJAN_BOOTSTRAP_STAGE="$stage"
         export EASYTROJAN_BOOTSTRAP_STAGE
-        local bundle="${stage}/easytrojan_bundle.tar.gz" sums="${stage}/SHA256SUMS"
-        local expected actual base_url repo_ref="" repo_meta="${stage}/repo.json"
-        base_url="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/latest/download"
-        mkdir -p "${stage}/unpack"
-        if curl -fsSL --connect-timeout 15 --max-time 60 \
-            "${base_url}/easytrojan_bundle.tar.gz" -o "$bundle" 2>/dev/null \
-            && curl -fsSL --connect-timeout 10 --max-time 30 \
-                "${base_url}/SHA256SUMS" -o "$sums" 2>/dev/null; then
-            expected=$(awk '$2 == "easytrojan_bundle.tar.gz" {print $1; exit}' "$sums")
-            [ -n "$expected" ] || return 1
-            if check_cmd sha256sum; then actual=$(sha256sum "$bundle" | awk '{print $1}')
-            elif check_cmd shasum; then actual=$(shasum -a 256 "$bundle" | awk '{print $1}')
-            elif check_cmd openssl; then actual=$(openssl dgst -sha256 "$bundle" | awk '{print $NF}')
-            else return 1
-            fi
-            [ "$actual" = "$expected" ] || return 1
-            tar -tzf "$bundle" | awk '!/^(easytrojan\.sh|hub_server\.py|lib\/?|lib\/[A-Za-z0-9._-]+)$/ {bad=1} END {exit bad}' || return 1
-            tar -xzf "$bundle" -C "${stage}/unpack" || return 1
-        else
-            rm -f "$bundle" "$sums"
-            curl -fsSL --connect-timeout 10 --max-time 30 \
-                -H "Accept: application/vnd.github+json" \
-                -H "User-Agent: easytrojan" \
-                "${REPO_API}/commits/main" -o "$repo_meta" || return 1
-            repo_ref=$(sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-fA-F]\{40\}\)".*/\1/p' "$repo_meta" | head -1)
-            printf '%s' "$repo_ref" | grep -Eq '^[0-9a-fA-F]{40}$' || return 1
-            info "Latest Release has no script bundle; using repository commit ${repo_ref:0:7}"
-            bundle="${stage}/repository.tar.gz"
-            curl -fsSL --connect-timeout 15 --max-time 120 \
-                "https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/${repo_ref}.tar.gz" -o "$bundle" || return 1
-            tar -tzf "$bundle" | awk '/^\// || /(^|\/)\.\.($|\/)/ {bad=1} END {exit bad}' || return 1
-            tar -xzf "$bundle" --strip-components=1 --no-same-owner --no-same-permissions \
-                -C "${stage}/unpack" || return 1
+        if ! _easytrojan_fetch_repository_snapshot "$stage"; then
+            warn "Current repository snapshot unavailable; trying the latest Release bundle"
+            _easytrojan_fetch_release_snapshot "$stage" || return 1
         fi
     fi
     [ -f "${stage}/unpack/lib/${name}" ] || return 1
@@ -175,24 +210,21 @@ _easytrojan_copy_if_different() {
     cp -f "$src" "$dest"
 }
 
-# Source one module: prefer EASYTROJAN_ROOT/lib, then SHARE_DIR/lib, else download to SHARE_DIR
+# Repository checkouts use sibling modules. Installed entries use SHARE_DIR.
+# Any other standalone entry refreshes every module from one coherent snapshot.
 easytrojan_source() {
     local name="$1" path=""
     if [ -f "${EASYTROJAN_ROOT}/lib/${name}" ]; then
         path="${EASYTROJAN_ROOT}/lib/${name}"
-    elif [ -f "${LIB_SHARE_DIR}/${name}" ]; then
+    elif _easytrojan_is_installed_entry && [ -f "${LIB_SHARE_DIR}/${name}" ]; then
         path="${LIB_SHARE_DIR}/${name}"
     else
         mkdir -p "$LIB_SHARE_DIR"
         if _easytrojan_fetch_module "$name" "${LIB_SHARE_DIR}/${name}"; then
             chmod 644 "${LIB_SHARE_DIR}/${name}"
             path="${LIB_SHARE_DIR}/${name}"
-            # keep root pointing at share for subsequent modules
-            if [ ! -d "${EASYTROJAN_ROOT}/lib" ]; then
-                EASYTROJAN_ROOT="$SHARE_DIR"
-            fi
         else
-            error "Missing module lib/${name}. Place the complete repo beside easytrojan.sh or ensure the latest Release bundle is available"
+            error "Missing module lib/${name}. Place the complete repo beside easytrojan.sh or ensure the repository/Release snapshot is reachable"
         fi
     fi
     # shellcheck disable=SC1090
@@ -209,6 +241,10 @@ easytrojan_load_all() {
 install_self() {
     local src src_dir m
     src=$(_easytrojan_script_path)
+    if [ -n "${EASYTROJAN_BOOTSTRAP_STAGE:-}" ] \
+        && [ -f "${EASYTROJAN_BOOTSTRAP_STAGE}/unpack/easytrojan.sh" ]; then
+        src="${EASYTROJAN_BOOTSTRAP_STAGE}/unpack/easytrojan.sh"
+    fi
     if [ ! -f "$src" ]; then
         return 0
     fi
@@ -239,6 +275,9 @@ install_self() {
     if [ -f "${src_dir}/hub_server.py" ]; then
         cp -f "${src_dir}/hub_server.py" "${SHARE_DIR}/hub_server.py"
         chmod 644 "${SHARE_DIR}/hub_server.py"
+    elif [ -n "${EASYTROJAN_BOOTSTRAP_STAGE:-}" ]; then
+        _easytrojan_fetch_bundle_file hub_server.py "${SHARE_DIR}/hub_server.py" 2>/dev/null || true
+        [ -f "${SHARE_DIR}/hub_server.py" ] && chmod 644 "${SHARE_DIR}/hub_server.py"
     elif [ ! -f "${SHARE_DIR}/hub_server.py" ]; then
         _easytrojan_fetch_bundle_file hub_server.py "${SHARE_DIR}/hub_server.py" 2>/dev/null || true
         [ -f "${SHARE_DIR}/hub_server.py" ] && chmod 644 "${SHARE_DIR}/hub_server.py"

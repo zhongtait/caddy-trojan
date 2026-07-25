@@ -77,6 +77,54 @@ echo "$help_out" | grep -qiE 'install|EasyTrojan|Usage' || fail "help output une
 echo "$help_out" | grep -qi 'hub' || fail "help missing hub command"
 pass "modules load; --help works"
 
+# ---------- standalone entry must replace stale installed modules ----------
+info "standalone entry refreshes stale installed modules"
+bootstrap_tmp=$(mktemp -d)
+mock_sha=1111111111111111111111111111111111111111
+mkdir -p "${bootstrap_tmp}/entry" "${bootstrap_tmp}/share/lib" \
+  "${bootstrap_tmp}/snapshot/caddy-trojan-main/lib" "${bootstrap_tmp}/bin"
+cp easytrojan.sh "${bootstrap_tmp}/entry/easytrojan.sh"
+cp easytrojan.sh hub_server.py "${bootstrap_tmp}/snapshot/caddy-trojan-main/"
+cp lib/*.sh "${bootstrap_tmp}/snapshot/caddy-trojan-main/lib/"
+tar -czf "${bootstrap_tmp}/main.tar.gz" -C "${bootstrap_tmp}/snapshot" caddy-trojan-main
+for m in "${declared[@]}"; do
+  printf '%s\n' 'return 97' > "${bootstrap_tmp}/share/lib/${m}"
+done
+cat > "${bootstrap_tmp}/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+url="" output=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) output="${2:-}"; shift 2 ;;
+    http://*|https://*) url="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+[ -n "$output" ] || exit 90
+case "$url" in
+  */commits/main) printf '{\n  "sha": "%s"\n}\n' "$MOCK_REPO_SHA" > "$output" ;;
+  */archive/"${MOCK_REPO_SHA}".tar.gz) cp "$MOCK_MAIN_ARCHIVE" "$output" ;;
+  */releases/*) exit 91 ;;
+  *) exit 92 ;;
+esac
+EOF
+chmod +x "${bootstrap_tmp}/bin/curl"
+if ! PATH="${bootstrap_tmp}/bin:${PATH}" \
+  MOCK_REPO_SHA="$mock_sha" MOCK_MAIN_ARCHIVE="${bootstrap_tmp}/main.tar.gz" \
+  EASYTROJAN_SHARE_DIR="${bootstrap_tmp}/share" \
+  bash "${bootstrap_tmp}/entry/easytrojan.sh" --help >/dev/null 2>&1; then
+  rm -rf "$bootstrap_tmp"
+  fail "standalone entry did not prefer the current repository snapshot"
+fi
+if ! cmp -s lib/common.sh "${bootstrap_tmp}/share/lib/common.sh" \
+  || ! cmp -s lib/install.sh "${bootstrap_tmp}/share/lib/install.sh"; then
+  rm -rf "$bootstrap_tmp"
+  fail "standalone entry did not refresh the complete module set"
+fi
+rm -rf "$bootstrap_tmp"
+pass "standalone entry refreshes one coherent module snapshot"
+
 # ---------- deterministic client/link helpers ----------
 info "camouflage fallback URL + WebSocket ALPN"
 asset_url=$(IT_TOOLS_REPO=CorentinTh/it-tools bash -c \

@@ -90,7 +90,7 @@ except Exception:
     if [ -z "$asset_url" ] && [ "$version" != "latest" ]; then
         asset_url=$(it_tools_direct_asset_url "$version" || true)
         if [ -n "$asset_url" ]; then
-            warn "GitHub API asset metadata unavailable; using pinned release URL (${tag})"
+            info "GitHub API asset metadata unavailable; using pinned release URL (${tag})"
         fi
     fi
     if [ -z "$asset_url" ]; then
@@ -141,7 +141,7 @@ except Exception:
         fi
         ok "IT-Tools SHA256 verified"
     else
-        warn "This pinned IT-Tools release does not publish SHA256 metadata; validating archive paths only"
+        info "This pinned IT-Tools release does not publish SHA256 metadata; validating archive paths only"
     fi
     if ! unzip -Z1 "$zip_path" > "${tmp_dir}/entries.txt" 2>/dev/null \
         || awk '/(^\/)|(^|\/)\.\.($|\/)|\\/ {bad=1} END {exit bad}' "${tmp_dir}/entries.txt"; then

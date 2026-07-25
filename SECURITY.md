@@ -104,6 +104,8 @@ sha256sum -c SHA256SUMS
 
 默认伪装站使用 [CorentinTh/it-tools](https://github.com/CorentinTh/it-tools) 的固定 release 静态资源（GPL-3.0）。安装时会从 GitHub 下载 zip，检查归档路径后原子替换 `/etc/caddy/www`。GitHub 提供 asset digest 时脚本会校验 SHA256；旧 release 未提供 digest 时，可通过 `IT_TOOLS_SHA256` 显式固定校验值。请遵守其许可证与上游安全公告。
 
+仅下载 `easytrojan.sh` 入口时，脚本通过 GitHub API 解析当前 `main` 提交并下载不可变提交快照，避免入口脚本与旧 Release/本机残留模块混用。API 元数据不可用时会尝试 `main` 分支快照，仓库快照不可用时才回退到带 SHA256 校验的 Release 包。
+
 ## 节点聚合 Hub
 
 启用 `easytrojan hub enable` 后：
