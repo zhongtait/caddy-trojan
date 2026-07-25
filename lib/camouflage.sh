@@ -22,6 +22,11 @@ it_tools_direct_asset_url() {
         "$IT_TOOLS_REPO" "$tag" "${tag#v}"
 }
 
+zip_entries_are_safe() {
+    local entries_file="$1"
+    awk '/(^\/)|(^|\/)\.\.($|\/)|\\|^[A-Za-z]:/ {bad=1} END {exit bad}' "$entries_file"
+}
+
 write_camouflage_site() {
     mkdir -p "$WWW_DIR"
     if ! check_cmd unzip; then
@@ -103,6 +108,10 @@ except Exception:
 
     configured_digest=${IT_TOOLS_SHA256:-}
     configured_digest=${configured_digest#sha256:}
+    if [ -z "$configured_digest" ] \
+        && [ "$version" = "${IT_TOOLS_PINNED_VERSION:-}" ]; then
+        configured_digest="${IT_TOOLS_PINNED_SHA256:-}"
+    fi
     if [ -n "$configured_digest" ]; then
         if ! printf '%s' "$configured_digest" | grep -Eq '^[0-9a-fA-F]{64}$'; then
             error "IT_TOOLS_SHA256 must be a 64-character SHA256 digest"
@@ -144,7 +153,7 @@ except Exception:
         info "This pinned IT-Tools release does not publish SHA256 metadata; validating archive paths only"
     fi
     if ! unzip -Z1 "$zip_path" > "${tmp_dir}/entries.txt" 2>/dev/null \
-        || awk '/(^\/)|(^|\/)\.\.($|\/)|\\/ {bad=1} END {exit bad}' "${tmp_dir}/entries.txt"; then
+        || ! zip_entries_are_safe "${tmp_dir}/entries.txt"; then
         warn "IT-Tools archive contains unsafe paths"
         camouflage_fallback_or_keep
         trap - RETURN

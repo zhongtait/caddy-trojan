@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- fix(camouflage): correct the inverted ZIP path-safety condition and pin the default IT-Tools archive SHA256.
 - fix(bootstrap): make standalone installs and updates load one current repository snapshot instead of stale installed/Release modules, so camouflage fallback and WebSocket ALPN fixes take effect.
 - fix(ui): report expected firewall and pinned-asset integrity notices as informational messages; reserve warnings for actual failures.
 - feat(system): enable and persist `fq` + BBR during installation when supported; keep broader sysctl/limits tuning opt-in.

@@ -131,6 +131,19 @@ asset_url=$(IT_TOOLS_REPO=CorentinTh/it-tools bash -c \
   '. lib/camouflage.sh; it_tools_direct_asset_url v2024.10.22-7ca5933')
 [ "$asset_url" = "https://github.com/CorentinTh/it-tools/releases/download/v2024.10.22-7ca5933/it-tools-2024.10.22-7ca5933.zip" ] \
   || fail "unexpected pinned IT-Tools URL: $asset_url"
+safe_entries=$(mktemp)
+unsafe_entries=$(mktemp)
+printf '%s\n' 'index.html' 'assets/app.js' 'nested/path/file.css' > "$safe_entries"
+printf '%s\n' 'index.html' '../escape.txt' > "$unsafe_entries"
+if ! bash -c '. lib/camouflage.sh; zip_entries_are_safe "$1"' _ "$safe_entries"; then
+  rm -f "$safe_entries" "$unsafe_entries"
+  fail "safe camouflage archive entries were rejected"
+fi
+if bash -c '. lib/camouflage.sh; zip_entries_are_safe "$1"' _ "$unsafe_entries"; then
+  rm -f "$safe_entries" "$unsafe_entries"
+  fail "unsafe camouflage archive entry was accepted"
+fi
+rm -f "$safe_entries" "$unsafe_entries"
 share_link=$(bash -c \
   'error() { exit 1; }; . lib/common.sh; build_share_link example.com secret-pass ws')
 echo "$share_link" | grep -qE 'alpn=http(%2[Ff]|/)1\.1' \
@@ -138,7 +151,7 @@ echo "$share_link" | grep -qE 'alpn=http(%2[Ff]|/)1\.1' \
 if echo "$share_link" | grep -qE 'alpn=h2(%2[Cc]|,)'; then
   fail "WebSocket share link must not advertise h2 first: $share_link"
 fi
-pass "pinned camouflage URL; WebSocket ALPN=http/1.1"
+pass "pinned camouflage URL and archive paths; WebSocket ALPN=http/1.1"
 
 info "BBR install helper"
 bbr_test_file=$(mktemp)
