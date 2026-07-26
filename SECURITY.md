@@ -37,7 +37,7 @@ openssl rand -base64 24
 
 不建议通过命令行参数传入密码，因为密码可能会被 shell history 或进程列表记录。
 
-`easytrojan status` 默认不输出分享链接；需要时使用 `easytrojan status --show-link`。用户列表只显示脱敏密码。
+`easytrojan status` 默认不输出分享链接；需要时使用 `easytrojan status --show-link`。用户列表只显示脱敏密码（长度 ≤ 8 的短密码整体隐藏）。
 
 推荐使用交互式安装方式：
 
@@ -56,6 +56,8 @@ Trojan 密码会保存在：
 同一批密码也会以 `users "..."` 形式写入 `/etc/caddy/Caddyfile`（imgk/caddy-trojan 官方配置方式）。该文件权限同样为 `600`，属主 `caddy:caddy`。请勿把 Caddyfile 提交到公开仓库或分享给他人。
 
 使用 `caddy` upstream 时，用户密钥还会落在 Caddy 本地 storage（前缀 `trojan/`）。`easytrojan user del` 会同时更新 passwd.txt、Caddyfile，并调用 Admin API 删除 storage 中的键。
+
+节点与 Hub 之间的注册、注销、删除，以及删除 Caddy storage 用户等 API 调用，密码和令牌都通过 `0600` 临时文件传给 `curl`，不会作为命令行参数出现在进程列表（`ps auxww`）中。
 
 ## 端口安全
 
@@ -115,6 +117,8 @@ sha256sum -c SHA256SUMS
 - `register_token` 可注册/删除节点，**不要分享或写入公开仓库**。
 - 订阅 URL 中的 `sub_token` 可拉取全部节点密码的 base64 订阅，**按密码同等保管**。
 - `nodes.json` 含明文密码，目录权限应保持 `700`，文件 `600`。
+- Hub 状态由 `hub_server.py --init` 统一初始化（原子写、损坏即 fail-closed）；`config.json`、`nodes.json` 原子替换并保留 `.bak`。
+- Hub 对内部状态错误只返回通用信息 `hub state unavailable`（HTTP 503），不向未认证请求泄漏服务器文件路径；认证失败会记录到日志。
 - 不需要聚合时请 `easytrojan hub disable` 或卸载。
 
 ### Hub membership 文件

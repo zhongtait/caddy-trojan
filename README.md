@@ -16,7 +16,8 @@
 - 可选多节点 Hub，输出 base64 格式的 `trojan://` 订阅
 - Release 资源通过 `SHA256SUMS` 校验
 - Caddy Admin API 仅监听 `127.0.0.1:2019`
-- 全局 sysctl 和 limits 调优默认关闭，可按需启用
+- 默认启用 BBR 及安全的代理网络调优（提升长连接速度、降低每连接内存）；更激进的全局 sysctl/limits 调优可用 `--tune-system` 开启
+- 小内存 VPS 自动为 Caddy 设置软内存上限（`GOMEMLIMIT ≈ 75% 内存`）作为 OOM 兜底
 
 ## 开始之前
 
@@ -308,6 +309,23 @@ Hub 相关数据：
 | SNI / Host | 部署域名 |
 | Path | `/` |
 
+## 性能与资源
+
+节点默认已做好基础调优，通常无需额外配置：
+
+- **BBR + 网络调优（默认开启）**：内核支持时，安装与 `update` 会启用 BBR 拥塞控制，
+  并附带 `tcp_slow_start_after_idle=0`（长连接空闲后立即恢复满速）与
+  `tcp_notsent_lowat=16384`（降低每连接发送缓冲内存与写延迟）。写入
+  `/etc/sysctl.d/99-easytrojan-bbr.conf`。
+- **软内存上限（小内存 VPS）**：Caddy 服务按约 75% 物理内存设置 `GOMEMLIMIT` 作为
+  OOM 兜底。正常单客户负载不会触发；异常或内存泄漏时由 Go GC 更积极回收，避免小内存
+  机器被 OOM 杀掉。内存无法探测或过小时自动跳过。
+- **更激进的吞吐调优（可选）**：`--tune-system` 额外启用更大的 socket 缓冲、连接队列等
+  全局 sysctl 与 limits，适合高延迟 / 跨区域链路，但会增加内存占用；写入
+  `/etc/sysctl.d/99-caddy-trojan.conf` 与 `/etc/security/limits.d/caddy-trojan.conf`。
+
+以上调优均可逆，卸载脚本会移除对应文件。
+
 ## 常见问题
 
 ### 安装时报域名校验失败
@@ -407,8 +425,9 @@ curl -fsSL https://raw.githubusercontent.com/zhongtait/caddy-trojan/main/uninsta
 bash scripts/ci_validate.sh
 ```
 
-该脚本检查 Bash 语法、模块清单、LF 换行、命令加载、Python 编译和 Hub API
-基本行为。
+该脚本检查 Bash 语法、`shellcheck` 静态检查（warning 级）、模块清单、LF 换行、
+命令加载、Python 编译和 Hub API 基本行为。本机安装了 `shellcheck` 时会一并运行，
+未安装则自动跳过（CI 中一定运行）。
 
 ## 项目结构
 
@@ -419,6 +438,7 @@ bash scripts/ci_validate.sh
 | `hub_server.py` | 可选的节点聚合 Hub |
 | `uninstall.sh` | 卸载脚本 |
 | `scripts/ci_validate.sh` | 本地与 CI 校验入口 |
+| `.shellcheckrc` | shellcheck 规则配置 |
 | `sha` | 上游 commit 标记，用于检测插件变化并固定构建 |
 | `SECURITY.md` | 安全边界与报告策略 |
 | `CHANGELOG.md` | 版本变更记录 |

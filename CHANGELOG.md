@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+### Added
+
+- feat(system): 默认随 BBR 一并应用并持久化 `tcp_slow_start_after_idle=0` 与 `tcp_notsent_lowat=16384`（长连接恢复满速、降低每连接内存）；安装与 `update` 均生效。
+- feat(system): 为 Caddy 服务设置软内存上限 `GOMEMLIMIT`（约 75% 内存）作为小内存 VPS 的 OOM 兜底；内存无法探测或过小时跳过。
+- ci: 将 `shellcheck`（warning 级）接入 `scripts/ci_validate.sh` 与 GitHub Actions，新增 `.shellcheckrc`。
+- test(hub): 单元测试自 7 增至 12（节点缓存与拷贝隔离、落盘失败、`build_link` tcp/IPv6、`delete_by_credentials`、订阅体等）。
+
+### Changed
+
+- perf(hub): 按文件标识（mtime/size/inode）缓存已校验的节点与默认订阅体，重复 `/sub` 拉取不再重复解析和校验；`/sub` 走 HTTP/1.1 keep-alive（写操作强制关闭连接）。
+- refactor: 抽取 `detect_share_transport`、`hub_json_field`、`hub_register_payload`、`hub_indexed_name`、`hub_unregister_password`、`validate_port`、`http_send_json` 等公共函数并去重多处逻辑。
+
+### Security
+
+- security(hub): 所有注册/注销/删除及 Admin API 删除用户改用 `http_send_json`，密码与令牌经 `0600` 临时文件传递，不再出现在进程参数（`ps auxww`）中。
+- security(hub): 内部状态错误统一返回通用 `hub state unavailable`（503），不向未认证请求泄漏服务器文件路径；认证失败写审计日志、访问日志保持安静。
+- security(hub): 用 `hub_server.py --init` 统一初始化 Hub 状态（原子写、损坏即 fail-closed），移除会轮换 token 且非原子写的内嵌实现；`hub token` 失败提示不再打印真实 `register_token`；密码脱敏对长度 ≤ 8 全掩。
+
+### Fixed
+
+- fix(hub): `_save_json` 的磁盘/权限错误转为 `DataStoreError`（干净 503）而非断连；负 `Content-Length` 返回 400（原 413）。
+- fix: `--port` 非数字即报错（避免注入非法 JSON）；安装证书回滚分支在 `set -e` 下不再中途退出；`uninstall.sh` 接受 `yes`。
+
+<!-- 以下为更早累积的未发布记录 -->
+
 - fix(camouflage): correct the inverted ZIP path-safety condition and pin the default IT-Tools archive SHA256.
 - fix(bootstrap): make standalone installs and updates load one current repository snapshot instead of stale installed/Release modules, so camouflage fallback and WebSocket ALPN fixes take effect.
 - fix(ui): report expected firewall and pinned-asset integrity notices as informational messages; reserve warnings for actual failures.
