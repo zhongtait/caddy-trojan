@@ -54,7 +54,8 @@ Notes:
   - --server ADDR: share-link address for Cloudflare preferred IP (SNI/Host still use domain)
   - --port PORT: connect port for share links / subscription (default 443; CF HTTPS ports ok)
   - --tls-mode auto: Caddy ACME (default). origin: Cloudflare Origin / file certs
-  - BBR is enabled automatically when supported by the host kernel
+  - BBR + safe proxy network tuning (tcp_slow_start_after_idle, tcp_notsent_lowat)
+    are enabled automatically when supported by the host kernel
   - --tune-system: opt in to additional global sysctl and security limit tuning
   - Reinstall without --tls-mode keeps previous TLS mode; origin reuses /etc/caddy/certs if present
   - Trojan WebSocket client ALPN must be http/1.1 only (do not add h2)
@@ -85,6 +86,48 @@ is_ipv4() {
     # shellcheck disable=SC2086
     set -- $ip
     [ "$1" -le 255 ] && [ "$2" -le 255 ] && [ "$3" -le 255 ] && [ "$4" -le 255 ]
+}
+
+# Send an HTTP request with curl while keeping secrets out of argv (ps auxww).
+# The hub token (if any) is written to a 0600 --config file; a JSON body (if any)
+# is written to a 0600 --data-binary file. Non-secret flags/URL pass through.
+#
+#   http_send_json <METHOD> <URL> <TOKEN> <PAYLOAD> [extra curl flags...]
+#
+# TOKEN or PAYLOAD may be "" to omit. Echoes curl stdout; returns curl's status.
+http_send_json() {
+    local method="$1" url="$2" token="$3" payload="$4"
+    shift 4
+    local cfg="" body="" rc
+    local -a args=(-X "$method")
+    if [ -n "$token" ] || [ -n "$payload" ]; then
+        cfg=$(mktemp) || return 1
+        chmod 600 "$cfg" 2>/dev/null || true
+        : > "$cfg"
+        [ -n "$payload" ] && printf 'header = "Content-Type: application/json"\n' >> "$cfg"
+        [ -n "$token" ] && printf 'header = "X-Hub-Token: %s"\n' "$token" >> "$cfg"
+        args+=(--config "$cfg")
+    fi
+    if [ -n "$payload" ]; then
+        body=$(mktemp) || { rm -f "$cfg"; return 1; }
+        chmod 600 "$body" 2>/dev/null || true
+        printf '%s' "$payload" > "$body"
+        args+=(--data-binary "@${body}")
+    fi
+    curl "$@" "${args[@]}" "$url"
+    rc=$?
+    [ -n "$cfg" ] && rm -f "$cfg"
+    [ -n "$body" ] && rm -f "$body"
+    return "$rc"
+}
+
+# Validate a user-supplied TCP port (1-65535); error out with a clear message.
+# Ports flow unquoted into JSON payloads, so reject non-numeric input early.
+validate_port() {
+    local p="$1" label="${2:---port}"
+    if ! [[ "$p" =~ ^[0-9]+$ ]] || [ "$p" -lt 1 ] || [ "$p" -gt 65535 ]; then
+        error "${label} must be a number between 1 and 65535 (got: ${p})"
+    fi
 }
 
 urlencode() {
@@ -169,6 +212,9 @@ prompt_password() {
     fi
 }
 
+# Assigns the shared entry-point globals consumed by install/manage modules
+# (those cross-module reads are invisible to per-file static analysis).
+# shellcheck disable=SC2034
 parse_common_args() {
     while [ "$#" -gt 0 ]; do
         case "$1" in

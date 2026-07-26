@@ -29,6 +29,17 @@ for f in "${mods[@]}"; do
 done
 pass "shell syntax (easytrojan.sh, uninstall.sh, ${#mods[@]} modules)"
 
+# ---------- shellcheck static analysis (warning severity) ----------
+if command -v shellcheck >/dev/null 2>&1; then
+  info "shellcheck --severity=warning"
+  shellcheck --severity=warning --shell=bash \
+    easytrojan.sh uninstall.sh scripts/ci_validate.sh lib/*.sh \
+    || fail "shellcheck reported warning-level issues"
+  pass "shellcheck clean (warning severity)"
+else
+  info "shellcheck not installed; skipping static analysis (CI installs it)"
+fi
+
 # ---------- module list consistency ----------
 info "EASYTROJAN_LIB_MODULES vs lib/"
 declared=()
@@ -171,18 +182,42 @@ if ! BBR_SYSCTL_FILE="$bbr_test_file" bash -c '
   ok() { :; }
   . lib/system.sh
   enable_bbr
-  grep -q "net.ipv4.tcp_congestion_control = bbr" "$BBR_SYSCTL_FILE"
+  grep -q "net.ipv4.tcp_congestion_control = bbr" "$BBR_SYSCTL_FILE" \
+    && grep -q "net.ipv4.tcp_slow_start_after_idle = 0" "$BBR_SYSCTL_FILE" \
+    && grep -q "net.ipv4.tcp_notsent_lowat = 16384" "$BBR_SYSCTL_FILE"
 '; then
   rm -f "$bbr_test_file"
   fail "BBR helper did not persist the expected configuration"
 fi
 rm -f "$bbr_test_file"
-pass "BBR helper enables and persists supported kernels"
+pass "BBR helper enables BBR + proxy network tuning and persists them"
+
+# ---------- GOMEMLIMIT derivation (OOM guard for small VPS) ----------
+info "GOMEMLIMIT derivation (~75% RAM)"
+gml_1g=$(bash -c '. lib/system.sh; derive_gomemlimit_mib 1048576')
+[ "$gml_1g" = "768" ] || fail "expected 768 MiB for 1 GiB RAM, got '${gml_1g}'"
+gml_zero=$(bash -c '. lib/system.sh; derive_gomemlimit_mib 0')
+[ -z "$gml_zero" ] || fail "expected empty GOMEMLIMIT for undetectable RAM, got '${gml_zero}'"
+gml_tiny=$(bash -c '. lib/system.sh; derive_gomemlimit_mib 65536')
+[ -z "$gml_tiny" ] || fail "expected empty GOMEMLIMIT for tiny RAM, got '${gml_tiny}'"
+pass "GOMEMLIMIT derivation: ~75% RAM, skips undetectable/tiny hosts"
 
 # ---------- python compile ----------
 info "python3 -m py_compile hub_server.py"
 python3 -m py_compile hub_server.py || fail "py_compile failed"
 pass "hub_server.py compiles"
+
+# ---------- --init is the single source of truth for hub state ----------
+info "hub_server.py --init creates config + nodes"
+INIT_TMP=$(mktemp -d)
+EASYTROJAN_HUB_DIR="$INIT_TMP" EASYTROJAN_HUB_LISTEN="127.0.0.1:2099" \
+  python3 hub_server.py --init >/dev/null || { rm -rf "$INIT_TMP"; fail "--init failed"; }
+{ [ -f "${INIT_TMP}/config.json" ] && [ -f "${INIT_TMP}/nodes.json" ]; } \
+  || { rm -rf "$INIT_TMP"; fail "--init did not create state files"; }
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d.get("register_token") and d.get("sub_token")' \
+  "${INIT_TMP}/config.json" || { rm -rf "$INIT_TMP"; fail "--init config missing tokens"; }
+rm -rf "$INIT_TMP"
+pass "hub_server.py --init initializes state"
 
 # ---------- python unit tests (no sockets) ----------
 info "python3 -m unittest"
@@ -320,6 +355,18 @@ node_count=$(curl -sf -H "X-Hub-Token: ${REG_TOKEN}" "http://127.0.0.1:${PORT}/a
 [ "$node_count" = "25" ] || fail "concurrent registration lost nodes: expected 25, got ${node_count}"
 pass "concurrent registration keeps all nodes"
 
+# ---------- http_send_json: secret-safe curl helper (no token/body in argv) ----------
+info "http_send_json keeps token + body out of argv"
+hs_get=$(bash -c '. lib/common.sh; http_send_json GET "http://127.0.0.1:'"${PORT}"'/api/nodes" "'"${REG_TOKEN}"'" "" -sf') \
+  || fail "http_send_json GET failed"
+echo "$hs_get" | python3 -c 'import json,sys; assert "count" in json.load(sys.stdin)' \
+  || fail "http_send_json GET returned unexpected body"
+hs_code=$(bash -c '. lib/common.sh; http_send_json GET "http://127.0.0.1:'"${PORT}"'/api/nodes" "wrong-token-xxxxxxxx" "" -s -o /dev/null -w "%{http_code}"')
+[ "$hs_code" = "401" ] || fail "http_send_json bad token expected 401, got ${hs_code}"
+hs_reg=$(bash -c '. lib/common.sh; http_send_json POST "http://127.0.0.1:'"${PORT}"'/api/register" "'"${REG_TOKEN}"'" "{\"domain\":\"hs.example.com\",\"password\":\"secret-pass-hs\"}" -sf')
+echo "$hs_reg" | grep -qE '"ok"[[:space:]]*:[[:space:]]*true' || fail "http_send_json POST register failed: ${hs_reg}"
+pass "http_send_json sends token header + JSON body correctly"
+
 # ---------- semantic state validation ----------
 cp "${HUB_TMP}/nodes.json" "${HUB_TMP}/nodes.valid.json"
 python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["nodes"][0]["password"]=42; json.dump(d,open(p,"w"))' \
@@ -346,11 +393,15 @@ code=$(curl -s -o /dev/null -w "%{http_code}" -H "X-Hub-Token: ${REG_TOKEN}" \
 pass "empty persisted tokens are not silently rotated"
 cp "${HUB_TMP}/config.valid.json" "${HUB_TMP}/config.json"
 
-# ---------- corrupt state must fail closed ----------
+# ---------- corrupt state must fail closed without leaking paths ----------
 printf '{broken\n' > "${HUB_TMP}/nodes.json"
-code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${PORT}/health" || true)
+code=$(curl -s -o "${HUB_TMP}/err.json" -w "%{http_code}" "http://127.0.0.1:${PORT}/health" || true)
 [ "$code" = "503" ] || fail "expected 503 for corrupt node state, got ${code}"
-pass "corrupt node state fails closed"
+grep -q 'hub state unavailable' "${HUB_TMP}/err.json" || fail "503 body should be generic: $(cat "${HUB_TMP}/err.json")"
+if grep -q "$HUB_TMP" "${HUB_TMP}/err.json"; then
+  fail "503 body leaked a server file path: $(cat "${HUB_TMP}/err.json")"
+fi
+pass "corrupt node state fails closed with a generic message"
 
 info "all checks passed (no node install)"
 pass "ci_validate done"

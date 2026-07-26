@@ -24,6 +24,7 @@ import json
 import os
 import re
 import secrets
+import sys
 import threading
 import time
 import urllib.parse
@@ -36,6 +37,14 @@ NODES_FILE = HUB_DIR / "nodes.json"
 CFG_FILE = HUB_DIR / "config.json"
 LISTEN = os.environ.get("EASYTROJAN_HUB_LISTEN", "127.0.0.1:2099")
 LOCK = threading.RLock()
+# Cache the parsed+validated node list and the rendered default subscription body,
+# keyed on the nodes file identity (mtime/size/inode). Repeated subscription pulls
+# then skip a full JSON parse, per-node regex validation, and base64 render while
+# nodes.json is unchanged. All access happens under LOCK.
+_nodes_cache_key: tuple | None = None
+_nodes_cache: list[dict] | None = None
+_sub_cache_key: tuple | None = None
+_sub_cache_body: bytes | None = None
 MAX_BODY_BYTES = 64 * 1024
 MAX_NODES = 10_000
 MAX_NAME_LENGTH = 128
@@ -74,31 +83,55 @@ def _load_json(path: Path, default: Any) -> Any:
 
 
 def _save_json(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-        f.flush()
-        os.fsync(f.fileno())
-    if path.is_file():
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        if path.is_file():
+            try:
+                backup = path.with_suffix(path.suffix + ".bak")
+                with path.open("rb") as src, backup.open("wb") as dst:
+                    dst.write(src.read())
+                    dst.flush()
+                    os.fsync(dst.fileno())
+                os.chmod(backup, 0o600)
+            except OSError:
+                pass
+        os.replace(tmp, path)
+    except OSError as exc:
+        # Turn disk/permission failures into a clean 503 instead of an uncaught
+        # exception that drops the connection with no HTTP response.
         try:
-            backup = path.with_suffix(path.suffix + ".bak")
-            with path.open("rb") as src, backup.open("wb") as dst:
-                dst.write(src.read())
-                dst.flush()
-                os.fsync(dst.fileno())
-            os.chmod(backup, 0o600)
+            tmp.unlink()
         except OSError:
             pass
-    os.replace(tmp, path)
+        raise DataStoreError(f"cannot persist hub state: {path}") from exc
     try:
         os.chmod(path, 0o600)
     except OSError:
         pass
 
 
+def _nodes_stat_key() -> tuple | None:
+    """Identity of the nodes file for cache validation; None if it is missing."""
+    try:
+        st = NODES_FILE.stat()
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size, st.st_ino)
+
+
 def _load_nodes_unlocked() -> list[dict]:
+    global _nodes_cache_key, _nodes_cache
+    key = _nodes_stat_key()
+    if key is not None and key == _nodes_cache_key and _nodes_cache is not None:
+        # Hand out an independent copy so callers that mutate in place
+        # (rename/upsert) never touch cached state.
+        return [dict(n) for n in _nodes_cache]
     data = _load_json(NODES_FILE, {"nodes": []})
     if not isinstance(data, dict) or not isinstance(data.get("nodes"), list):
         raise DataStoreError(f"invalid node state: {NODES_FILE}")
@@ -110,10 +143,13 @@ def _load_nodes_unlocked() -> list[dict]:
             _validate_node(node)
         except ValueError as exc:
             raise DataStoreError(f"invalid node entry {index}: {NODES_FILE}") from exc
-    return nodes
+    _nodes_cache = [dict(n) for n in nodes]
+    _nodes_cache_key = key
+    return [dict(n) for n in nodes]
 
 
 def _save_nodes_unlocked(nodes: list[dict]) -> None:
+    global _nodes_cache_key, _nodes_cache
     if len(nodes) > MAX_NODES:
         raise DataStoreError(f"too many nodes: {len(nodes)}")
     for index, node in enumerate(nodes):
@@ -122,6 +158,10 @@ def _save_nodes_unlocked(nodes: list[dict]) -> None:
         except ValueError as exc:
             raise DataStoreError(f"invalid node entry {index}") from exc
     _save_json(NODES_FILE, {"nodes": nodes, "updated_at": _now()})
+    # Refresh the cache from the just-written state (os.replace gives a new inode,
+    # so reads after this see a fresh key and the next read is a cache hit).
+    _nodes_cache = [dict(n) for n in nodes]
+    _nodes_cache_key = _nodes_stat_key()
 
 
 def ensure_config() -> dict:
@@ -142,10 +182,11 @@ def ensure_config() -> dict:
         _validate_config(cfg)
         if changed:
             _save_json(CFG_FILE, cfg)
+        # Only guarantee the nodes file exists here; every request that actually
+        # reads nodes validates them via load_nodes(), so re-validating the whole
+        # set on each ensure_config() call (twice per /sub hit) is wasted work.
         if not NODES_FILE.is_file():
             _save_nodes_unlocked([])
-        else:
-            _load_nodes_unlocked()
         return cfg
 
 
@@ -410,9 +451,9 @@ def build_link(node: dict, server: str | None = None, port: int | None = None) -
     return f"trojan://{user}@{authority_addr}:{p}?security=tls&sni={qe(sni)}&alpn={qe(alpn)}&type=tcp#{frag}"
 
 
-def subscription_body(server: str | None = None, port: int | None = None) -> bytes:
+def _encode_subscription(nodes: list[dict], server: str | None, port: int | None) -> bytes:
     links = []
-    for n in load_nodes():
+    for n in nodes:
         link = build_link(n, server=server, port=port)
         if link:
             links.append(link)
@@ -420,14 +461,48 @@ def subscription_body(server: str | None = None, port: int | None = None) -> byt
     return base64.b64encode(text.encode("utf-8"))
 
 
+def subscription_body(server: str | None = None, port: int | None = None) -> bytes:
+    global _sub_cache_key, _sub_cache_body
+    # Only the unmodified (no ?server/?port rewrite) pull is cacheable; that is the
+    # common polling path. Override pulls render fresh.
+    if server is None and port is None:
+        with LOCK:
+            key = _nodes_stat_key()
+            if key is not None and key == _sub_cache_key and _sub_cache_body is not None:
+                return _sub_cache_body
+            body = _encode_subscription(_load_nodes_unlocked(), None, None)
+            _sub_cache_body = body
+            _sub_cache_key = key
+            return body
+    return _encode_subscription(load_nodes(), server, port)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "EasyTrojanHub/1.0"
+    # Reuse connections for the hot GET /sub path (Caddy reverse-proxies with
+    # keep-alive), cutting per-pull TCP/thread setup. All responses set
+    # Content-Length; write verbs force-close to avoid any unread-body desync.
+    protocol_version = "HTTP/1.1"
 
-    def log_message(self, fmt: str, *args: Any) -> None:
-        # keep journal clean
-        sys_stderr = getattr(self, "_quiet", True)
-        if not sys_stderr:
-            super().log_message(fmt, *args)
+    def log_request(self, code: Any = "-", size: Any = "-") -> None:  # noqa: N802
+        # Access logs stay out of the journal; errors still reach it via log_error().
+        return
+
+    def _audit(self, msg: str) -> None:
+        # Minimal audit line to stderr (journald) for auth failures, without the
+        # per-request access-log noise. Guarded so it never raises mid-handler.
+        try:
+            client = self.client_address[0] if getattr(self, "client_address", None) else "-"
+        except Exception:
+            client = "-"
+        sys.stderr.write(f"easytrojan-hub: {msg} from {client}\n")
+        sys.stderr.flush()
+
+    def _fail_state(self, exc: Exception) -> None:
+        # Internal state problems: detail to the log, generic message to the client
+        # so unauthenticated callers never learn server file paths.
+        self.log_error("hub state error: %s", exc)
+        self._json(503, {"error": "hub state unavailable"})
 
     def _no_cache_headers(self) -> None:
         # Strong no-cache for subscription clients and any reverse proxy (Cloudflare).
@@ -462,13 +537,14 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 cfg = ensure_config()
             except DataStoreError as exc:
-                self._json(503, {"error": str(exc)})
+                self._fail_state(exc)
                 return False
         auth = self.headers.get("Authorization", "") or ""
         if auth.lower().startswith("bearer "):
             auth = auth[7:]
         token = self.headers.get("X-Hub-Token") or auth.strip()
         if not _token_ok(token, cfg["register_token"]):
+            self._audit(f"unauthorized {getattr(self, 'command', '?')} {getattr(self, 'path', '?')}")
             self._json(401, {"error": "unauthorized"})
             return False
         return True
@@ -479,7 +555,10 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             self._json(400, {"error": "invalid content length"})
             return None
-        if length < 0 or length > MAX_BODY_BYTES:
+        if length < 0:
+            self._json(400, {"error": "invalid content length"})
+            return None
+        if length > MAX_BODY_BYTES:
             self._json(413, {"error": "request body too large"})
             return None
         raw = self.rfile.read(length) if length > 0 else b"{}"
@@ -500,14 +579,14 @@ class Handler(BaseHTTPRequestHandler):
         try:
             cfg = ensure_config()
         except DataStoreError as exc:
-            self._json(503, {"error": str(exc)})
+            self._fail_state(exc)
             return
 
         if path in ("/", "/health"):
             try:
                 node_count = len(load_nodes())
             except DataStoreError as exc:
-                self._json(503, {"error": str(exc)})
+                self._fail_state(exc)
                 return
             self._json(200, {"ok": True, "service": "easytrojan-hub", "nodes": node_count})
             return
@@ -515,6 +594,7 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/sub/"):
             token = path[len("/sub/") :].strip("/")
             if not _token_ok(token, cfg.get("sub_token", "")):
+                self._audit(f"invalid subscription token {self.path}")
                 self._json(401, {"error": "invalid subscription token"})
                 return
             server = (qs.get("server") or qs.get("ip") or [None])[0]
@@ -530,8 +610,11 @@ class Handler(BaseHTTPRequestHandler):
                 if server is not None:
                     server = _host(server, "server")
                 body = subscription_body(server=server, port=port)
-            except (DataStoreError, ValueError) as exc:
-                self._json(503 if isinstance(exc, DataStoreError) else 400, {"error": str(exc)})
+            except DataStoreError as exc:
+                self._fail_state(exc)
+                return
+            except ValueError as exc:
+                self._json(400, {"error": str(exc)})
                 return
             # clients expect plain base64 text; profile headers help apps refresh reliably
             extra = {
@@ -547,14 +630,16 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 nodes = load_nodes()
             except DataStoreError as exc:
-                self._json(503, {"error": str(exc)})
+                self._fail_state(exc)
                 return
             # Return operator metadata without exposing complete passwords.
             safe = []
             for n in nodes:
                 item = dict(n)
                 pw = item.get("password") or ""
-                item["password"] = (pw[:2] + "***" + pw[-2:]) if len(pw) > 4 else "****"
+                # Only reveal edges of clearly long passwords; short ones (<=8) that
+                # would expose half their characters are fully masked.
+                item["password"] = (pw[:2] + "***" + pw[-2:]) if len(pw) > 8 else "****"
                 safe.append(item)
             self._json(200, {"nodes": safe, "count": len(safe)})
             return
@@ -584,6 +669,9 @@ class Handler(BaseHTTPRequestHandler):
             self._head_only = False
 
     def do_POST(self) -> None:  # noqa: N802
+        # Write verbs may respond before consuming the body (auth/size errors);
+        # close the connection so a keep-alive peer never reads a stale body.
+        self.close_connection = True
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         routes = {
@@ -609,7 +697,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": str(e)})
                 return
             except DataStoreError as e:
-                self._json(503, {"error": str(e)})
+                self._fail_state(e)
                 return
             self._json(200, {"ok": True, "node": {"id": node["id"], "name": node["name"], "domain": node["domain"]}})
             return
@@ -622,7 +710,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 ok = delete_node(nid)
             except DataStoreError as exc:
-                self._json(503, {"error": str(exc)})
+                self._fail_state(exc)
                 return
             self._json(200 if ok else 404, {"ok": ok})
             return
@@ -631,8 +719,11 @@ class Handler(BaseHTTPRequestHandler):
             nid = str(payload.get("id") or "")
             try:
                 node = rename_node(nid, payload.get("name"))
-            except (DataStoreError, ValueError) as exc:
-                self._json(503 if isinstance(exc, DataStoreError) else 400, {"error": str(exc)})
+            except DataStoreError as exc:
+                self._fail_state(exc)
+                return
+            except ValueError as exc:
+                self._json(400, {"error": str(exc)})
                 return
             self._json(200 if node else 404, {"ok": bool(node), "node": {"id": node["id"], "name": node["name"]} if node else None})
             return
@@ -647,12 +738,13 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 removed = delete_by_credentials(domain, password, name)
             except DataStoreError as exc:
-                self._json(503, {"error": str(exc)})
+                self._fail_state(exc)
                 return
             self._json(200, {"ok": True, "removed": removed})
             return
 
     def do_DELETE(self) -> None:  # noqa: N802
+        self.close_connection = True
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         if path.startswith("/api/nodes/"):
@@ -662,7 +754,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 ok = delete_node(nid)
             except DataStoreError as exc:
-                self._json(503, {"error": str(exc)})
+                self._fail_state(exc)
                 return
             self._json(200 if ok else 404, {"ok": ok})
             return
@@ -700,6 +792,12 @@ class LimitedThreadingHTTPServer(ThreadingHTTPServer):
 
 
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "--init":
+        # Single source of truth for hub state creation/validation: the installer
+        # calls this instead of maintaining a second, non-atomic Python snippet.
+        ensure_config()
+        print(f"initialized hub config: {CFG_FILE}", flush=True)
+        return
     cfg = ensure_config()
     bind = os.environ.get("EASYTROJAN_HUB_LISTEN") or cfg.get("bind") or LISTEN
     host, port = _parse_bind(bind)

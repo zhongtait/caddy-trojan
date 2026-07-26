@@ -6,7 +6,7 @@ enable_bbr() {
     local config_file="${BBR_SYSCTL_FILE:-/etc/sysctl.d/99-easytrojan-bbr.conf}"
     local available current
 
-    info "Enabling BBR congestion control..."
+    info "Enabling BBR congestion control and proxy network tuning..."
     if check_cmd modprobe; then
         modprobe tcp_bbr &>/dev/null || true
         modprobe sch_fq &>/dev/null || true
@@ -24,11 +24,20 @@ enable_bbr() {
         warn "Failed to enable BBR; continuing with the current congestion control"
         return 0
     fi
+    # Two safe, proxy-friendly tunables applied alongside BBR (both reversible):
+    #  - tcp_slow_start_after_idle=0 keeps long-lived Trojan/WS tunnels at full
+    #    speed after brief idle, instead of restarting from a small window.
+    #  - tcp_notsent_lowat=16384 caps unsent bytes queued per socket, lowering
+    #    per-connection memory and write latency under load.
+    sysctl -w net.ipv4.tcp_slow_start_after_idle=0 &>/dev/null || true
+    sysctl -w net.ipv4.tcp_notsent_lowat=16384 &>/dev/null || true
     if ! {
         printf '%s\n' \
             '# Managed by EasyTrojan' \
             'net.core.default_qdisc = fq' \
-            'net.ipv4.tcp_congestion_control = bbr' > "$config_file"
+            'net.ipv4.tcp_congestion_control = bbr' \
+            'net.ipv4.tcp_slow_start_after_idle = 0' \
+            'net.ipv4.tcp_notsent_lowat = 16384' > "$config_file"
     }; then
         warn "BBR is active for this boot but could not be persisted to ${config_file}"
         return 0
@@ -77,7 +86,29 @@ EOF
     ok "Optional system limits applied"
 }
 
+# Echo a soft GOMEMLIMIT value in MiB (~75% of RAM), or nothing when RAM is
+# undetectable or tiny (<170MB total). Optional arg overrides MemTotal (kB) for tests.
+# shellcheck disable=SC2120  # optional arg is exercised by tests, not this module
+derive_gomemlimit_mib() {
+    local mem_kb="${1:-}"
+    if [ -z "$mem_kb" ]; then
+        mem_kb=$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null || true)
+    fi
+    mem_kb=${mem_kb//[^0-9]/}
+    [ -n "$mem_kb" ] && [ "$mem_kb" -gt 0 ] || return 0
+    local limit_mib=$(( mem_kb * 3 / 4 / 1024 ))
+    [ "$limit_mib" -ge 128 ] || return 0
+    printf '%s' "$limit_mib"
+}
+
 write_caddy_unit() {
+    # Soft memory cap (~75% of RAM) as an OOM guard for small VPS. GOMEMLIMIT is a
+    # soft target: normal single-client load never nears it, but a leak/spike makes
+    # Go's GC reclaim harder instead of the box OOM-killing Caddy. Omitted if RAM
+    # is undetectable or tiny.
+    local gomemlimit_env="" limit_mib
+    limit_mib=$(derive_gomemlimit_mib)
+    [ -n "$limit_mib" ] && gomemlimit_env="Environment=GOMEMLIMIT=${limit_mib}MiB"
     cat > /etc/systemd/system/caddy.service <<EOF
 [Unit]
 # Managed by EasyTrojan
@@ -91,6 +122,7 @@ Type=notify
 User=caddy
 Group=caddy
 Environment=XDG_CONFIG_HOME=/etc XDG_DATA_HOME=/var/lib HOME=/var/lib/caddy
+${gomemlimit_env}
 ExecStart=${CADDY_BIN} run --environ --config ${CADDYFILE}
 ExecReload=${CADDY_BIN} reload --config ${CADDYFILE} --force
 TimeoutStopSec=5s

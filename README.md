@@ -124,7 +124,9 @@ sudo IT_TOOLS_VERSION=v2024.10.22-7ca5933 \
 sudo IT_TOOLS_VERSION=v2024.10.22-7ca5933 IT_TOOLS_SHA256='<64位SHA256>' \
   bash easytrojan.sh install --domain example.com
 
-# 安装时会在内核支持的情况下自动启用 BBR；以下选项额外启用全局 sysctl 和 limits 调优
+# 安装时会在内核支持时自动启用 BBR，并附带两项安全的代理网络调优
+# （tcp_slow_start_after_idle=0、tcp_notsent_lowat=16384）；
+# 以下选项额外启用更激进的全局 sysctl（更大 socket 缓冲、端口范围等）和 limits 调优
 sudo bash easytrojan.sh install --domain example.com --tune-system
 ```
 

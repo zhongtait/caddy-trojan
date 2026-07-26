@@ -36,6 +36,7 @@ do_install() {
     prompt_domain
 
     info "Detecting server IP..."
+    local address_ip site_domain
     address_ip=$(detect_public_ip) || error "Failed to detect public IPv4. Check network connectivity."
     info "Server IP: $address_ip"
     site_domain="$caddy_domain"
@@ -43,10 +44,16 @@ do_install() {
     if [ "${skip_domain_check:-0}" = "1" ]; then
         warn "Skipping domain resolution check for ${site_domain}"
     else
-        domain_ip=$(resolve_domain_ipv4 "$site_domain")
-        [ -z "$domain_ip" ] && error "Failed to resolve domain '$site_domain'"
-        if ! domain_points_to_ip "$site_domain" "$address_ip"; then
-            error "Domain '$site_domain' does not resolve to this server ($address_ip). Seen: $(resolve_domain_ipv4_list "$site_domain" | tr '\n' ' ')"
+        # Resolve once and reuse for both the empty check and the match check;
+        # resolve_domain_ipv4_list may run dig/getent/host/python/ping in turn.
+        local resolved_ips="" matched=0 ip
+        resolved_ips=$(resolve_domain_ipv4_list "$site_domain")
+        [ -n "$resolved_ips" ] || error "Failed to resolve domain '$site_domain'"
+        while IFS= read -r ip; do
+            [ "$ip" = "$address_ip" ] && { matched=1; break; }
+        done <<< "$resolved_ips"
+        if [ "$matched" != "1" ]; then
+            error "Domain '$site_domain' does not resolve to this server ($address_ip). Seen: $(printf '%s' "$resolved_ips" | tr '\n' ' ')"
         fi
         info "Domain verified: $site_domain -> $address_ip"
     fi
@@ -153,8 +160,9 @@ do_install() {
                     warn "New certificate request failed. Restoring from backup..."
                     cp -a "${cert_backup}/certificates" "${CADDY_DATA_DIR}/" 2>/dev/null || true
                     cp -a "${cert_backup}/acme" "${CADDY_DATA_DIR}/" 2>/dev/null || true
-                    chown -R caddy:caddy "$CADDY_DATA_DIR"
-                    systemctl restart caddy.service
+                    # Best-effort recovery path: never abort mid-rollback under set -e.
+                    chown -R caddy:caddy "$CADDY_DATA_DIR" || true
+                    systemctl restart caddy.service || true
                     ok "Certificates restored from backup"
                 else
                     error "Certificate application failed after $((max_wait * 3))s.\nPlease check:\n  1. TCP ports 80 and 443 are open\n  2. Domain A record points to this server\n  3. journalctl -u caddy --no-pager -n 30"

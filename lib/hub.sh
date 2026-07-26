@@ -6,6 +6,49 @@ hub_enabled() {
     [ -f "$HUB_ENABLED_FILE" ]
 }
 
+# Read one top-level field from a JSON file (empty string on any error/missing).
+hub_json_field() {
+    local file="$1" field="$2"
+    [ -f "$file" ] || return 0
+    python3 -c 'import json,sys
+p,f=sys.argv[1],sys.argv[2]
+try:
+    print(json.load(open(p,encoding="utf-8")).get(f,""))
+except Exception:
+    print("")
+' "$file" "$field" 2>/dev/null || true
+}
+
+# Build a Trojan node registration JSON payload with all string fields escaped.
+hub_register_payload() {
+    local name="$1" domain="$2" passwd="$3" server="$4" port="$5" transport="$6"
+    printf '{"name":"%s","domain":"%s","password":"%s","server":"%s","port":%s,"sni":"%s","host":"%s","path":"/","transport":"%s","alpn":"http/1.1"}' \
+        "$(json_escape "$name")" "$(json_escape "$domain")" "$(json_escape "$passwd")" \
+        "$(json_escape "$server")" "$port" \
+        "$(json_escape "$domain")" "$(json_escape "$domain")" \
+        "$(json_escape "$transport")"
+}
+
+# Nth display name for multi-password hosts: base, then base-2, base-3, ...
+hub_indexed_name() {
+    local base="$1" index="$2"
+    if [ "$index" -le 1 ]; then
+        printf '%s' "$base"
+    else
+        printf '%s-%s' "$base" "$index"
+    fi
+}
+
+# Best-effort unregister of one domain+password from a hub via its API. Secrets
+# stay out of argv. base_url is the hub root (local http://HUB_LISTEN or remote).
+hub_unregister_password() {
+    local base_url="$1" token="$2" domain="$3" passwd="$4" payload
+    [ -n "$domain" ] && [ -n "$passwd" ] || return 0
+    payload=$(printf '{"domain":"%s","password":"%s"}' \
+        "$(json_escape "$domain")" "$(json_escape "$passwd")")
+    http_send_json POST "${base_url%/}/api/unregister" "$token" "$payload" -sf >/dev/null 2>&1
+}
+
 hub_local_name_file() {
     printf '%s' "${HUB_LOCAL_NAME_FILE:-${TROJAN_DIR}/hub-local-name.txt}"
 }
@@ -43,10 +86,7 @@ hub_reregister_local_named() {
     wait_for_hub_api || return 1
     while IFS= read -r passwd || [ -n "$passwd" ]; do
         [ -n "$passwd" ] || continue
-        curl -sf -X POST -H "Content-Type: application/json" -H "X-Hub-Token: ${reg_token}" \
-            -d "$(printf '{"domain":"%s","password":"%s"}' \
-                "$(json_escape "$domain")" "$(json_escape "$passwd")")" \
-            "http://${HUB_LISTEN}/api/unregister" >/dev/null 2>&1 || true
+        hub_unregister_password "http://${HUB_LISTEN}" "$reg_token" "$domain" "$passwd" || true
     done < "$PASSWD_FILE"
     hub_register_local "$name_base"
 }
@@ -181,16 +221,7 @@ PY
 }
 
 hub_read_client_field() {
-    local field="$1" f
-    f=$(hub_client_file)
-    [ -f "$f" ] || return 0
-    python3 -c 'import json,sys
-p,f=sys.argv[1],sys.argv[2]
-try:
-    print(json.load(open(p,encoding="utf-8")).get(f,""))
-except Exception:
-    print("")
-' "$f" "$field" 2>/dev/null || true
+    hub_json_field "$(hub_client_file)" "$1"
 }
 
 install_hub_binary() {
@@ -311,53 +342,19 @@ EOF
 }
 
 hub_read_cfg_field() {
-    local field="$1"
-    [ -f "$HUB_CFG" ] || return 0
-    python3 -c 'import json,sys
-p,f=sys.argv[1],sys.argv[2]
-try:
-    print(json.load(open(p,encoding="utf-8")).get(f,""))
-except Exception:
-    print("")
-' "$HUB_CFG" "$field" 2>/dev/null || true
+    hub_json_field "$HUB_CFG" "$1"
 }
 
 hub_ensure_config_files() {
     mkdir -p "$HUB_DIR"
     chmod 700 "$HUB_DIR"
-    EASYTROJAN_HUB_DIR="$HUB_DIR" EASYTROJAN_HUB_LISTEN="$HUB_LISTEN" python3 - <<'PY'
-import json, os, secrets
-from pathlib import Path
-d = Path(os.environ.get("EASYTROJAN_HUB_DIR", "/etc/caddy/trojan/hub"))
-d.mkdir(parents=True, exist_ok=True)
-cfg_p = d / "config.json"
-nodes_p = d / "nodes.json"
-cfg = {}
-if cfg_p.is_file():
-    try:
-        cfg = json.loads(cfg_p.read_text(encoding="utf-8"))
-    except Exception:
-        raise SystemExit(f"invalid hub config: {cfg_p}; restore {cfg_p}.bak or remove it deliberately")
-    if not isinstance(cfg, dict):
-        raise SystemExit(f"invalid hub config object: {cfg_p}")
-changed = False
-if not cfg.get("register_token"):
-    cfg["register_token"] = secrets.token_urlsafe(24)
-    changed = True
-if not cfg.get("sub_token"):
-    cfg["sub_token"] = secrets.token_urlsafe(24)
-    changed = True
-bind = os.environ.get("EASYTROJAN_HUB_LISTEN", "127.0.0.1:2099")
-if cfg.get("bind") != bind:
-    cfg["bind"] = bind
-    changed = True
-if changed or not cfg_p.is_file():
-    cfg_p.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.chmod(cfg_p, 0o600)
-if not nodes_p.is_file():
-    nodes_p.write_text(json.dumps({"nodes": []}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.chmod(nodes_p, 0o600)
-PY
+    # Delegate to the server's ensure_config() (atomic write + fail-closed on
+    # corrupt state) instead of a second, conflicting inline implementation.
+    local server="${SHARE_DIR}/hub_server.py"
+    [ -f "$server" ] || error "hub_server.py missing at $server; run install/update first"
+    EASYTROJAN_HUB_DIR="$HUB_DIR" EASYTROJAN_HUB_LISTEN="$HUB_LISTEN" \
+        python3 "$server" --init >/dev/null \
+        || error "Failed to initialize hub state (config may be corrupt: ${HUB_CFG}; restore ${HUB_CFG}.bak or remove it deliberately)"
 }
 
 hub_ensure_runtime() {
@@ -389,7 +386,7 @@ wait_for_hub_api() {
 }
 
 hub_register_local() {
-    local domain reg_token passwd name_base name i=0 transport="ws" attempt resp code body
+    local domain reg_token passwd name_base name i=0 transport="ws" resp code body
     domain=$(read_installed_domain 2>/dev/null || true)
     reg_token=$(hub_read_cfg_field register_token)
     [ -n "$domain" ] && [ -n "$reg_token" ] && [ -f "$PASSWD_FILE" ] || return 0
@@ -398,31 +395,20 @@ hub_register_local() {
         warn "Check: systemctl status ${HUB_UNIT}; journalctl -u ${HUB_UNIT} -n 40 --no-pager"
         return 1
     fi
-    if [ -f "$CADDYFILE" ] && ! grep -q "websocket" "$CADDYFILE" 2>/dev/null; then
-        transport="tcp"
-    fi
+    transport=$(detect_share_transport)
     name_base="${1:-$domain}"
     while IFS= read -r passwd || [ -n "$passwd" ]; do
         [ -n "$passwd" ] || continue
         i=$((i + 1))
-        if [ "$i" -eq 1 ]; then
-            name="$name_base"
-        else
-            name="${name_base}-${i}"
-        fi
+        name=$(hub_indexed_name "$name_base" "$i")
         local payload
-        # Valid JSON template (do NOT backslash-escape quotes inside single quotes).
-        payload=$(printf '{"name":"%s","domain":"%s","password":"%s","server":"%s","port":443,"sni":"%s","host":"%s","path":"/","transport":"%s","alpn":"http/1.1"}' \
-            "$(json_escape "$name")" "$(json_escape "$domain")" "$(json_escape "$passwd")" \
-            "$(json_escape "$domain")" "$(json_escape "$domain")" "$(json_escape "$domain")" \
-            "$(json_escape "$transport")")
+        payload=$(hub_register_payload "$name" "$domain" "$passwd" "$domain" 443 "$transport")
         resp=""
         code="000"
         body=""
-        for attempt in 1 2 3 4 5; do
-            resp=$(curl -sS -w "\n%{http_code}" --connect-timeout 2 --max-time 8 \
-                -X POST -H "Content-Type: application/json" -H "X-Hub-Token: ${reg_token}" \
-                -d "$payload" "http://${HUB_LISTEN}/api/register" 2>&1) || true
+        for _ in 1 2 3 4 5; do
+            resp=$(http_send_json POST "http://${HUB_LISTEN}/api/register" "$reg_token" "$payload" \
+                -sS -w '\n%{http_code}' --connect-timeout 2 --max-time 8 2>&1) || true
             code=$(printf '%s' "$resp" | tail -n1 | tr -d '\r')
             body=$(printf '%s' "$resp" | sed '$d')
             if [ "$code" = "200" ]; then
@@ -433,7 +419,7 @@ hub_register_local() {
         done
         if [ "$code" != "200" ]; then
             warn "Failed to register local user into hub (${name}) HTTP ${code}: ${body:-no response}"
-            warn "Hint: TOKEN=$(python3 -c 'import json;print(json.load(open("/etc/caddy/trojan/hub/config.json"))["register_token"])'); curl -sS -H \"X-Hub-Token: $TOKEN\" http://127.0.0.1:2099/api/nodes"
+            warn "Hint: run 'easytrojan hub token' to see the register_token, then: curl -sS -H \"X-Hub-Token: <register_token>\" http://${HUB_LISTEN}/api/nodes"
             return 1
         fi
     done < "$PASSWD_FILE"
@@ -465,9 +451,7 @@ hub_reregister_to_remote() {
     domain=$(read_installed_domain 2>/dev/null || true)
     [ -n "$domain" ] && [ -f "$PASSWD_FILE" ] || return 0
     check_cmd curl || return 0
-    if [ -f "$CADDYFILE" ] && ! grep -q "websocket" "$CADDYFILE" 2>/dev/null; then
-        transport="tcp"
-    fi
+    transport=$(detect_share_transport)
     [ -n "$name" ] || name="$domain"
     [ -n "$server" ] || server="$domain"
     [ -n "$port" ] || port=443
@@ -475,25 +459,16 @@ hub_reregister_to_remote() {
     while IFS= read -r passwd || [ -n "$passwd" ]; do
         [ -n "$passwd" ] || continue
         i=$((i + 1))
-        if [ "$i" -eq 1 ]; then
-            reg_name="$name"
-        else
-            reg_name="${name}-${i}"
-        fi
-        payload=$(printf '{"name":"%s","domain":"%s","password":"%s","server":"%s","port":%s,"sni":"%s","host":"%s","path":"/","transport":"%s","alpn":"http/1.1"}' \
-            "$(json_escape "$reg_name")" "$(json_escape "$domain")" "$(json_escape "$passwd")" \
-            "$(json_escape "$server")" "$port" \
-            "$(json_escape "$domain")" "$(json_escape "$domain")" \
-            "$(json_escape "$transport")")
-        curl -sf -X POST -H "Content-Type: application/json" -H "X-Hub-Token: ${token}" \
-            -d "$payload" "${hub_url}/api/register" >/dev/null || \
+        reg_name=$(hub_indexed_name "$name" "$i")
+        payload=$(hub_register_payload "$reg_name" "$domain" "$passwd" "$server" "$port" "$transport")
+        http_send_json POST "${hub_url}/api/register" "$token" "$payload" -sf >/dev/null || \
             warn "Failed to re-register ${reg_name} to remote hub"
     done < "$PASSWD_FILE"
 }
 
 # Best-effort: remove one password from local hub nodes and remote joined hub.
 hub_remove_local_password() {
-    local passwd="$1" domain reg_token hub_url token payload
+    local passwd="$1" domain reg_token hub_url token name_hint
     [ -n "$passwd" ] || return 0
     domain=$(read_installed_domain 2>/dev/null || true)
     [ -n "$domain" ] || return 0
@@ -502,10 +477,7 @@ hub_remove_local_password() {
     if hub_enabled && systemctl is-active --quiet "$HUB_UNIT" 2>/dev/null; then
         reg_token=$(hub_read_cfg_field register_token)
         if [ -n "$reg_token" ]; then
-            payload=$(printf '{"domain":"%s","password":"%s"}' \
-                "$(json_escape "$domain")" "$(json_escape "$passwd")")
-            curl -sf -X POST -H "Content-Type: application/json" -H "X-Hub-Token: ${reg_token}" \
-                -d "$payload" "http://${HUB_LISTEN}/api/unregister" >/dev/null 2>&1 || true
+            hub_unregister_password "http://${HUB_LISTEN}" "$reg_token" "$domain" "$passwd" || true
         fi
     fi
 
@@ -516,10 +488,7 @@ hub_remove_local_password() {
         name_hint=$(hub_read_client_field name)
         if [ -n "$hub_url" ] && [ -n "$token" ] && check_cmd curl; then
             hub_url="${hub_url%/}"
-            payload=$(printf '{"domain":"%s","password":"%s"}' \
-                "$(json_escape "$domain")" "$(json_escape "$passwd")")
-            if ! curl -sf -X POST -H "Content-Type: application/json" -H "X-Hub-Token: ${token}" \
-                -d "$payload" "${hub_url}/api/unregister" >/dev/null 2>&1; then
+            if ! hub_unregister_password "$hub_url" "$token" "$domain" "$passwd"; then
                 # Older hub without /api/unregister: try DELETE /api/nodes/<id> for common names
                 python3 - "$hub_url" "$token" "$domain" "$passwd" "${name_hint:-$domain}" <<'PY' 2>/dev/null || \
                     warn "Failed to unregister password on remote hub (${hub_url})"
@@ -686,6 +655,7 @@ except Exception:
                         ;;
                     --port)
                         [ -n "${2:-}" ] || error "--port requires a value"
+                        validate_port "$2"
                         port_q="$2"; shift 2
                         ;;
                     -h|--help)
@@ -740,7 +710,7 @@ EOF
             local reg_token
             reg_token=$(hub_read_cfg_field register_token)
             if [ -n "$reg_token" ] && systemctl is-active --quiet "$HUB_UNIT" 2>/dev/null; then
-                curl -sf -H "X-Hub-Token: ${reg_token}" "http://${HUB_LISTEN}/api/nodes" | python3 -c 'import json,sys
+                http_send_json GET "http://${HUB_LISTEN}/api/nodes" "$reg_token" "" -sf | python3 -c 'import json,sys
 d=json.load(sys.stdin)
 print("nodes:", d.get("count", 0))
 for n in d.get("nodes") or []:
@@ -753,7 +723,7 @@ nodes=d.get("nodes") or []
 print("nodes:", len(nodes))
 for n in nodes:
     pw=n.get("password") or ""
-    mask=(pw[:2]+"***"+pw[-2:]) if len(pw)>4 else "****"
+    mask=(pw[:2]+"***"+pw[-2:]) if len(pw)>8 else "****"
     print("  -", n.get("id"), n.get("name"), "%s:%s" % (n.get("domain"), n.get("port")), "pw="+mask)
 ' "$HUB_NODES"
             fi
@@ -772,7 +742,7 @@ for n in nodes:
             reg_token=$(hub_read_cfg_field register_token)
             [ -n "$reg_token" ] || error "Hub not configured"
             if systemctl is-active --quiet "$HUB_UNIT" 2>/dev/null; then
-                curl -sf -X DELETE -H "X-Hub-Token: ${reg_token}" "http://${HUB_LISTEN}/api/nodes/${nid}" >/dev/null \
+                http_send_json DELETE "http://${HUB_LISTEN}/api/nodes/${nid}" "$reg_token" "" -sf >/dev/null \
                     || error "Delete failed (id not found or hub down)"
             else
                 error "Hub service is not running; start ${HUB_UNIT} before removing a node"
@@ -845,8 +815,7 @@ EOF
         [ -n "$reg_token" ] || error "Hub register token missing"
         payload=$(printf '{"id":"%s","name":"%s"}' \
             "$(json_escape "$nid")" "$(json_escape "$new_name")")
-        resp=$(curl -sS -X POST -H "Content-Type: application/json" -H "X-Hub-Token: ${reg_token}" \
-            -d "$payload" "http://${HUB_LISTEN}/api/rename" 2>&1) \
+        resp=$(http_send_json POST "http://${HUB_LISTEN}/api/rename" "$reg_token" "$payload" -sS 2>&1) \
             || error "Rename failed: ${resp}"
         echo "$resp" | grep -q '"ok"[[:space:]]*:[[:space:]]*true' \
             || error "Rename failed (id not found?): ${resp}"
@@ -875,10 +844,7 @@ EOF
             local passwd
             while IFS= read -r passwd || [ -n "$passwd" ]; do
                 [ -n "$passwd" ] || continue
-                curl -sf -X POST -H "Content-Type: application/json" -H "X-Hub-Token: ${token}" \
-                    -d "$(printf '{"domain":"%s","password":"%s"}' \
-                        "$(json_escape "$domain")" "$(json_escape "$passwd")")" \
-                    "${hub_url%/}/api/unregister" >/dev/null 2>&1 || true
+                hub_unregister_password "$hub_url" "$token" "$domain" "$passwd" || true
             done < "$PASSWD_FILE"
             hub_reregister_to_remote || warn "Remote hub re-register failed; run hub join again"
             ok "Remote hub membership name -> ${new_name}"
@@ -910,6 +876,7 @@ do_hub_join() {
                 ;;
             --port)
                 [ -n "${2:-}" ] || error "--port requires a value"
+                validate_port "$2"
                 port="$2"; shift 2
                 ;;
             -h|--help)
@@ -938,9 +905,7 @@ EOF
     domain=$(read_installed_domain 2>/dev/null || true)
     [ -n "$domain" ] || error "Local domain not found. Install first."
     [ -f "$PASSWD_FILE" ] || error "No local passwords in $PASSWD_FILE"
-    if [ -f "$CADDYFILE" ] && ! grep -q "websocket" "$CADDYFILE" 2>/dev/null; then
-        transport="tcp"
-    fi
+    transport=$(detect_share_transport)
     [ -n "$name" ] || name="$domain"
     [ -n "$server" ] || server="$domain"
     hub_url="${hub_url%/}"
@@ -949,18 +914,10 @@ EOF
     while IFS= read -r passwd || [ -n "$passwd" ]; do
         [ -n "$passwd" ] || continue
         i=$((i + 1))
-        if [ "$i" -eq 1 ]; then
-            reg_name="$name"
-        else
-            reg_name="${name}-${i}"
-        fi
-        payload=$(printf '{"name":"%s","domain":"%s","password":"%s","server":"%s","port":%s,"sni":"%s","host":"%s","path":"/","transport":"%s","alpn":"http/1.1"}' \
-            "$(json_escape "$reg_name")" "$(json_escape "$domain")" "$(json_escape "$passwd")" \
-            "$(json_escape "$server")" "$port" \
-            "$(json_escape "$domain")" "$(json_escape "$domain")" \
-            "$(json_escape "$transport")")
-        resp=$(curl -sS -X POST -H "Content-Type: application/json" -H "X-Hub-Token: ${token}" \
-            -d "$payload" "${hub_url}/api/register" 2>&1) || error "Register failed: ${resp}"
+        reg_name=$(hub_indexed_name "$name" "$i")
+        payload=$(hub_register_payload "$reg_name" "$domain" "$passwd" "$server" "$port" "$transport")
+        resp=$(http_send_json POST "${hub_url}/api/register" "$token" "$payload" -sS 2>&1) \
+            || error "Register failed: ${resp}"
         echo "$resp" | grep -q '"ok"' || error "Register rejected: ${resp}"
         count=$((count + 1))
         ok "Registered ${reg_name} -> ${hub_url}"
