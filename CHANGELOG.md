@@ -2,12 +2,17 @@
 
 ## [Unreleased]
 
-- security: update scripts from a checksummed Release bundle; detect Caddy plugin changes by binary digest and restart safely.
+- fix(camouflage): correct the inverted ZIP path-safety condition and pin the default IT-Tools archive SHA256.
+- fix(bootstrap): make standalone installs and updates load one current repository snapshot instead of stale installed/Release modules, so camouflage fallback and WebSocket ALPN fixes take effect.
+- fix(ui): report expected firewall and pinned-asset integrity notices as informational messages; reserve warnings for actual failures.
+- feat(system): enable and persist `fq` + BBR during installation when supported; keep broader sysctl/limits tuning opt-in.
+- security: update scripts from a pinned repository snapshot with checksummed Release fallback; detect Caddy plugin changes by binary digest and restart safely.
 - security: validate Caddyfile before atomic activation, isolate Caddy runtime data under `/var/lib/caddy`, and keep configuration root-owned.
-- security: pin and verify the camouflage archive, use stable opaque Hub node IDs, and preserve the previous site/config on failed updates.
+- security: pin the camouflage release, verify SHA256 when published or explicitly configured, validate archive paths, and preserve the previous site on failure.
+- fix(camouflage): retry downloads and use the pinned release asset URL when old GitHub releases do not expose asset digest metadata.
 - fix(hub): implement HTTP HEAD so subscription Cache-Control is visible to curl -I / CI.
 - **fix: Caddyfile `order trojan before handle`** so Trojan WebSocket is not swallowed by camouflage SPA `handle` (client got HTTP 200 HTML instead of WS 101). `update` now regenerates Caddyfile.
-- client: share/subscription ALPN back to `h2,http/1.1` (server already enables both).
+- fix(client): force WebSocket share/subscription ALPN to `http/1.1`; h2-first negotiation caused intermittent latency-test and connection failures.
 
 - fix(hub): detect/link python3.13 and fall back to versioned python in hub service wrapper.
 

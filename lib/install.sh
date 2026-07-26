@@ -51,7 +51,8 @@ do_install() {
         info "Domain verified: $site_domain -> $address_ip"
     fi
 
-    warn "Ensure cloud security group / firewall allows inbound TCP 80 and 443 from the public Internet (ACME needs 80)."
+    info "Ensure cloud security group / firewall allows inbound TCP 80 and 443 from the public Internet (ACME needs 80)."
+    enable_bbr
 
     local cert_backup="" previous_domain=""
     previous_domain=$(read_installed_domain 2>/dev/null || true)
@@ -198,7 +199,7 @@ do_install() {
     echo -e "${GREEN}║${NC}  Address  : ${CYAN}${site_domain}${NC}"
     echo -e "${GREEN}║${NC}  Port     : ${CYAN}443${NC}"
     echo -e "${GREEN}║${NC}  Password : ${CYAN}${trojan_passwd}${NC}"
-    echo -e "${GREEN}║${NC}  ALPN     : ${CYAN}h2, http/1.1${NC}"
+    echo -e "${GREEN}║${NC}  ALPN     : ${CYAN}http/1.1 only${NC}  ${YELLOW}(WebSocket)${NC}"
     echo -e "${GREEN}║${NC}  Transport: ${CYAN}websocket${NC}"
     echo -e "${GREEN}║${NC}  TLS mode : ${CYAN}$(read_tls_mode)${NC}  (easytrojan cert status)"
     echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
@@ -211,7 +212,7 @@ do_install() {
     echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${GREEN}║${NC}  ${YELLOW}Share Link:${NC}"
     echo -e "${GREEN}║${NC}  ${CYAN}${share_link}${NC}"
-    echo -e "${GREEN}║${NC}  ${YELLOW}Client:${NC} ALPN=h2,http/1.1; SNI/Host=domain; path=/"
+    echo -e "${GREEN}║${NC}  ${YELLOW}Client:${NC} ALPN=http/1.1; SNI/Host=domain; path=/"
     echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 }

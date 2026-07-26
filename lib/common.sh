@@ -54,9 +54,11 @@ Notes:
   - --server ADDR: share-link address for Cloudflare preferred IP (SNI/Host still use domain)
   - --port PORT: connect port for share links / subscription (default 443; CF HTTPS ports ok)
   - --tls-mode auto: Caddy ACME (default). origin: Cloudflare Origin / file certs
-  - --tune-system: opt in to global sysctl and security limit tuning
+  - BBR is enabled automatically when supported by the host kernel
+  - --tune-system: opt in to additional global sysctl and security limit tuning
   - Reinstall without --tls-mode keeps previous TLS mode; origin reuses /etc/caddy/certs if present
-  - Camouflage site defaults to CorentinTh/it-tools (override: IT_TOOLS_VERSION=...)
+  - Trojan WebSocket client ALPN must be http/1.1 only (do not add h2)
+  - Camouflage site defaults to CorentinTh/it-tools (override: IT_TOOLS_VERSION=..., IT_TOOLS_SHA256=...)
   - hub: optional node aggregation + base64 subscription on one machine
   - subscribe preferred IP (ALL nodes rewritten for that pull):
       https://hub-domain/sub/<token>?server=IP&port=443
@@ -297,11 +299,11 @@ build_share_link() {
     [ -n "$addr" ] || error "Share link needs domain or --server address"
     if [ "$transport" = "ws" ]; then
         # Address may be CF anycast IP; SNI + WS Host must remain the real domain.
-        # Advertise both ALPN values; server already enables h2 + h1.
-        printf 'trojan://%s@%s:%s?security=tls&sni=%s&alpn=h2%%2Chttp%%2F1.1&type=ws&host=%s&path=%%2F#%s' \
+        # WebSocket Upgrade is HTTP/1.1; h2-first ALPN causes intermittent handshake failures.
+        printf 'trojan://%s@%s:%s?security=tls&sni=%s&alpn=http%%2F1.1&type=ws&host=%s&path=%%2F#%s' \
             "$encoded" "$addr" "$port" "$domain" "$domain" "$display_name"
     else
-        printf 'trojan://%s@%s:%s?security=tls&sni=%s&alpn=h2%%2Chttp%%2F1.1&type=tcp#%s' \
+        printf 'trojan://%s@%s:%s?security=tls&sni=%s&alpn=http%%2F1.1&type=tcp#%s' \
             "$encoded" "$addr" "$port" "$domain" "$display_name"
     fi
 }

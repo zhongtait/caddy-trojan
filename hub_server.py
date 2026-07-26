@@ -105,14 +105,22 @@ def _load_nodes_unlocked() -> list[dict]:
     nodes = list(data["nodes"])
     if len(nodes) > MAX_NODES:
         raise DataStoreError(f"too many nodes: {len(nodes)}")
-    if any(not isinstance(node, dict) for node in nodes):
-        raise DataStoreError(f"invalid node entry: {NODES_FILE}")
+    for index, node in enumerate(nodes):
+        try:
+            _validate_node(node)
+        except ValueError as exc:
+            raise DataStoreError(f"invalid node entry {index}: {NODES_FILE}") from exc
     return nodes
 
 
 def _save_nodes_unlocked(nodes: list[dict]) -> None:
     if len(nodes) > MAX_NODES:
         raise DataStoreError(f"too many nodes: {len(nodes)}")
+    for index, node in enumerate(nodes):
+        try:
+            _validate_node(node)
+        except ValueError as exc:
+            raise DataStoreError(f"invalid node entry {index}") from exc
     _save_json(NODES_FILE, {"nodes": nodes, "updated_at": _now()})
 
 
@@ -122,15 +130,16 @@ def ensure_config() -> dict:
         if not isinstance(cfg, dict):
             raise DataStoreError(f"invalid hub config: {CFG_FILE}")
         changed = False
-        if not cfg.get("register_token"):
+        if "register_token" not in cfg:
             cfg["register_token"] = secrets.token_urlsafe(24)
             changed = True
-        if not cfg.get("sub_token"):
+        if "sub_token" not in cfg:
             cfg["sub_token"] = secrets.token_urlsafe(24)
             changed = True
         if "bind" not in cfg:
             cfg["bind"] = LISTEN
             changed = True
+        _validate_config(cfg)
         if changed:
             _save_json(CFG_FILE, cfg)
         if not NODES_FILE.is_file():
@@ -181,13 +190,83 @@ def _host(value: Any, field: str, default: str = "") -> str:
 def _port(value: Any, field: str = "port") -> int:
     if isinstance(value, bool):
         raise ValueError(f"invalid {field}")
-    try:
-        port = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"invalid {field}") from exc
+    if isinstance(value, int):
+        port = value
+    elif isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
+        port = int(value.strip())
+    else:
+        raise ValueError(f"invalid {field}")
     if not 1 <= port <= 65535:
         raise ValueError(f"invalid {field}")
     return port
+
+
+def _validate_config(cfg: dict) -> None:
+    for field in ("register_token", "sub_token"):
+        value = cfg.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise DataStoreError(f"invalid hub config field: {field}")
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+            raise DataStoreError(f"invalid hub config field: {field}")
+    try:
+        _parse_bind(cfg.get("bind"))
+    except ValueError as exc:
+        raise DataStoreError("invalid hub config field: bind") from exc
+
+
+def _parse_bind(value: Any) -> tuple[str, int]:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("invalid bind")
+    value = value.strip()
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        raise ValueError("invalid bind")
+    if value.startswith("["):
+        match = re.fullmatch(r"\[([^]]+)](?::([0-9]+))?", value)
+        if not match:
+            raise ValueError("invalid bind")
+        host, port_raw = match.groups()
+        try:
+            if ipaddress.ip_address(host).version != 6:
+                raise ValueError("invalid bind")
+        except ValueError as exc:
+            raise ValueError("invalid bind") from exc
+    else:
+        if value.count(":") > 1:
+            raise ValueError("IPv6 bind addresses must use brackets")
+        host, separator, port_raw = value.partition(":")
+        if not separator:
+            port_raw = ""
+    if not host or any(ch.isspace() for ch in host):
+        raise ValueError("invalid bind")
+    return host, _port(port_raw or 2099, "bind port")
+
+
+def _validate_node(node: Any) -> None:
+    if not isinstance(node, dict):
+        raise ValueError("node must be an object")
+    node_id = _text(node.get("id"), "id", maximum=64)
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", node_id):
+        raise ValueError("invalid id")
+    domain = _host(node.get("domain"), "domain")
+    _text(node.get("password"), "password", maximum=MAX_PASSWORD_LENGTH)
+    _text(node.get("name"), "name", domain, MAX_NAME_LENGTH)
+    _host(node.get("server"), "server", domain)
+    _port(node.get("port", 443))
+    _host(node.get("sni"), "sni", domain)
+    _host(node.get("host"), "host", domain)
+    _text(node.get("path"), "path", "/", MAX_PATH_LENGTH)
+    transport = _text(node.get("transport"), "transport", "ws", 16).lower()
+    if transport not in ("ws", "tcp"):
+        raise ValueError("transport must be ws or tcp")
+    alpn = _text(node.get("alpn"), "alpn", "http/1.1", 128)
+    if any(not re.fullmatch(r"[A-Za-z0-9._/-]+", item.strip()) for item in alpn.split(",")):
+        raise ValueError("invalid alpn")
+    if not isinstance(node.get("enabled", True), bool):
+        raise ValueError("enabled must be boolean")
+    for field in ("created_at", "updated_at"):
+        value = node.get(field)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+            raise ValueError(f"invalid {field}")
 
 
 def upsert_node(payload: dict) -> dict:
@@ -205,7 +284,7 @@ def upsert_node(payload: dict) -> dict:
     transport = _text(payload.get("transport"), "transport", "ws", 16).lower()
     if transport not in ("ws", "tcp"):
         raise ValueError("transport must be ws or tcp")
-    alpn = _text(payload.get("alpn"), "alpn", "h2,http/1.1", 128)
+    alpn = _text(payload.get("alpn"), "alpn", "http/1.1", 128)
     if any(not re.fullmatch(r"[A-Za-z0-9._/-]+", item.strip()) for item in alpn.split(",")):
         raise ValueError("invalid alpn")
     enabled = payload.get("enabled", True)
@@ -230,9 +309,6 @@ def upsert_node(payload: dict) -> dict:
         "enabled": enabled,
         "updated_at": _now(),
     }
-    if payload.get("created_at"):
-        node["created_at"] = payload["created_at"]
-
     with LOCK:
         nodes = _load_nodes_unlocked()
         found = False
@@ -320,10 +396,12 @@ def build_link(node: dict, server: str | None = None, port: int | None = None) -
     transport = (node.get("transport") or "ws").lower()
     user = qe(password)
     frag = qe(name)
-    # Keep configured ALPN list (default both h2 and http/1.1).
-    alpn_raw = str(node.get("alpn") or "h2,http/1.1").strip() or "h2,http/1.1"
+    alpn_raw = str(node.get("alpn") or "http/1.1").strip() or "http/1.1"
     parts = [x.strip() for x in alpn_raw.split(",") if x.strip()]
-    alpn = ",".join(parts) if parts else "h2,http/1.1"
+    if transport == "ws" or "http/1.1" in parts:
+        alpn = "http/1.1"
+    else:
+        alpn = parts[0] if parts else "http/1.1"
     if transport == "ws":
         return (
             f"trojan://{user}@{authority_addr}:{p}"
@@ -379,17 +457,41 @@ class Handler(BaseHTTPRequestHandler):
         if not getattr(self, "_head_only", False):
             self.wfile.write(body)
 
-    def _auth_register(self) -> bool | None:
-        try:
-            cfg = ensure_config()
-        except DataStoreError as exc:
-            self._json(503, {"error": str(exc)})
-            return None
+    def _require_register_auth(self, cfg: dict | None = None) -> bool:
+        if cfg is None:
+            try:
+                cfg = ensure_config()
+            except DataStoreError as exc:
+                self._json(503, {"error": str(exc)})
+                return False
         auth = self.headers.get("Authorization", "") or ""
         if auth.lower().startswith("bearer "):
             auth = auth[7:]
         token = self.headers.get("X-Hub-Token") or auth.strip()
-        return _token_ok(token, cfg.get("register_token", ""))
+        if not _token_ok(token, cfg["register_token"]):
+            self._json(401, {"error": "unauthorized"})
+            return False
+        return True
+
+    def _read_json_object(self) -> dict | None:
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._json(400, {"error": "invalid content length"})
+            return None
+        if length < 0 or length > MAX_BODY_BYTES:
+            self._json(413, {"error": "request body too large"})
+            return None
+        raw = self.rfile.read(length) if length > 0 else b"{}"
+        try:
+            payload = json.loads(raw.decode("utf-8") or "{}")
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._json(400, {"error": "invalid json"})
+            return None
+        if not isinstance(payload, dict):
+            self._json(400, {"error": "invalid payload"})
+            return None
+        return payload
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
@@ -440,17 +542,14 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/nodes":
-            if (auth_ok := self._auth_register()) is not True:
-                if auth_ok is None:
-                    return
-                self._json(401, {"error": "unauthorized"})
+            if not self._require_register_auth(cfg):
                 return
             try:
                 nodes = load_nodes()
             except DataStoreError as exc:
                 self._json(503, {"error": str(exc)})
                 return
-            # do not strip passwords for authenticated operator; mark count only in public health
+            # Return operator metadata without exposing complete passwords.
             safe = []
             for n in nodes:
                 item = dict(n)
@@ -461,10 +560,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/config":
-            if (auth_ok := self._auth_register()) is not True:
-                if auth_ok is None:
-                    return
-                self._json(401, {"error": "unauthorized"})
+            if not self._require_register_auth(cfg):
                 return
             self._json(
                 200,
@@ -490,29 +586,25 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            self._json(400, {"error": "invalid content length"})
+        routes = {
+            "/api/register",
+            "/api/delete",
+            "/api/rename",
+            "/api/unregister",
+            "/api/delete_by_password",
+        }
+        if path not in routes:
+            self._json(404, {"error": "not found"})
             return
-        if length < 0 or length > MAX_BODY_BYTES:
-            self._json(413, {"error": "request body too large"})
+        if not self._require_register_auth():
             return
-        raw = self.rfile.read(length) if length > 0 else b"{}"
-        try:
-            payload = json.loads(raw.decode("utf-8") or "{}")
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            self._json(400, {"error": "invalid json"})
+        payload = self._read_json_object()
+        if payload is None:
             return
 
         if path == "/api/register":
-            if (auth_ok := self._auth_register()) is not True:
-                if auth_ok is None:
-                    return
-                self._json(401, {"error": "unauthorized"})
-                return
             try:
-                node = upsert_node(payload if isinstance(payload, dict) else {})
+                node = upsert_node(payload)
             except ValueError as e:
                 self._json(400, {"error": str(e)})
                 return
@@ -523,14 +615,6 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/delete":
-            if (auth_ok := self._auth_register()) is not True:
-                if auth_ok is None:
-                    return
-                self._json(401, {"error": "unauthorized"})
-                return
-            if not isinstance(payload, dict):
-                self._json(400, {"error": "invalid payload"})
-                return
             nid = str(payload.get("id") or "")
             if not nid:
                 self._json(400, {"error": "id required"})
@@ -544,14 +628,6 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/rename":
-            if (auth_ok := self._auth_register()) is not True:
-                if auth_ok is None:
-                    return
-                self._json(401, {"error": "unauthorized"})
-                return
-            if not isinstance(payload, dict):
-                self._json(400, {"error": "invalid payload"})
-                return
             nid = str(payload.get("id") or "")
             try:
                 node = rename_node(nid, payload.get("name"))
@@ -562,14 +638,6 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path in ("/api/unregister", "/api/delete_by_password"):
-            if (auth_ok := self._auth_register()) is not True:
-                if auth_ok is None:
-                    return
-                self._json(401, {"error": "unauthorized"})
-                return
-            if not isinstance(payload, dict):
-                self._json(400, {"error": "invalid payload"})
-                return
             domain = str(payload.get("domain") or "").strip()
             password = str(payload.get("password") or "")
             name = str(payload.get("name") or "").strip() or None
@@ -584,16 +652,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"ok": True, "removed": removed})
             return
 
-        self._json(404, {"error": "not found"})
-
     def do_DELETE(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         if path.startswith("/api/nodes/"):
-            if (auth_ok := self._auth_register()) is not True:
-                if auth_ok is None:
-                    return
-                self._json(401, {"error": "unauthorized"})
+            if not self._require_register_auth():
                 return
             nid = path[len("/api/nodes/") :].strip("/")
             try:
@@ -639,9 +702,7 @@ class LimitedThreadingHTTPServer(ThreadingHTTPServer):
 def main() -> None:
     cfg = ensure_config()
     bind = os.environ.get("EASYTROJAN_HUB_LISTEN") or cfg.get("bind") or LISTEN
-    host, _, port_s = bind.partition(":")
-    host = host or "127.0.0.1"
-    port = int(port_s or "2099")
+    host, port = _parse_bind(bind)
     httpd = LimitedThreadingHTTPServer((host, port), Handler)
     print(f"easytrojan-hub listening on {host}:{port}", flush=True)
     print(f"config: {CFG_FILE}", flush=True)

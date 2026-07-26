@@ -60,8 +60,7 @@ sudo ufw allow 443/tcp
 下载入口脚本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zhongtait/caddy-trojan/main/easytrojan.sh -o easytrojan.sh
-chmod +x easytrojan.sh
+curl -fsSL https://raw.githubusercontent.com/zhongtait/caddy-trojan/main/easytrojan.sh -o easytrojan.sh && chmod +x easytrojan.sh
 ```
 
 ### 直连或 Cloudflare 灰云
@@ -121,7 +120,11 @@ sudo bash easytrojan.sh install \
 sudo IT_TOOLS_VERSION=v2024.10.22-7ca5933 \
   bash easytrojan.sh install --domain example.com
 
-# 显式启用全局 sysctl 和 limits 调优
+# 可选：为不发布 digest 的旧版 IT-Tools 显式指定 SHA256
+sudo IT_TOOLS_VERSION=v2024.10.22-7ca5933 IT_TOOLS_SHA256='<64位SHA256>' \
+  bash easytrojan.sh install --domain example.com
+
+# 安装时会在内核支持的情况下自动启用 BBR；以下选项额外启用全局 sysctl 和 limits 调优
 sudo bash easytrojan.sh install --domain example.com --tune-system
 ```
 
@@ -131,8 +134,9 @@ sudo bash easytrojan.sh install --domain example.com --tune-system
 sudo bash easytrojan.sh 'password' example.com
 ```
 
-仅下载入口脚本时，脚本会获取并校验最新 Release 的完整模块包；从仓库运行时，
-优先使用本地 `lib/`。
+仅下载入口脚本时，脚本会优先获取当前 `main` 提交的完整模块快照，并覆盖机器上
+可能残留的旧模块；仓库快照不可用时才回退到校验过的 Release 模块包。从完整仓库
+运行时优先使用同目录的 `lib/`。
 
 ## 管理命令
 
@@ -297,7 +301,7 @@ Hub 相关数据：
 | 地址 | 部署域名，或 Cloudflare 优选 IP |
 | 端口 | 443，或 Cloudflare 支持的 HTTPS 端口 |
 | TLS | 开启 |
-| ALPN | `h2,http/1.1` |
+| ALPN | `http/1.1`（仅此一项） |
 | 传输 | WebSocket |
 | SNI / Host | 部署域名 |
 | Path | `/` |
@@ -324,8 +328,8 @@ Cloudflare Origin 证书只用于 Cloudflare 到源站的连接，浏览器不�
 4. 端口是 Cloudflare 支持的 HTTPS 端口。
 5. `sudo easytrojan doctor` 和 `systemctl is-active caddy` 无异常。
 
-部分客户端在橙云下进行延迟测试时，可能无法正确协商 ALPN。可在客户端临时将
-ALPN 改为仅 `http/1.1` 排查。
+WebSocket Upgrade 使用 HTTP/1.1。分享链接和 Hub 订阅默认只设置
+`alpn=http/1.1`；不要添加或优先设置 `h2`，否则延迟测试和连接可能间歇失败。
 
 ### 客户端连上后返回伪装站 HTML
 
@@ -386,9 +390,7 @@ ACME 材料并重新申请。未指定 TLS 模式时会保留当前设置。
 卸载：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zhongtait/caddy-trojan/main/uninstall.sh -o uninstall.sh
-chmod +x uninstall.sh
-sudo bash uninstall.sh
+curl -fsSL https://raw.githubusercontent.com/zhongtait/caddy-trojan/main/uninstall.sh -o uninstall.sh && chmod +x uninstall.sh && sudo bash uninstall.sh
 ```
 
 非交互卸载使用 `sudo bash uninstall.sh -y`。卸载脚本只删除带 EasyTrojan

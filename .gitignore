@@ -3,6 +3,7 @@
 Thumbs.db
 *.swp
 *.tmp
+.idea/
 
 # Local secrets / env
 .env
@@ -13,6 +14,7 @@ Thumbs.db
 __pycache__/
 *.py
 !hub_server.py
+!tests/test_*.py
 .venv/
 venv/
 

@@ -182,7 +182,7 @@ generate_caddyfile() {
         listener_wrappers {
             trojan
         }
-        # Camouflage + Trojan share the same TLS stack; advertise h2 and h1
+        # Browsers may use h2; Trojan WebSocket clients must offer http/1.1 only.
         protocols h2 h1
     }
     servers :80 {

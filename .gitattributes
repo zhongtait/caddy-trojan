@@ -1,0 +1,7 @@
+# Keep repository text files executable and consistent across platforms.
+* text=auto eol=lf
+
+# Never apply line-ending conversion to binary archives or executables.
+*.gz binary
+*.zip binary
+caddy binary

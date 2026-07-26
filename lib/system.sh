@@ -2,6 +2,46 @@
 # EasyTrojan module: system.sh
 # shellcheck shell=bash
 
+enable_bbr() {
+    local config_file="${BBR_SYSCTL_FILE:-/etc/sysctl.d/99-easytrojan-bbr.conf}"
+    local available current
+
+    info "Enabling BBR congestion control..."
+    if check_cmd modprobe; then
+        modprobe tcp_bbr &>/dev/null || true
+        modprobe sch_fq &>/dev/null || true
+    fi
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+    if ! printf '%s\n' "$available" | grep -qw bbr; then
+        warn "BBR is not available on this kernel; continuing with the current congestion control"
+        return 0
+    fi
+    if ! sysctl -w net.core.default_qdisc=fq &>/dev/null; then
+        warn "Failed to enable the fq queue discipline; BBR was not changed"
+        return 0
+    fi
+    if ! sysctl -w net.ipv4.tcp_congestion_control=bbr &>/dev/null; then
+        warn "Failed to enable BBR; continuing with the current congestion control"
+        return 0
+    fi
+    if ! {
+        printf '%s\n' \
+            '# Managed by EasyTrojan' \
+            'net.core.default_qdisc = fq' \
+            'net.ipv4.tcp_congestion_control = bbr' > "$config_file"
+    }; then
+        warn "BBR is active for this boot but could not be persisted to ${config_file}"
+        return 0
+    fi
+    chmod 644 "$config_file" 2>/dev/null || true
+    current=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+    if [ "$current" = "bbr" ]; then
+        ok "BBR enabled and persisted (${config_file})"
+    else
+        warn "BBR did not become active; current congestion control: ${current:-unknown}"
+    fi
+}
+
 apply_sysctl_limits() {
     info "Applying system optimizations..."
     cat > /etc/sysctl.d/99-caddy-trojan.conf <<'EOF'
@@ -23,13 +63,6 @@ net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_keepalive_time = 600
 net.ipv4.tcp_notsent_lowat = 16384
 EOF
-    modprobe tcp_bbr &>/dev/null || true
-    if grep -wq bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
-        {
-            echo "net.core.default_qdisc = fq"
-            echo "net.ipv4.tcp_congestion_control = bbr"
-        } >> /etc/sysctl.d/99-caddy-trojan.conf
-    fi
     sysctl --system &>/dev/null || true
 
     cat > /etc/security/limits.d/caddy-trojan.conf <<'EOF'
@@ -41,7 +74,7 @@ caddy hard nproc  65535
 root  soft nofile 1048576
 root  hard nofile 1048576
 EOF
-    ok "System optimizations applied (BBR: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 'N/A'))"
+    ok "Optional system limits applied"
 }
 
 write_caddy_unit() {
