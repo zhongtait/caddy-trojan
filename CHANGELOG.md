@@ -52,11 +52,13 @@
 
 - Hub：`_save_json` 的磁盘 / 权限错误转为 `DataStoreError`（干净的 503）而非直接断连；负数 `Content-Length` 返回 400（原为 413）。
 - 命令行：`--port` 非数字即报错，避免注入非法 JSON；安装证书回滚分支在 `set -e` 下不再中途退出；`uninstall.sh` 接受 `yes`。
+- 安装：增加完整的运行依赖预检，按 Debian / RHEL 正确映射 `iproute2` / `iproute` 与 `passwd` / `shadow-utils`，并在安装后确认所需命令确实可用。
 - Caddy：Caddyfile 增加 `order trojan before handle`，避免 Trojan WebSocket 被伪装站 SPA `handle` 吞掉（客户端拿到 HTTP 200 HTML 而非 WS 101）；`update` 现在会重新生成 Caddyfile。
 - 客户端：强制 WebSocket 分享 / 订阅链接的 ALPN 为 `http/1.1`，h2 优先协商会导致延迟测试与连接间歇失败。
 - 客户端：分享 / 订阅链接默认 `alpn=http/1.1`，修复 Cloudflare WebSocket 延迟与 TLS 断连。
 - 伪装站：修正反向的 ZIP 路径安全判断，并固定默认 IT-Tools 归档的 SHA256。
 - 伪装站：下载失败时重试；旧 GitHub release 不提供 asset digest 元数据时，改用固定的 release 资源 URL。
+- 伪装站：为独立加载的模块提供默认 IT-Tools 仓库，并将临时目录清理隔离到子 shell 的 `EXIT` trap，避免 `set -u` 未绑定变量及 `RETURN` trap 泄漏。
 - 引导：独立安装与更新改为加载同一份当前仓库快照，而非机器上残留的旧模块或旧 Release，使伪装站回退与 WebSocket ALPN 修复得以生效。
 - Hub：等待本地 Hub HTTP 就绪，修正 register / unregister 的 JSON 载荷，并带 HTTP 状态与响应体重试（修复 `hub enable` 后立即注册失败）。
 - Hub：检测并链接 python3.13，服务包装脚本回退到带版本号的 python。

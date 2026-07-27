@@ -11,7 +11,7 @@ camouflage_fallback_or_keep() {
 }
 
 it_tools_direct_asset_url() {
-    local version="$1" tag
+    local version="$1" tag repo="${IT_TOOLS_REPO:-CorentinTh/it-tools}"
     [ "$version" != "latest" ] || return 1
     case "$version" in
         v*) tag="$version" ;;
@@ -19,7 +19,7 @@ it_tools_direct_asset_url() {
     esac
     printf '%s' "$tag" | grep -Eq '^v[A-Za-z0-9][A-Za-z0-9._-]*$' || return 1
     printf 'https://github.com/%s/releases/download/%s/it-tools-%s.zip' \
-        "$IT_TOOLS_REPO" "$tag" "${tag#v}"
+        "$repo" "$tag" "${tag#v}"
 }
 
 zip_entries_are_safe() {
@@ -27,36 +27,34 @@ zip_entries_are_safe() {
     awk '/(^\/)|(^|\/)\.\.($|\/)|\\|^[A-Za-z]:/ {bad=1} END {exit bad}' "$entries_file"
 }
 
-write_camouflage_site() {
+write_camouflage_site() (
     mkdir -p "$WWW_DIR"
     install_pkg unzip
     install_pkg curl
 
-    local version="${IT_TOOLS_VERSION:-latest}"
+    local version="${IT_TOOLS_VERSION:-latest}" repo="${IT_TOOLS_REPO:-CorentinTh/it-tools}"
     local api_url asset_url="" asset_digest="" asset_meta="" tmp_dir zip_path tag extract_root
     local staged_site old_site expected_digest actual_digest configured_digest download_ok=0 attempt
     tmp_dir=$(mktemp -d)
-    # RETURN traps are process-global. Clear this one while tmp_dir is still in
-    # scope so later function returns cannot expand an unset local under set -u.
-    trap 'trap - RETURN; rm -rf -- "${tmp_dir:-}"' RETURN
+    trap 'rm -rf -- "${tmp_dir:-}"' EXIT
 
     info "Installing camouflage site: IT-Tools (${version})..."
 
     if [ "$version" = "latest" ]; then
-        api_url="https://api.github.com/repos/${IT_TOOLS_REPO}/releases/latest"
+        api_url="https://api.github.com/repos/${repo}/releases/latest"
     else
         # accept v2024... or 2024...
         case "$version" in
             v*) tag="$version" ;;
             *) tag="v${version}" ;;
         esac
-        api_url="https://api.github.com/repos/${IT_TOOLS_REPO}/releases/tags/${tag}"
+        api_url="https://api.github.com/repos/${repo}/releases/tags/${tag}"
     fi
 
     if ! check_cmd unzip; then
         warn "unzip not available; using built-in fallback tools page"
         camouflage_fallback_or_keep
-        return 0  # RETURN trap removes tmp_dir
+        return 0  # The subshell EXIT trap removes tmp_dir
     fi
 
     # Resolve one release asset and its GitHub-provided digest together.
@@ -93,7 +91,7 @@ except Exception:
     if [ -z "$asset_url" ]; then
         warn "IT-Tools release URL unavailable"
         camouflage_fallback_or_keep
-        return 0  # RETURN trap removes tmp_dir
+        return 0  # The subshell EXIT trap removes tmp_dir
     fi
 
     configured_digest=${IT_TOOLS_SHA256:-}
@@ -123,7 +121,7 @@ except Exception:
     if [ "$download_ok" != "1" ]; then
         warn "Failed to download IT-Tools zip; using built-in fallback tools page"
         camouflage_fallback_or_keep
-        return 0  # RETURN trap removes tmp_dir
+        return 0  # The subshell EXIT trap removes tmp_dir
     fi
 
     if printf '%s' "$asset_digest" | grep -Eq '^sha256:[0-9a-fA-F]{64}$'; then
@@ -132,7 +130,7 @@ except Exception:
         if [ "$actual_digest" != "$expected_digest" ]; then
             warn "IT-Tools SHA256 mismatch; refusing the downloaded archive"
             camouflage_fallback_or_keep
-            trap - RETURN
+            trap - EXIT
             rm -rf "$tmp_dir"
             return 0
         fi
@@ -144,14 +142,14 @@ except Exception:
         || ! zip_entries_are_safe "${tmp_dir}/entries.txt"; then
         warn "IT-Tools archive contains unsafe paths"
         camouflage_fallback_or_keep
-        return 0  # RETURN trap removes tmp_dir
+        return 0  # The subshell EXIT trap removes tmp_dir
     fi
 
     mkdir -p "${tmp_dir}/extract"
     if ! unzip -q "$zip_path" -d "${tmp_dir}/extract"; then
         warn "Failed to unzip IT-Tools; using built-in fallback tools page"
         camouflage_fallback_or_keep
-        return 0  # RETURN trap removes tmp_dir
+        return 0  # The subshell EXIT trap removes tmp_dir
     fi
 
     # Zip may be flat (index.html at root) or nested in one folder
@@ -165,7 +163,7 @@ except Exception:
     if [ -z "${extract_root:-}" ] || [ ! -f "${extract_root}/index.html" ]; then
         warn "IT-Tools archive layout unexpected; using fallback tools page"
         camouflage_fallback_or_keep
-        return 0  # RETURN trap removes tmp_dir
+        return 0  # The subshell EXIT trap removes tmp_dir
     fi
 
     staged_site="${CADDY_DIR}/.www.new.$$"
@@ -175,7 +173,7 @@ except Exception:
     cp -a "${extract_root}/." "$staged_site/"
     # Attribution for operators
     cat > "${staged_site}/.it-tools-source.txt" <<EOF
-source=https://github.com/${IT_TOOLS_REPO}
+source=https://github.com/${repo}
 tag=${tag:-$version}
 license=GPL-3.0
 homepage=https://it-tools.tech
@@ -194,8 +192,8 @@ EOF
     fi
     rm -rf "$old_site"
     ok "IT-Tools site installed to ${WWW_DIR} (${tag:-$version})"
-    # RETURN trap removes tmp_dir
-}
+    # The subshell EXIT trap removes tmp_dir without affecting the caller.
+)
 
 # Minimal offline SPA if GitHub download fails (still looks like a real tools site)
 write_camouflage_fallback() {

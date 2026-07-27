@@ -196,8 +196,8 @@ done
   || fail "shared account-tools dependency should only be installed once"
 pass "install preflight covers required Debian/RHEL package mappings"
 
-# ---------- camouflage RETURN trap must be one-shot ----------
-info "camouflage cleanup RETURN trap"
+# ---------- camouflage cleanup must be isolated from the caller ----------
+info "camouflage temporary-directory cleanup"
 camo_test_root=$(mktemp -d)
 if ! bash -c '
   set -euo pipefail
@@ -206,7 +206,9 @@ if ! bash -c '
   WWW_DIR="${test_root}/www"
   CADDY_DIR=$test_root
   IT_TOOLS_VERSION=latest
+  unset IT_TOOLS_REPO
   info() { :; }
+  ok() { :; }
   warn() { :; }
   check_cmd() { [ "$1" != unzip ]; }
   install_pkg() { :; }
@@ -215,11 +217,12 @@ if ! bash -c '
   write_camouflage_site
   [ ! -e "$mock_tmp" ]
   [ -z "$(trap -p RETURN)" ]
+  [ -z "$(trap -p EXIT)" ]
   post_cleanup_probe() { :; }
   post_cleanup_probe
 ' _ "$camo_test_root"; then
   rm -rf "$camo_test_root"
-  fail "write_camouflage_site leaked a RETURN trap referencing local tmp_dir"
+  fail "write_camouflage_site cleanup failed or leaked a trap into its caller"
 fi
 rm -rf "$camo_test_root"
 pass "camouflage cleanup is one-shot and nounset-safe"
