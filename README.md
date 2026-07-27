@@ -32,6 +32,10 @@
 | 系统 | systemd Linux；包管理器为 `apt`、`dnf` 或 `yum` |
 | 架构 | `x86_64/amd64` 或 `aarch64/arm64` |
 
+安装脚本会预检并自动安装缺失的运行依赖，包括 `curl`、`tar`、`unzip`、
+`openssl`、`file`、`iproute` 工具、系统用户管理工具和 CA 证书。
+Hub 所需的 `python3 >= 3.8` 会在启用 Hub 时按需安装。
+
 放行端口示例（按实际防火墙选择一种）：
 
 ```bash

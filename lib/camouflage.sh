@@ -29,22 +29,16 @@ zip_entries_are_safe() {
 
 write_camouflage_site() {
     mkdir -p "$WWW_DIR"
-    if ! check_cmd unzip; then
-        info "Installing unzip (needed for IT-Tools package)..."
-        if check_cmd dnf; then dnf install -y unzip &>/dev/null || true
-        elif check_cmd yum; then yum install -y unzip &>/dev/null || true
-        elif check_cmd apt-get; then
-            apt-get update -qq &>/dev/null || true
-            apt-get install -y unzip &>/dev/null || true
-        fi
-    fi
-    check_cmd curl || install_pkg curl
+    install_pkg unzip
+    install_pkg curl
 
     local version="${IT_TOOLS_VERSION:-latest}"
     local api_url asset_url="" asset_digest="" asset_meta="" tmp_dir zip_path tag extract_root
     local staged_site old_site expected_digest actual_digest configured_digest download_ok=0 attempt
     tmp_dir=$(mktemp -d)
-    trap 'rm -rf "$tmp_dir"' RETURN
+    # RETURN traps are process-global. Clear this one while tmp_dir is still in
+    # scope so later function returns cannot expand an unset local under set -u.
+    trap 'trap - RETURN; rm -rf -- "${tmp_dir:-}"' RETURN
 
     info "Installing camouflage site: IT-Tools (${version})..."
 

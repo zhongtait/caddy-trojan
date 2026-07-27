@@ -164,6 +164,66 @@ if echo "$share_link" | grep -qE 'alpn=h2(%2[Cc]|,)'; then
 fi
 pass "pinned camouflage URL and archive paths; WebSocket ALPN=http/1.1"
 
+# ---------- install dependency package mapping ----------
+info "install dependency package mapping"
+dependency_calls=$(bash -c '
+  set -euo pipefail
+  . lib/common.sh
+  installed="systemctl"
+  info() { :; }
+  check_cmd() {
+    case " $installed " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+  }
+  install_os_package() {
+    printf "%s|%s\n" "$1" "$2"
+    case "$1" in
+      iproute2) installed="$installed ip ss" ;;
+      passwd) installed="$installed useradd groupadd" ;;
+      *) installed="$installed $1" ;;
+    esac
+  }
+  ensure_install_dependencies
+') || fail "dependency preflight failed under mocked package installation"
+for mapping in \
+  'curl|curl' 'tar|tar' 'unzip|unzip' 'openssl|openssl' 'file|file' \
+  'iproute2|iproute' 'passwd|shadow-utils'; do
+  echo "$dependency_calls" | grep -qxF "$mapping" \
+    || fail "dependency preflight missed package mapping: $mapping"
+done
+[ "$(echo "$dependency_calls" | grep -cxF 'iproute2|iproute')" -eq 1 ] \
+  || fail "shared iproute dependency should only be installed once"
+[ "$(echo "$dependency_calls" | grep -cxF 'passwd|shadow-utils')" -eq 1 ] \
+  || fail "shared account-tools dependency should only be installed once"
+pass "install preflight covers required Debian/RHEL package mappings"
+
+# ---------- camouflage RETURN trap must be one-shot ----------
+info "camouflage cleanup RETURN trap"
+camo_test_root=$(mktemp -d)
+if ! bash -c '
+  set -euo pipefail
+  test_root=$1
+  mock_tmp="${test_root}/download"
+  WWW_DIR="${test_root}/www"
+  CADDY_DIR=$test_root
+  IT_TOOLS_VERSION=latest
+  info() { :; }
+  warn() { :; }
+  check_cmd() { [ "$1" != unzip ]; }
+  install_pkg() { :; }
+  mktemp() { mkdir -p "$mock_tmp"; printf "%s" "$mock_tmp"; }
+  . lib/camouflage.sh
+  write_camouflage_site
+  [ ! -e "$mock_tmp" ]
+  [ -z "$(trap -p RETURN)" ]
+  post_cleanup_probe() { :; }
+  post_cleanup_probe
+' _ "$camo_test_root"; then
+  rm -rf "$camo_test_root"
+  fail "write_camouflage_site leaked a RETURN trap referencing local tmp_dir"
+fi
+rm -rf "$camo_test_root"
+pass "camouflage cleanup is one-shot and nounset-safe"
+
 info "BBR install helper"
 bbr_test_file=$(mktemp)
 if ! BBR_SYSCTL_FILE="$bbr_test_file" bash -c '
