@@ -179,9 +179,6 @@ generate_caddyfile() {
     order trojan before handle
     https_port 443
     servers :443 {
-        listener_wrappers {
-            trojan
-        }
         # Browsers may use h2; Trojan WebSocket clients must offer http/1.1 only.
         protocols h2 h1
     }
@@ -277,9 +274,41 @@ detect_share_transport() {
     fi
 }
 
+caddyfile_has_trojan_listener_wrapper() {
+    local file="$1"
+    [ -f "$file" ] || return 1
+    awk '
+        /^[[:space:]]*listener_wrappers[[:space:]]*\{/ { in_wrappers = 1 }
+        in_wrappers && /(^|[[:space:]{])trojan([[:space:]}]|$)/ { found = 1 }
+        in_wrappers && /}/ { in_wrappers = 0 }
+        END { exit(found ? 0 : 1) }
+    ' "$file"
+}
+
 reload_caddy() {
+    local legacy_wrapper_removed=0
+    if caddyfile_has_trojan_listener_wrapper "${CADDYFILE}.bak" \
+        && ! caddyfile_has_trojan_listener_wrapper "$CADDYFILE"; then
+        legacy_wrapper_removed=1
+    fi
     if ! systemctl is-active --quiet caddy 2>/dev/null; then
         return 0
+    fi
+    if [ "$legacy_wrapper_removed" -eq 1 ]; then
+        # Reload can retain the old listener under Caddy's eternal grace period.
+        # A full process restart is required to stop intercepting ordinary TLS.
+        info "Restarting Caddy to retire the legacy Trojan listener wrapper..."
+        if systemctl restart caddy.service 2>/dev/null && wait_for_admin_api; then
+            return 0
+        fi
+        warn "Caddy restart failed after removing the legacy listener wrapper; restoring the previous configuration..."
+        if [ -f "${CADDYFILE}.bak" ]; then
+            cp -p "${CADDYFILE}.bak" "$CADDYFILE"
+            chown root:caddy "$CADDYFILE" 2>/dev/null || true
+            chmod 640 "$CADDYFILE"
+            systemctl restart caddy.service 2>/dev/null || true
+        fi
+        return 1
     fi
     if systemctl reload caddy.service 2>/dev/null; then
         return 0

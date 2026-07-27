@@ -156,19 +156,59 @@ json_escape() {
     printf '%s' "$s"
 }
 
-install_pkg() {
-    local pkg="$1"
-    check_cmd "$pkg" && return 0
-    info "Installing $pkg..."
+install_os_package() {
+    local apt_pkg="$1" rpm_pkg="${2:-$1}"
     if check_cmd dnf; then
-        dnf install -y "$pkg" &>/dev/null || error "Failed to install $pkg via dnf"
+        dnf install -y "$rpm_pkg" &>/dev/null \
+            || error "Failed to install $rpm_pkg via dnf"
     elif check_cmd yum; then
-        yum install -y "$pkg" &>/dev/null || error "Failed to install $pkg via yum"
+        yum install -y "$rpm_pkg" &>/dev/null \
+            || error "Failed to install $rpm_pkg via yum"
     elif check_cmd apt-get; then
-        apt-get update -qq &>/dev/null || true
-        apt-get install -y "$pkg" &>/dev/null || error "Failed to install $pkg via apt-get"
+        if [ "${EASYTROJAN_APT_UPDATED:-0}" != "1" ]; then
+            apt-get update -qq &>/dev/null || true
+            EASYTROJAN_APT_UPDATED=1
+        fi
+        apt-get install -y "$apt_pkg" &>/dev/null \
+            || error "Failed to install $apt_pkg via apt-get"
     else
-        error "Unable to install $pkg: no supported package manager found"
+        error "Unable to install packages: no supported package manager found"
+    fi
+}
+
+install_pkg() {
+    local command_name="$1" apt_pkg="${2:-$1}" rpm_pkg="${3:-${2:-$1}}"
+    check_cmd "$command_name" && return 0
+    info "Installing dependency: $command_name..."
+    install_os_package "$apt_pkg" "$rpm_pkg"
+    check_cmd "$command_name" \
+        || error "Installed package for $command_name, but the command is still unavailable"
+}
+
+ensure_install_dependencies() {
+    check_cmd systemctl \
+        || error "systemd is required, but systemctl is unavailable"
+
+    # Network, archive, TLS, binary validation and camouflage-site tools.
+    install_pkg curl
+    install_pkg tar
+    install_pkg unzip
+    install_pkg openssl
+    install_pkg file
+
+    # ip and ss share one package, whose name differs by distribution family.
+    install_pkg ip iproute2 iproute
+    install_pkg ss iproute2 iproute
+
+    # Creating the dedicated caddy account requires these commands.
+    install_pkg useradd passwd shadow-utils
+    install_pkg groupadd passwd shadow-utils
+
+    # HTTPS downloads need a system trust store even when curl already exists.
+    if [ ! -r /etc/ssl/certs/ca-certificates.crt ] \
+        && [ ! -r /etc/pki/tls/certs/ca-bundle.crt ]; then
+        info "Installing dependency: CA certificates..."
+        install_os_package ca-certificates ca-certificates
     fi
 }
 

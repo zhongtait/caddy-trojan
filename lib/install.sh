@@ -4,6 +4,7 @@
 
 do_install() {
     require_root
+    ensure_install_dependencies
     if [ -f "$CADDYFILE" ] && ! grep -qF '# Managed by EasyTrojan' "$CADDYFILE" 2>/dev/null; then
         if [ ! -f "$DOMAIN_FILE" ] || [ ! -f "$PASSWD_FILE" ]; then
             error "Existing Caddy configuration detected at $CADDYFILE. Back it up or remove it before installing EasyTrojan."
@@ -15,9 +16,6 @@ do_install() {
         error "Existing Caddy systemd unit detected. Refusing to overwrite it."
     fi
     prompt_password
-    install_pkg tar
-    install_pkg curl
-
     local check_port=""
     if check_cmd ss; then
         check_port=$(ss -Hlnp 'sport = :80 or sport = :443' 2>/dev/null | grep -v caddy || true)

@@ -164,6 +164,148 @@ if echo "$share_link" | grep -qE 'alpn=h2(%2[Cc]|,)'; then
 fi
 pass "pinned camouflage URL and archive paths; WebSocket ALPN=http/1.1"
 
+# ---------- install dependency package mapping ----------
+info "install dependency package mapping"
+dependency_calls=$(bash -c '
+  set -euo pipefail
+  . lib/common.sh
+  installed="systemctl"
+  info() { :; }
+  check_cmd() {
+    case " $installed " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+  }
+  install_os_package() {
+    printf "%s|%s\n" "$1" "$2"
+    case "$1" in
+      iproute2) installed="$installed ip ss" ;;
+      passwd) installed="$installed useradd groupadd" ;;
+      *) installed="$installed $1" ;;
+    esac
+  }
+  ensure_install_dependencies
+') || fail "dependency preflight failed under mocked package installation"
+for mapping in \
+  'curl|curl' 'tar|tar' 'unzip|unzip' 'openssl|openssl' 'file|file' \
+  'iproute2|iproute' 'passwd|shadow-utils'; do
+  echo "$dependency_calls" | grep -qxF "$mapping" \
+    || fail "dependency preflight missed package mapping: $mapping"
+done
+[ "$(echo "$dependency_calls" | grep -cxF 'iproute2|iproute')" -eq 1 ] \
+  || fail "shared iproute dependency should only be installed once"
+[ "$(echo "$dependency_calls" | grep -cxF 'passwd|shadow-utils')" -eq 1 ] \
+  || fail "shared account-tools dependency should only be installed once"
+pass "install preflight covers required Debian/RHEL package mappings"
+
+# ---------- camouflage cleanup must be isolated from the caller ----------
+info "camouflage temporary-directory cleanup"
+camo_test_root=$(mktemp -d)
+if ! bash -c '
+  set -euo pipefail
+  test_root=$1
+  mock_tmp="${test_root}/download"
+  WWW_DIR="${test_root}/www"
+  CADDY_DIR=$test_root
+  IT_TOOLS_VERSION=latest
+  unset IT_TOOLS_REPO
+  info() { :; }
+  ok() { :; }
+  warn() { :; }
+  check_cmd() { [ "$1" != unzip ]; }
+  install_pkg() { :; }
+  mktemp() { mkdir -p "$mock_tmp"; printf "%s" "$mock_tmp"; }
+  . lib/camouflage.sh
+  write_camouflage_site
+  [ ! -e "$mock_tmp" ]
+  [ -z "$(trap -p RETURN)" ]
+  [ -z "$(trap -p EXIT)" ]
+  post_cleanup_probe() { :; }
+  post_cleanup_probe
+' _ "$camo_test_root"; then
+  rm -rf "$camo_test_root"
+  fail "write_camouflage_site cleanup failed or leaked a trap into its caller"
+fi
+rm -rf "$camo_test_root"
+pass "camouflage cleanup is one-shot and nounset-safe"
+
+# ---------- generated Caddyfile must use WS handler, not raw listener ----------
+info "Caddyfile WebSocket-only listener configuration"
+caddy_test_root=$(mktemp -d)
+mkdir -p "${caddy_test_root}/bin" "${caddy_test_root}/www" "${caddy_test_root}/trojan"
+cat > "${caddy_test_root}/bin/caddy" <<'EOF'
+#!/usr/bin/env bash
+[ "${1:-}" = validate ]
+EOF
+chmod +x "${caddy_test_root}/bin/caddy"
+if ! bash -c '
+  set -euo pipefail
+  test_root=$1
+  CADDY_DIR=$test_root
+  CADDYFILE="${test_root}/Caddyfile"
+  CADDY_BIN="${test_root}/bin/caddy"
+  WWW_DIR="${test_root}/www"
+  TROJAN_DIR="${test_root}/trojan"
+  PASSWD_FILE="${TROJAN_DIR}/passwd.txt"
+  DOMAIN_FILE="${TROJAN_DIR}/domain.txt"
+  MANAGED_MARKER="${CADDY_DIR}/.easytrojan-managed"
+  HUB_LISTEN=127.0.0.1:2099
+  printf "%s\n" secret-pass > "$PASSWD_FILE"
+  chown() { :; }
+  error() { printf "%s\n" "$*" >&2; exit 1; }
+  info() { :; }
+  warn() { :; }
+  hub_enabled() { return 1; }
+  tls_directive_line() { :; }
+  . lib/caddy.sh
+  generate_caddyfile example.com
+  grep -q "^[[:space:]]*websocket$" "$CADDYFILE"
+  ! grep -q "listener_wrappers" "$CADDYFILE"
+' _ "$caddy_test_root"; then
+  rm -rf "$caddy_test_root"
+  fail "generated Caddyfile enabled a raw listener or omitted the WebSocket handler"
+fi
+
+cat > "${caddy_test_root}/Caddyfile.bak" <<'EOF'
+{
+    servers :443 {
+        listener_wrappers {
+            trojan
+        }
+    }
+}
+EOF
+cat > "${caddy_test_root}/Caddyfile" <<'EOF'
+{
+    servers :443 {
+        protocols h2 h1
+    }
+}
+EOF
+if ! bash -c '
+  set -euo pipefail
+  test_root=$1
+  CADDYFILE="${test_root}/Caddyfile"
+  CADDY_BIN="${test_root}/bin/caddy"
+  calls="${test_root}/systemctl.calls"
+  info() { :; }
+  warn() { :; }
+  chown() { :; }
+  systemctl() {
+    printf "%s\n" "$*" >> "$calls"
+    return 0
+  }
+  . lib/caddy.sh
+  wait_for_admin_api() { return 0; }
+  reload_caddy
+  grep -qx "is-active --quiet caddy" "$calls"
+  grep -qx "restart caddy.service" "$calls"
+  ! grep -q "^reload " "$calls"
+' _ "$caddy_test_root"; then
+  rm -rf "$caddy_test_root"
+  fail "legacy Trojan listener removal did not force a full Caddy restart"
+fi
+rm -rf "$caddy_test_root"
+pass "generated Caddyfile is WS-only; legacy listener migration forces restart"
+
 info "BBR install helper"
 bbr_test_file=$(mktemp)
 if ! BBR_SYSCTL_FILE="$bbr_test_file" bash -c '
