@@ -116,8 +116,11 @@ do_update() {
             [ -f "$entry_stage" ] || { rm -rf "$update_stage"; error "EasyTrojan bundle is incomplete"; }
             chmod +x "$entry_stage"
             dest="$SCRIPT_BIN"
-            if [ -f "$0" ] && [ -w "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" ] 2>/dev/null; then
-                dest=$(readlink -f "$0" 2>/dev/null || echo "$SCRIPT_BIN")
+            local entry_real entry_dir
+            entry_real=$(readlink -f "$0" 2>/dev/null || echo "$0")
+            entry_dir=$(dirname "$entry_real")
+            if [ -f "$0" ] && [ -w "$entry_dir" ]; then
+                dest="$entry_real"
             fi
             local _m
             local _mods=("${EASYTROJAN_LIB_MODULES[@]}")
@@ -183,6 +186,9 @@ do_update() {
         write_caddy_unit
         systemctl daemon-reload 2>/dev/null || true
         unit_refresh=1
+        # Refresh BBR + proxy network tuning so existing nodes pick up newer
+        # defaults without a full reinstall.
+        enable_bbr || true
     fi
     old_version=$("$CADDY_BIN" version 2>/dev/null | awk '{print $1}' || echo "not-installed")
     info "Current Caddy version: $old_version"
@@ -355,6 +361,7 @@ do_status() {
                 ;;
             --port)
                 [ -n "${2:-}" ] || error "--port requires a value"
+                validate_port "$2"
                 server_port="$2"
                 shift 2
                 ;;
@@ -400,10 +407,12 @@ EOF
     domain=$(read_installed_domain 2>/dev/null || true)
     [ -n "$domain" ] && echo -e "  Domain : ${CYAN}${domain}${NC}"
     echo -e "  ALPN   : ${CYAN}http/1.1 only${NC}  ${YELLOW}(WebSocket client)${NC}"
-    echo -e "  TLS    : ${CYAN}$(read_tls_mode)${NC}"
+    local tls_mode
+    tls_mode=$(read_tls_mode)
+    echo -e "  TLS    : ${CYAN}${tls_mode}${NC}"
 
     local cert_file="" expiry=""
-    if [ "$(read_tls_mode)" = "origin" ]; then
+    if [ "$tls_mode" = "origin" ]; then
         cert_file=$(read_tls_cert_path)
         if [ -f "$cert_file" ]; then
             if check_cmd openssl; then
@@ -448,10 +457,8 @@ EOF
     fi
 
     if [ "$show_link" = "1" ] && [ -f "$PASSWD_FILE" ] && [ -n "$domain" ]; then
-        local passwd transport="ws"
-        if [ -f "$CADDYFILE" ] && ! grep -q "websocket" "$CADDYFILE" 2>/dev/null; then
-            transport="tcp"
-        fi
+        local passwd transport
+        transport=$(detect_share_transport)
         if [ -n "$server_addr" ]; then
             echo -e "  Server : ${CYAN}${server_addr}${NC}:${server_port}  (SNI/Host: ${domain})"
         fi
@@ -480,6 +487,7 @@ do_link() {
                 ;;
             --port)
                 [ -n "${2:-}" ] || error "--port requires a value"
+                validate_port "$2"
                 server_port="$2"
                 shift 2
                 ;;
@@ -510,13 +518,11 @@ EOF
         esac
     done
 
-    local domain transport="ws" passwd
+    local domain transport passwd
     domain=$(read_installed_domain 2>/dev/null || true)
     [ -n "$domain" ] || error "Domain not found. Install first: easytrojan install --domain example.com"
     [ -f "$PASSWD_FILE" ] || error "No passwords in $PASSWD_FILE"
-    if [ -f "$CADDYFILE" ] && ! grep -q "websocket" "$CADDYFILE" 2>/dev/null; then
-        transport="tcp"
-    fi
+    transport=$(detect_share_transport)
 
     local found=0
     while IFS= read -r passwd || [ -n "$passwd" ]; do

@@ -20,6 +20,11 @@
 # Based on: https://github.com/imgk/caddy-trojan
 # Project:  https://github.com/zhongtait/caddy-trojan
 
+# This file defines the shared config constants and entry-point variables that
+# the dynamically-sourced lib/*.sh modules consume; shellcheck cannot follow that
+# indirection, so its "unused variable" check is a false positive here.
+# shellcheck disable=SC2034
+
 set -euo pipefail
 
 REPO_OWNER="zhongtait"
@@ -119,7 +124,8 @@ _easytrojan_is_installed_entry() {
 }
 
 _easytrojan_fetch_repository_snapshot() {
-    local stage="$1" repo_meta="${stage}/repo.json" archive="${stage}/repository.tar.gz"
+    local stage="$1"
+    local repo_meta="${stage}/repo.json" archive="${stage}/repository.tar.gz"
     local repo_ref="" archive_ref="refs/heads/main" source_label="main branch"
 
     mkdir -p "$stage"

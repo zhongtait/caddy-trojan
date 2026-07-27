@@ -62,9 +62,7 @@ write_camouflage_site() {
     if ! check_cmd unzip; then
         warn "unzip not available; using built-in fallback tools page"
         camouflage_fallback_or_keep
-        trap - RETURN
-        rm -rf "$tmp_dir"
-        return 0
+        return 0  # RETURN trap removes tmp_dir
     fi
 
     # Resolve one release asset and its GitHub-provided digest together.
@@ -101,9 +99,7 @@ except Exception:
     if [ -z "$asset_url" ]; then
         warn "IT-Tools release URL unavailable"
         camouflage_fallback_or_keep
-        trap - RETURN
-        rm -rf "$tmp_dir"
-        return 0
+        return 0  # RETURN trap removes tmp_dir
     fi
 
     configured_digest=${IT_TOOLS_SHA256:-}
@@ -133,9 +129,7 @@ except Exception:
     if [ "$download_ok" != "1" ]; then
         warn "Failed to download IT-Tools zip; using built-in fallback tools page"
         camouflage_fallback_or_keep
-        trap - RETURN
-        rm -rf "$tmp_dir"
-        return 0
+        return 0  # RETURN trap removes tmp_dir
     fi
 
     if printf '%s' "$asset_digest" | grep -Eq '^sha256:[0-9a-fA-F]{64}$'; then
@@ -156,18 +150,14 @@ except Exception:
         || ! zip_entries_are_safe "${tmp_dir}/entries.txt"; then
         warn "IT-Tools archive contains unsafe paths"
         camouflage_fallback_or_keep
-        trap - RETURN
-        rm -rf "$tmp_dir"
-        return 0
+        return 0  # RETURN trap removes tmp_dir
     fi
 
     mkdir -p "${tmp_dir}/extract"
     if ! unzip -q "$zip_path" -d "${tmp_dir}/extract"; then
         warn "Failed to unzip IT-Tools; using built-in fallback tools page"
         camouflage_fallback_or_keep
-        trap - RETURN
-        rm -rf "$tmp_dir"
-        return 0
+        return 0  # RETURN trap removes tmp_dir
     fi
 
     # Zip may be flat (index.html at root) or nested in one folder
@@ -181,9 +171,7 @@ except Exception:
     if [ -z "${extract_root:-}" ] || [ ! -f "${extract_root}/index.html" ]; then
         warn "IT-Tools archive layout unexpected; using fallback tools page"
         camouflage_fallback_or_keep
-        trap - RETURN
-        rm -rf "$tmp_dir"
-        return 0
+        return 0  # RETURN trap removes tmp_dir
     fi
 
     staged_site="${CADDY_DIR}/.www.new.$$"
@@ -212,8 +200,7 @@ EOF
     fi
     rm -rf "$old_site"
     ok "IT-Tools site installed to ${WWW_DIR} (${tag:-$version})"
-    trap - RETURN
-    rm -rf "$tmp_dir"
+    # RETURN trap removes tmp_dir
 }
 
 # Minimal offline SPA if GitHub download fails (still looks like a real tools site)

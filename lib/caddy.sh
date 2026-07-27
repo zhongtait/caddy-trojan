@@ -88,8 +88,8 @@ download_caddy() {
 }
 
 wait_for_admin_api() {
-    local i
-    for i in $(seq 1 15); do
+    local _
+    for _ in $(seq 1 15); do
         curl -sf "${ADMIN_API}/config/" &>/dev/null && return 0
         sleep 1
     done
@@ -250,7 +250,8 @@ delete_trojan_user_storage() {
     local passwd="$1" payload
     payload=$(printf '{"password":"%s"}' "$(json_escape "$passwd")")
     # imgk/caddy-trojan: DELETE /trojan/users/delete  body: {"password":"..."}
-    curl -sf -X DELETE -H "Content-Type: application/json" -d "$payload" "${ADMIN_API}/trojan/users/delete"
+    # Password goes through http_send_json's temp body file, never argv.
+    http_send_json DELETE "${ADMIN_API}/trojan/users/delete" "" "$payload" -sf
 }
 
 remove_password_from_file() {
@@ -263,6 +264,17 @@ remove_password_from_file() {
     mv -f "$tmp" "$PASSWD_FILE"
     chmod 640 "$PASSWD_FILE"
     chown root:caddy "$PASSWD_FILE" 2>/dev/null || true
+}
+
+# Echo the share/subscription transport: "tcp" when the Caddyfile has no
+# websocket directive, otherwise "ws". Centralizes a check duplicated across
+# status/link/hub call sites.
+detect_share_transport() {
+    if [ -f "$CADDYFILE" ] && ! grep -q "websocket" "$CADDYFILE" 2>/dev/null; then
+        printf 'tcp'
+    else
+        printf 'ws'
+    fi
 }
 
 reload_caddy() {
@@ -293,7 +305,8 @@ reload_caddy() {
 
 mask_secret() {
     local s="$1" n=${#1}
-    if [ "$n" -le 4 ]; then
+    # Fully mask short secrets; only reveal edges of clearly long ones.
+    if [ "$n" -le 8 ]; then
         printf '****'
     else
         printf '%s***%s' "${s:0:2}" "${s: -2}"

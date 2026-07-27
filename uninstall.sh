@@ -35,7 +35,7 @@ fi
 
 if [ "${1:-}" != "-y" ] && [ "${1:-}" != "--yes" ]; then
     read -rp "Are you sure you want to uninstall Caddy-Trojan? [y/N] " confirm
-    [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Cancelled."; exit 0; }
+    [[ "$confirm" =~ ^[Yy]([Ee][Ss])?$ ]] || { echo "Cancelled."; exit 0; }
 fi
 echo ""
 

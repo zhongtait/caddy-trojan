@@ -1,0 +1,10 @@
+# ShellCheck configuration for EasyTrojan.
+#
+# The lib/*.sh modules are sourced dynamically at runtime (see easytrojan_source)
+# and share globals/functions defined in easytrojan.sh. ShellCheck analyses each
+# file in isolation and cannot follow that indirection, so it reports shared
+# entry-point variables as "referenced but not assigned" (SC2154). That is a
+# false positive inherent to the module layout, so it is disabled project-wide.
+# Genuinely-unused local variables are still caught by SC2034, which stays on
+# (scoped disables live inline where shared globals are defined/assigned).
+disable=SC2154
