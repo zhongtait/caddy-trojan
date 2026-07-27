@@ -227,6 +227,85 @@ fi
 rm -rf "$camo_test_root"
 pass "camouflage cleanup is one-shot and nounset-safe"
 
+# ---------- generated Caddyfile must use WS handler, not raw listener ----------
+info "Caddyfile WebSocket-only listener configuration"
+caddy_test_root=$(mktemp -d)
+mkdir -p "${caddy_test_root}/bin" "${caddy_test_root}/www" "${caddy_test_root}/trojan"
+cat > "${caddy_test_root}/bin/caddy" <<'EOF'
+#!/usr/bin/env bash
+[ "${1:-}" = validate ]
+EOF
+chmod +x "${caddy_test_root}/bin/caddy"
+if ! bash -c '
+  set -euo pipefail
+  test_root=$1
+  CADDY_DIR=$test_root
+  CADDYFILE="${test_root}/Caddyfile"
+  CADDY_BIN="${test_root}/bin/caddy"
+  WWW_DIR="${test_root}/www"
+  TROJAN_DIR="${test_root}/trojan"
+  PASSWD_FILE="${TROJAN_DIR}/passwd.txt"
+  DOMAIN_FILE="${TROJAN_DIR}/domain.txt"
+  MANAGED_MARKER="${CADDY_DIR}/.easytrojan-managed"
+  HUB_LISTEN=127.0.0.1:2099
+  printf "%s\n" secret-pass > "$PASSWD_FILE"
+  chown() { :; }
+  error() { printf "%s\n" "$*" >&2; exit 1; }
+  info() { :; }
+  warn() { :; }
+  hub_enabled() { return 1; }
+  tls_directive_line() { :; }
+  . lib/caddy.sh
+  generate_caddyfile example.com
+  grep -q "^[[:space:]]*websocket$" "$CADDYFILE"
+  ! grep -q "listener_wrappers" "$CADDYFILE"
+' _ "$caddy_test_root"; then
+  rm -rf "$caddy_test_root"
+  fail "generated Caddyfile enabled a raw listener or omitted the WebSocket handler"
+fi
+
+cat > "${caddy_test_root}/Caddyfile.bak" <<'EOF'
+{
+    servers :443 {
+        listener_wrappers {
+            trojan
+        }
+    }
+}
+EOF
+cat > "${caddy_test_root}/Caddyfile" <<'EOF'
+{
+    servers :443 {
+        protocols h2 h1
+    }
+}
+EOF
+if ! bash -c '
+  set -euo pipefail
+  test_root=$1
+  CADDYFILE="${test_root}/Caddyfile"
+  CADDY_BIN="${test_root}/bin/caddy"
+  calls="${test_root}/systemctl.calls"
+  info() { :; }
+  warn() { :; }
+  chown() { :; }
+  systemctl() {
+    printf "%s\n" "$*" >> "$calls"
+    return 0
+  }
+  . lib/caddy.sh
+  wait_for_admin_api() { return 0; }
+  reload_caddy
+  grep -qx "is-active --quiet caddy" "$calls"
+  grep -qx "restart caddy.service" "$calls"
+  ! grep -q "^reload " "$calls"
+' _ "$caddy_test_root"; then
+  rm -rf "$caddy_test_root"
+  fail "legacy Trojan listener removal did not force a full Caddy restart"
+fi
+rm -rf "$caddy_test_root"
+pass "generated Caddyfile is WS-only; legacy listener migration forces restart"
+
 info "BBR install helper"
 bbr_test_file=$(mktemp)
 if ! BBR_SYSCTL_FILE="$bbr_test_file" bash -c '

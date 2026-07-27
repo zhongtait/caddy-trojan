@@ -50,6 +50,7 @@
 
 ### 修复
 
+- Caddy：Trojan-over-WebSocket 配置不再启用 raw `listener_wrappers { trojan }`，避免其在 TLS 前拦截普通 443 流量并造成间歇性空响应；从旧配置迁移时自动完整重启 Caddy，防止旧 listener 在 graceful reload 后继续存活。
 - Hub：`_save_json` 的磁盘 / 权限错误转为 `DataStoreError`（干净的 503）而非直接断连；负数 `Content-Length` 返回 400（原为 413）。
 - 命令行：`--port` 非数字即报错，避免注入非法 JSON；安装证书回滚分支在 `set -e` 下不再中途退出；`uninstall.sh` 接受 `yes`。
 - 安装：增加完整的运行依赖预检，按 Debian / RHEL 正确映射 `iproute2` / `iproute` 与 `passwd` / `shadow-utils`，并在安装后确认所需命令确实可用。

@@ -355,6 +355,12 @@ Cloudflare Origin 证书只用于 Cloudflare 到源站的连接，浏览器不�
 WebSocket Upgrade 使用 HTTP/1.1。分享链接和 Hub 订阅默认只设置
 `alpn=http/1.1`；不要添加或优先设置 `h2`，否则延迟测试和连接可能间歇失败。
 
+EasyTrojan 的节点传输为 Trojan-over-WebSocket，Caddyfile 不应配置
+`listener_wrappers { trojan }`。该 raw listener 会在 TLS 前拦截所有 443/TCP
+连接，可能导致伪装站和 WebSocket 间歇性空响应。`sudo easytrojan update` 会移除
+旧配置中的 wrapper，并完整重启一次 Caddy，确保旧 listener 不再因 graceful reload
+继续存活。
+
 ### 客户端连上后返回伪装站 HTML
 
 确认 Caddyfile 全局配置包含：

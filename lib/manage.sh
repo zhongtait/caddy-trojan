@@ -246,9 +246,9 @@ do_update() {
         generate_caddyfile "$domain"
         if systemctl is-active --quiet caddy 2>/dev/null; then
             if ! reload_caddy; then
-                warn "Caddy reload failed after Caddyfile regen; try: systemctl restart caddy"
+                warn "Caddy configuration apply failed after regeneration; inspect: journalctl -u caddy -n 50 --no-pager"
             else
-                ok "Caddyfile regenerated and reloaded"
+                ok "Caddyfile regenerated and applied"
             fi
         fi
     fi
