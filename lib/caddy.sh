@@ -145,10 +145,11 @@ generate_caddyfile() {
     mkdir -p "$CADDY_DIR" "$WWW_DIR" "$TROJAN_DIR"
     chown root:caddy "$CADDY_DIR" "$TROJAN_DIR" "$WWW_DIR" 2>/dev/null || true
     chmod 750 "$CADDY_DIR" "$TROJAN_DIR"
-    local users_block tls_line hub_proxy="" config_tmp
+    local users_block tls_line hub_proxy="" config_tmp outbound_ip
     users_block=$(build_users_directive)
     # NOTE: $(...) strips trailing newlines; keep ${tls_line} on its own line in the heredoc.
     tls_line=$(tls_directive_line "$site_domain")
+    outbound_ip=$(current_outbound_ip_priority)
     if hub_enabled; then
         # Sibling handle blocks are mutually exclusive. SPA try_files MUST live in its own
         # catch-all handle; otherwise it rewrites /sub/* and /api/* to index.html (browser 404).
@@ -187,7 +188,7 @@ generate_caddyfile() {
     }
     trojan {
         caddy
-        no_proxy
+        no_proxy ${outbound_ip}
 ${users_block}    }
 }
 :443, ${site_domain} {
@@ -236,6 +237,9 @@ EOF
     printf '%s\n' "$site_domain" > "$DOMAIN_FILE"
     chown root:caddy "$DOMAIN_FILE"
     chmod 640 "$DOMAIN_FILE"
+    printf '%s\n' "$outbound_ip" > "$OUTBOUND_IP_PRIORITY_FILE"
+    chown root:caddy "$OUTBOUND_IP_PRIORITY_FILE" 2>/dev/null || true
+    chmod 640 "$OUTBOUND_IP_PRIORITY_FILE"
     printf 'managed_by=easytrojan\nversion=1\n' > "$MANAGED_MARKER"
     chown root:caddy "$MANAGED_MARKER" 2>/dev/null || true
     chmod 640 "$MANAGED_MARKER"
