@@ -6,7 +6,7 @@
 
 ### 新增
 
-- 网络：安装时可选择 Trojan 出站 IPv4 或 IPv6，默认 IPv4；选择会持久化并显示在 status 中。
+- 网络：安装时可选择 Trojan 出站 IPv4 或 IPv6 优先级，默认 IPv4；另一地址族保持自动回退，选择会持久化并显示在 status 中。
 - 系统：默认随 BBR 一并应用并持久化 `tcp_slow_start_after_idle=0` 与 `tcp_notsent_lowat=16384`（长连接空闲后恢复满速、降低每连接内存）；安装与 `update` 均生效。
 - 系统：为 Caddy 服务设置软内存上限 `GOMEMLIMIT`（约 75% 内存），作为小内存 VPS 的 OOM 兜底；内存无法探测或过小时自动跳过。
 - 系统：安装时在内核支持的情况下启用并持久化 `fq` + BBR；更广泛的 sysctl / limits 调优保持可选。

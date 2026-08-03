@@ -55,8 +55,8 @@ Notes:
   - --server ADDR: share-link address for Cloudflare preferred IP (SNI/Host still use domain)
   - --port PORT: connect port for share links / subscription (default 443; CF HTTPS ports ok)
   - --tls-mode auto: Caddy ACME (default). origin: Cloudflare Origin / file certs
-  - --outbound-ip ipv4|ipv6: force Trojan outbound connections through the selected
-    address family (interactive installs ask; default: ipv4)
+  - --outbound-ip ipv4|ipv6: prefer this address family for Trojan outbound
+    connections, while retaining fallback to the other family (default: ipv4)
   - BBR + safe proxy network tuning (tcp_slow_start_after_idle, tcp_notsent_lowat)
     are enabled automatically when supported by the host kernel
   - --tune-system: opt in to additional global sysctl and security limit tuning

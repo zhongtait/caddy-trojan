@@ -1,8 +1,24 @@
 diff --git a/app/proxy.go b/app/proxy.go
-index d1844bb..d0d24ac 100644
+index d1844bb..e2a5ec9 100644
 --- a/app/proxy.go
 +++ b/app/proxy.go
-@@ -34,7 +34,21 @@ func init() {
+@@ -2,6 +2,7 @@ package app
+ 
+ import (
+ 	"bufio"
++	"context"
+ 	"encoding/base64"
+ 	"encoding/json"
+ 	"errors"
+@@ -10,6 +11,7 @@ import (
+ 	"net"
+ 	"net/http"
+ 	"sync"
++	"time"
+ 
+ 	"golang.org/x/net/proxy"
+ 
+@@ -34,7 +36,19 @@ func init() {
  	fn := ProxyParser(nil)
  
  	fn = func(args []string) (json.RawMessage, error) {
@@ -13,10 +29,8 @@ index d1844bb..d0d24ac 100644
 +		proxy := new(NoProxy)
 +		if len(args) == 1 {
 +			switch args[0] {
-+			case "ipv4":
-+				proxy.Network = "tcp4"
-+			case "ipv6":
-+				proxy.Network = "tcp6"
++			case "ipv4", "ipv6":
++				proxy.Network = args[0]
 +			default:
 +				return nil, fmt.Errorf("unsupported outbound IP family: %s", args[0])
 +			}
@@ -36,34 +50,121 @@ index d1844bb..d0d24ac 100644
  
  func (NoProxy) CaddyModule() caddy.ModuleInfo {
  	return caddy.ModuleInfo{
-@@ -108,12 +124,26 @@ func (*NoProxy) Close() error {
+@@ -108,14 +124,114 @@ func (*NoProxy) Close() error {
  	return nil
  }
  
 -func (*NoProxy) Dial(network, addr string) (net.Conn, error) {
 -	return net.Dial(network, addr)
 +func (p *NoProxy) Dial(network, addr string) (net.Conn, error) {
-+	return net.Dial(p.outboundNetwork(network), addr)
++	if p.Network == "" || (network != "tcp" && network != "udp") {
++		return net.Dial(network, addr)
++	}
++	host, port, err := net.SplitHostPort(addr)
++	if err != nil || net.ParseIP(host) != nil {
++		return net.Dial(network, addr)
++	}
++	ips, err := net.LookupIP(host)
++	if err != nil {
++		return nil, err
++	}
++	primary, fallback := p.prioritizedIPs(ips)
++	if network == "udp" {
++		if len(primary) == 0 {
++			primary = fallback
++		}
++		if len(primary) == 0 {
++			return nil, fmt.Errorf("no IP address found for %s", host)
++		}
++		return net.Dial(network, net.JoinHostPort(primary[0].String(), port))
++	}
++	return dialTCPPreferred(port, primary, fallback)
  }
  
 -func (*NoProxy) ListenPacket(network, addr string) (net.PacketConn, error) {
--	return net.ListenPacket(network, addr)
 +func (p *NoProxy) ListenPacket(network, addr string) (net.PacketConn, error) {
-+	return net.ListenPacket(p.outboundNetwork(network), addr)
-+}
-+
-+func (p *NoProxy) outboundNetwork(network string) string {
-+	if p.Network == "" {
-+		return network
-+	}
-+	switch network {
-+	case "tcp":
-+		return p.Network
-+	case "udp":
-+		return "udp" + p.Network[3:]
-+	default:
-+		return network
-+	}
+ 	return net.ListenPacket(network, addr)
  }
  
++func (p *NoProxy) prioritizedIPs(ips []net.IP) (primary, fallback []net.IP) {
++	for _, ip := range ips {
++		isV4 := ip.To4() != nil
++		if (p.Network == "ipv4" && isV4) || (p.Network == "ipv6" && !isV4) {
++			primary = append(primary, ip)
++		} else {
++			fallback = append(fallback, ip)
++		}
++	}
++	return primary, fallback
++}
++
++func dialTCPPreferred(port string, primary, fallback []net.IP) (net.Conn, error) {
++	type result struct {
++		conn net.Conn
++		err  error
++		ipv4 bool
++	}
++	if len(primary) == 0 {
++		primary, fallback = fallback, nil
++	}
++	if len(primary) == 0 {
++		return nil, errors.New("no IP address found")
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	results := make(chan result)
++	dial := func(ip net.IP, ipv4 bool) {
++		go func() {
++			conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", net.JoinHostPort(ip.String(), port))
++			got := result{conn: conn, err: err, ipv4: ipv4}
++			if ctx.Err() != nil {
++				if conn != nil {
++					conn.Close()
++				}
++				return
++			}
++			select {
++			case results <- got:
++			case <-ctx.Done():
++				if conn != nil {
++					conn.Close()
++				}
++			}
++		}()
++	}
++	dial(primary[0], primary[0].To4() != nil)
++	primaryNext, fallbackNext, pending := 1, 0, 1
++	timer := time.NewTimer(300 * time.Millisecond)
++	defer timer.Stop()
++	var lastErr error
++	for pending > 0 {
++		select {
++		case got := <-results:
++			pending--
++			if got.err == nil {
++				return got.conn, nil
++			}
++			lastErr = got.err
++			if got.ipv4 == (primary[0].To4() != nil) && primaryNext < len(primary) {
++				dial(primary[primaryNext], primary[primaryNext].To4() != nil)
++				primaryNext++
++				pending++
++			} else if fallbackNext < len(fallback) {
++				dial(fallback[fallbackNext], fallback[fallbackNext].To4() != nil)
++				fallbackNext++
++				pending++
++			}
++		case <-timer.C:
++			if fallbackNext < len(fallback) {
++				dial(fallback[fallbackNext], fallback[fallbackNext].To4() != nil)
++				fallbackNext++
++				pending++
++			}
++		}
++	}
++	return nil, lastErr
++}
++
  type noProxy struct {
+ 	NoProxy
+ }

@@ -92,9 +92,9 @@ sudo bash easytrojan.sh install --domain example.com --outbound-ip ipv4
 sudo bash easytrojan.sh install --domain example.com --outbound-ip ipv6
 ```
 
-选择 IPv6 时，服务器必须具备可用的 IPv6 出站路由；目标仅有另一种地址族时会
-连接失败。该选项控制的是 Trojan 代客户端访问目标网站时的出站连接，不影响域名
-解析、入站监听或证书申请。
+选择 IPv4 时会优先出站 IPv4；IPv4 不可用或目标仅有 AAAA 记录时会自动回退 IPv6。
+选择 IPv6 时则反向优先。该选项控制的是 Trojan 代客户端访问目标网站时的出站连接，
+不影响域名解析、入站监听或证书申请。
 
 ### Cloudflare 橙云
 
