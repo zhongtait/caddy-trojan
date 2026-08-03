@@ -7,7 +7,7 @@ usage() {
 EasyTrojan - One-click Caddy-Trojan installer
 
 Usage:
-  bash easytrojan.sh install --domain DOMAIN [--password PASSWORD] [--version VERSION] [--skip-domain-check]
+  bash easytrojan.sh install --domain DOMAIN [--password PASSWORD] [--version VERSION] [--outbound-ip ipv4|ipv6] [--skip-domain-check]
                              [--tls-mode auto|origin] [--origin-cert PATH] [--origin-key PATH] [--tune-system]
   bash easytrojan.sh update  [--version VERSION]
   bash easytrojan.sh renew [--force]
@@ -35,6 +35,7 @@ Legacy:
 Examples:
   bash easytrojan.sh install --domain example.com
   bash easytrojan.sh install --domain example.com --password 'strong_password'
+  bash easytrojan.sh install --domain example.com --outbound-ip ipv6
   bash easytrojan.sh install --domain example.com --tls-mode origin \
        --origin-cert /root/origin.pem --origin-key /root/origin.key --skip-domain-check
   bash easytrojan.sh cert origin --cert /root/origin.pem --key /root/origin.key
@@ -54,6 +55,8 @@ Notes:
   - --server ADDR: share-link address for Cloudflare preferred IP (SNI/Host still use domain)
   - --port PORT: connect port for share links / subscription (default 443; CF HTTPS ports ok)
   - --tls-mode auto: Caddy ACME (default). origin: Cloudflare Origin / file certs
+  - --outbound-ip ipv4|ipv6: force Trojan outbound connections through the selected
+    address family (interactive installs ask; default: ipv4)
   - BBR + safe proxy network tuning (tcp_slow_start_after_idle, tcp_notsent_lowat)
     are enabled automatically when supported by the host kernel
   - --tune-system: opt in to additional global sysctl and security limit tuning
@@ -86,6 +89,48 @@ is_ipv4() {
     # shellcheck disable=SC2086
     set -- $ip
     [ "$1" -le 255 ] && [ "$2" -le 255 ] && [ "$3" -le 255 ] && [ "$4" -le 255 ]
+}
+
+normalize_outbound_ip_priority() {
+    local value
+    value=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    case "$value" in
+        ipv4|4) printf 'ipv4' ;;
+        ipv6|6) printf 'ipv6' ;;
+        *) error "--outbound-ip must be ipv4 or ipv6 (got: $1)" ;;
+    esac
+}
+
+read_outbound_ip_priority() {
+    local value=""
+    if [ -f "$OUTBOUND_IP_PRIORITY_FILE" ]; then
+        value=$(head -1 "$OUTBOUND_IP_PRIORITY_FILE" 2>/dev/null || true)
+    fi
+    case "$value" in
+        ipv4|ipv6) printf '%s' "$value" ;;
+        *) printf 'ipv4' ;;
+    esac
+}
+
+current_outbound_ip_priority() {
+    if [ -n "${outbound_ip_priority:-}" ]; then
+        printf '%s' "$outbound_ip_priority"
+    else
+        read_outbound_ip_priority
+    fi
+}
+
+prompt_outbound_ip_priority() {
+    if [ -z "${outbound_ip_priority:-}" ] && [ -t 0 ]; then
+        local choice=""
+        read -rp "Trojan outbound IP family [1 IPv4 (default), 2 IPv6]: " choice
+        case "$choice" in
+            ""|1|4|ipv4|IPv4) outbound_ip_priority="ipv4" ;;
+            2|6|ipv6|IPv6) outbound_ip_priority="ipv6" ;;
+            *) error "Please choose 1 (IPv4) or 2 (IPv6)" ;;
+        esac
+    fi
+    outbound_ip_priority=$(normalize_outbound_ip_priority "${outbound_ip_priority:-ipv4}")
 }
 
 # Send an HTTP request with curl while keeping secrets out of argv (ps auxww).
@@ -271,6 +316,11 @@ parse_common_args() {
             --version)
                 [ -n "${2:-}" ] || error "--version requires a value"
                 release_version="$2"
+                shift 2
+                ;;
+            --outbound-ip|--ip-priority)
+                [ -n "${2:-}" ] || error "--outbound-ip requires ipv4 or ipv6"
+                outbound_ip_priority=$(normalize_outbound_ip_priority "$2")
                 shift 2
                 ;;
             --skip-domain-check)

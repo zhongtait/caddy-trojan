@@ -10,6 +10,7 @@
 
 - 支持 `amd64`、`arm64`，适用于使用 systemd 和 `apt`、`dnf` 或 `yum` 的 Linux
 - 支持 Trojan over WebSocket + TLS，SNI 和 WebSocket Host 固定为部署域名
+- 安装时可选择 Trojan 出站使用 IPv4 或 IPv6（默认 IPv4）
 - 支持 Caddy ACME 自动证书和 Cloudflare Origin 证书
 - 默认部署 [IT-Tools](https://github.com/CorentinTh/it-tools) 伪装站，下载失败时回退到内置页面
 - 支持多用户、分享链接、Cloudflare 优选 IP 和非 443 HTTPS 端口
@@ -82,6 +83,18 @@ sudo easytrojan status --show-link
 ```
 
 浏览器访问 `https://example.com` 应看到 IT-Tools 伪装站。
+
+安装过程中会询问 Trojan 的出站地址族；直接回车即强制使用 IPv4。需要非交互
+指定时使用：
+
+```bash
+sudo bash easytrojan.sh install --domain example.com --outbound-ip ipv4
+sudo bash easytrojan.sh install --domain example.com --outbound-ip ipv6
+```
+
+选择 IPv6 时，服务器必须具备可用的 IPv6 出站路由；目标仅有另一种地址族时会
+连接失败。该选项控制的是 Trojan 代客户端访问目标网站时的出站连接，不影响域名
+解析、入站监听或证书申请。
 
 ### Cloudflare 橙云
 

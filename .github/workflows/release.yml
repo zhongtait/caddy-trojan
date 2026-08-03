@@ -57,8 +57,11 @@ jobs:
             echo "Invalid upstream SHA: ${UPSTREAM_SHA:-<empty>}" >&2
             exit 1
           fi
-          echo "Building imgk/caddy-trojan at ${UPSTREAM_SHA}"
-          xcaddy build --with "github.com/imgk/caddy-trojan@${UPSTREAM_SHA}"
+          echo "Building imgk/caddy-trojan at ${UPSTREAM_SHA} with outbound IP-family support"
+          git clone --filter=blob:none https://github.com/imgk/caddy-trojan.git caddy-trojan
+          git -C caddy-trojan checkout --detach "${UPSTREAM_SHA}"
+          git -C caddy-trojan apply ../../patches/caddy-trojan-outbound-ip.patch
+          xcaddy build --with "github.com/imgk/caddy-trojan=./caddy-trojan"
           FILENAME="caddy_trojan_${{ matrix.os }}_${{ matrix.arch }}.tar.gz"
           tar -czvf "../${FILENAME}" caddy
 

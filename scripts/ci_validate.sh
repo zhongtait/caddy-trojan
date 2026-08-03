@@ -246,6 +246,7 @@ if ! bash -c '
   TROJAN_DIR="${test_root}/trojan"
   PASSWD_FILE="${TROJAN_DIR}/passwd.txt"
   DOMAIN_FILE="${TROJAN_DIR}/domain.txt"
+  OUTBOUND_IP_PRIORITY_FILE="${TROJAN_DIR}/outbound-ip-priority.txt"
   MANAGED_MARKER="${CADDY_DIR}/.easytrojan-managed"
   HUB_LISTEN=127.0.0.1:2099
   printf "%s\n" secret-pass > "$PASSWD_FILE"
@@ -254,10 +255,13 @@ if ! bash -c '
   info() { :; }
   warn() { :; }
   hub_enabled() { return 1; }
+  current_outbound_ip_priority() { printf ipv4; }
   tls_directive_line() { :; }
   . lib/caddy.sh
   generate_caddyfile example.com
   grep -q "^[[:space:]]*websocket$" "$CADDYFILE"
+  grep -q "^[[:space:]]*no_proxy ipv4$" "$CADDYFILE"
+  [ "$(cat "${TROJAN_DIR}/outbound-ip-priority.txt")" = ipv4 ]
   ! grep -q "listener_wrappers" "$CADDYFILE"
 ' _ "$caddy_test_root"; then
   rm -rf "$caddy_test_root"

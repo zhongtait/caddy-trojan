@@ -4,7 +4,7 @@
 # Supports: CentOS/RedHat 7+, Debian 9+, Ubuntu 16+
 #
 # Usage:
-#   bash easytrojan.sh install --domain DOMAIN [--password PASS] [--version VER] [--skip-domain-check]
+#   bash easytrojan.sh install --domain DOMAIN [--password PASS] [--version VER] [--outbound-ip ipv4|ipv6] [--skip-domain-check]
 #                            [--tls-mode auto|origin] [--origin-cert PATH] [--origin-key PATH]
 #                            [--tune-system]
 #   bash easytrojan.sh update  [--version VER]
@@ -42,6 +42,7 @@ CADDY_DATA_MARKER="${CADDY_DATA_DIR}/.easytrojan-managed"
 TROJAN_DIR="${CADDY_DIR}/trojan"
 PASSWD_FILE="${TROJAN_DIR}/passwd.txt"
 DOMAIN_FILE="${TROJAN_DIR}/domain.txt"
+OUTBOUND_IP_PRIORITY_FILE="${TROJAN_DIR}/outbound-ip-priority.txt"
 TLS_MODE_FILE="${TROJAN_DIR}/tls-mode.txt"
 TLS_CERT_FILE_REC="${TROJAN_DIR}/tls-cert.path"
 TLS_KEY_FILE_REC="${TROJAN_DIR}/tls-key.path"
@@ -304,6 +305,7 @@ tls_mode=""
 origin_cert_src=""
 origin_key_src=""
 tune_system="0"
+outbound_ip_priority=""
 
 cmd="${1:-}"
 case "$cmd" in

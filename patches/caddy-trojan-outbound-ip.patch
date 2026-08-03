@@ -1,0 +1,69 @@
+diff --git a/app/proxy.go b/app/proxy.go
+index d1844bb..d0d24ac 100644
+--- a/app/proxy.go
++++ b/app/proxy.go
+@@ -34,7 +34,21 @@ func init() {
+ 	fn := ProxyParser(nil)
+ 
+ 	fn = func(args []string) (json.RawMessage, error) {
+-		return caddyconfig.JSONModuleObject(new(NoProxy), "proxy", "none", nil), nil
++		if len(args) > 1 {
++			return nil, fmt.Errorf("no_proxy accepts at most one argument: ipv4 or ipv6")
++		}
++		proxy := new(NoProxy)
++		if len(args) == 1 {
++			switch args[0] {
++			case "ipv4":
++				proxy.Network = "tcp4"
++			case "ipv6":
++				proxy.Network = "tcp6"
++			default:
++				return nil, fmt.Errorf("unsupported outbound IP family: %s", args[0])
++			}
++		}
++		return caddyconfig.JSONModuleObject(proxy, "proxy", "none", nil), nil
+ 	}
+ 	RegisterProxyParser("none", fn)
+ 	RegisterProxyParser("no_proxy", fn)
+@@ -95,7 +109,9 @@ type Proxy interface {
+ 	trojan.Dialer
+ }
+ 
+-type NoProxy struct{}
++type NoProxy struct {
++	Network string `json:"network,omitempty"`
++}
+ 
+ func (NoProxy) CaddyModule() caddy.ModuleInfo {
+ 	return caddy.ModuleInfo{
+@@ -108,12 +124,26 @@ func (*NoProxy) Close() error {
+ 	return nil
+ }
+ 
+-func (*NoProxy) Dial(network, addr string) (net.Conn, error) {
+-	return net.Dial(network, addr)
++func (p *NoProxy) Dial(network, addr string) (net.Conn, error) {
++	return net.Dial(p.outboundNetwork(network), addr)
+ }
+ 
+-func (*NoProxy) ListenPacket(network, addr string) (net.PacketConn, error) {
+-	return net.ListenPacket(network, addr)
++func (p *NoProxy) ListenPacket(network, addr string) (net.PacketConn, error) {
++	return net.ListenPacket(p.outboundNetwork(network), addr)
++}
++
++func (p *NoProxy) outboundNetwork(network string) string {
++	if p.Network == "" {
++		return network
++	}
++	switch network {
++	case "tcp":
++		return p.Network
++	case "udp":
++		return "udp" + p.Network[3:]
++	default:
++		return network
++	}
+ }
+ 
+ type noProxy struct {

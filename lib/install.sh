@@ -32,6 +32,7 @@ do_install() {
     fi
 
     prompt_domain
+    prompt_outbound_ip_priority
 
     info "Detecting server IP..."
     local address_ip site_domain
@@ -203,6 +204,7 @@ do_install() {
     echo -e "${GREEN}║         EasyTrojan Installed Successfully!                  ║${NC}"
     echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${GREEN}║${NC}  Address  : ${CYAN}${site_domain}${NC}"
+    echo -e "${GREEN}║${NC}  Outbound : ${CYAN}${outbound_ip_priority}${NC}"
     echo -e "${GREEN}║${NC}  Port     : ${CYAN}443${NC}"
     echo -e "${GREEN}║${NC}  Password : ${CYAN}${trojan_passwd}${NC}"
     echo -e "${GREEN}║${NC}  ALPN     : ${CYAN}http/1.1 only${NC}  ${YELLOW}(WebSocket)${NC}"
