@@ -18,6 +18,81 @@ warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 ok()    { echo -e "${GREEN}[OK]${NC} $*"; }
 
+normalize_sysctl_value() {
+    printf '%s\n' "$1" | awk '{$1=$1; print}'
+}
+
+restore_easytrojan_sysctls() {
+    local backup_file="$1" key original managed extra current restored_value
+    local restored=0 preserved=0 failures=0 malformed=0
+
+    [ -f "$backup_file" ] || return 0
+    if ! command -v sysctl >/dev/null 2>&1; then
+        warn "Cannot restore sysctl values because sysctl is unavailable; preserving ${backup_file}"
+        return 1
+    fi
+
+    while IFS=$'\t' read -r key original managed extra || [ -n "${key:-}" ]; do
+        case "$key" in
+            ''|'#'*) continue ;;
+            net.core.default_qdisc|net.ipv4.tcp_congestion_control|\
+            net.core.somaxconn|net.core.rmem_max|net.core.wmem_max|\
+            net.ipv4.tcp_rmem|net.ipv4.tcp_wmem|net.ipv4.tcp_max_syn_backlog) ;;
+            *)
+                warn "Ignoring invalid sysctl backup key: ${key}"
+                malformed=1
+                continue
+                ;;
+        esac
+        if [ -z "$original" ] || [ -z "$managed" ] || [ -n "${extra:-}" ]; then
+            warn "Ignoring malformed sysctl backup record: ${key}"
+            malformed=1
+            continue
+        fi
+
+        original=$(normalize_sysctl_value "$original")
+        managed=$(normalize_sysctl_value "$managed")
+        current=$(sysctl -n "$key" 2>/dev/null) || {
+            warn "Cannot read current sysctl value during restore: ${key}"
+            failures=$((failures + 1))
+            continue
+        }
+        current=$(normalize_sysctl_value "$current")
+        if [ "$current" != "$managed" ]; then
+            warn "Preserving administrator-modified sysctl ${key}=${current} (EasyTrojan target was ${managed})"
+            preserved=$((preserved + 1))
+            continue
+        fi
+
+        if ! sysctl -w "${key}=${original}" >/dev/null 2>&1; then
+            warn "Failed to restore sysctl ${key}=${original}"
+            failures=$((failures + 1))
+            continue
+        fi
+        restored_value=$(sysctl -n "$key" 2>/dev/null || true)
+        restored_value=$(normalize_sysctl_value "$restored_value")
+        if [ "$restored_value" != "$original" ]; then
+            warn "sysctl ${key} restore verification failed (expected '${original}', got '${restored_value:-unavailable}')"
+            failures=$((failures + 1))
+            continue
+        fi
+        restored=$((restored + 1))
+    done < "$backup_file"
+
+    if [ "$failures" -ne 0 ] || [ "$malformed" -ne 0 ]; then
+        warn "Sysctl rollback was incomplete; preserving backup for manual recovery: ${backup_file}"
+        return 1
+    fi
+    rm -f "$backup_file"
+    ok "Sysctl rollback complete (${restored} restored, ${preserved} administrator-modified preserved)"
+}
+
+# Let offline tests exercise the rollback helper without running an uninstall.
+if [ "${EASYTROJAN_UNINSTALL_SOURCE_ONLY:-0}" = "1" ] \
+    && [ "${BASH_SOURCE[0]}" != "$0" ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 echo ""
 echo -e "${YELLOW}=== Caddy-Trojan Uninstaller ===${NC}"
 echo ""
@@ -58,6 +133,13 @@ if [ "$managed_caddy" = "1" ] && systemctl is-enabled --quiet caddy 2>/dev/null;
     info "Disabling Caddy service..."
     systemctl disable caddy &>/dev/null || true
     ok "Service disabled"
+fi
+
+sysctl_backup_file="${CADDY_SYSCTL_BACKUP_FILE:-/etc/caddy/.easytrojan-sysctl-backup}"
+sysctl_backup_used=0
+if [ -f "$sysctl_backup_file" ]; then
+    sysctl_backup_used=1
+    restore_easytrojan_sysctls "$sysctl_backup_file" || true
 fi
 
 info "Removing files..."
@@ -117,7 +199,11 @@ for sysctl_file in /etc/sysctl.d/99-caddy-trojan.conf /etc/sysctl.d/99-easytroja
     fi
 done
 if [ "$sysctl_removed" = "1" ]; then
-    sysctl --system &>/dev/null || true
+    if [ "$sysctl_backup_used" != "1" ]; then
+        # Legacy installations have no original-value snapshot. Reload the
+        # remaining host policy, but do not claim that absent keys were reset.
+        sysctl --system &>/dev/null || true
+    fi
     ok "EasyTrojan sysctl configuration removed"
 fi
 
@@ -148,5 +234,9 @@ systemctl daemon-reload 2>/dev/null || true
 echo ""
 echo -e "${GREEN}Caddy-Trojan uninstalled successfully.${NC}"
 echo ""
-warn "Some kernel parameters remain active until next reboot."
+if [ "$sysctl_removed" = "1" ] && [ "$sysctl_backup_used" != "1" ]; then
+    warn "This legacy installation had no sysctl snapshot; some kernel parameters may remain active until reboot."
+elif [ -f "$sysctl_backup_file" ]; then
+    warn "A sysctl rollback backup remains for manual recovery: ${sysctl_backup_file}"
+fi
 echo ""

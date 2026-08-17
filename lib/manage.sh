@@ -4,7 +4,17 @@
 
 do_doctor() {
     require_root
-    [ "$#" -eq 0 ] || error "Usage: easytrojan doctor"
+    local network_only=0
+    if [ "$#" -gt 0 ]; then
+        [ "$#" -eq 1 ] && [ "$1" = "--network" ] \
+            || error "Usage: easytrojan doctor [--network]"
+        network_only=1
+    fi
+
+    if [ "$network_only" -eq 1 ]; then
+        doctor_network
+        return 0
+    fi
 
     local failures=0 domain mode cert_file key_file
     doctor_ok() { ok "doctor: $*"; }
@@ -85,6 +95,103 @@ do_doctor() {
     ok "doctor: no blocking issues found"
 }
 
+deploy_easytrojan_bundle() (
+    # Stage the complete runtime tree, then swap it as one unit. The caller is
+    # still running the old entry script, so this avoids a partially copied
+    # module set being observed by a concurrent invocation.
+    set -euo pipefail
+    bundle_root="$1" entry_stage="$2" dest="$3"
+    shift 3
+    parent="" stage="" backup="" old_dir="" target="" tmp="" idx=0 swapped=0 success=0
+    targets=() old_exists=()
+
+    parent=$(dirname "$SHARE_DIR")
+    mkdir -p "$parent"
+    stage=$(mktemp -d "${parent}/.easytrojan.new.XXXXXX")
+    backup="${parent}/.easytrojan.old.$$"
+    old_dir=$(mktemp -d)
+    targets=("$SCRIPT_BIN" "$SCRIPT_LEGACY")
+    if [ -n "$dest" ] && [ "$dest" != "$SCRIPT_BIN" ] && [ "$dest" != "$SCRIPT_LEGACY" ]; then
+        targets+=("$dest")
+    fi
+
+    cleanup_bundle_deploy() {
+        if [ "$success" -ne 1 ] && [ "$swapped" -eq 1 ]; then
+            rm -rf -- "$SHARE_DIR"
+            if [ -e "$backup" ]; then
+                mv -- "$backup" "$SHARE_DIR"
+            fi
+            idx=0
+            for target in "${targets[@]}"; do
+                if [ "${old_exists[$idx]}" -eq 1 ]; then
+                    cp -f -- "${old_dir}/${idx}" "$target"
+                    chmod 755 "$target"
+                else
+                    rm -f -- "$target"
+                fi
+                idx=$((idx + 1))
+            done
+        fi
+        rm -rf -- "$stage" "$old_dir"
+        if [ "$success" -eq 1 ] && [ -e "$backup" ]; then
+            rm -rf -- "$backup"
+        fi
+    }
+    trap cleanup_bundle_deploy EXIT
+
+    for target in "${targets[@]}"; do
+        if [ -f "$target" ]; then
+            cp -f -- "$target" "${old_dir}/${idx}"
+            old_exists[$idx]=1
+        else
+            old_exists[$idx]=0
+        fi
+        idx=$((idx + 1))
+    done
+
+    mkdir -p "${stage}/lib"
+    for module in "$@"; do
+        cp -f -- "${bundle_root}/lib/${module}" "${stage}/lib/${module}"
+        chmod 644 "${stage}/lib/${module}"
+    done
+    cp -f -- "${bundle_root}/hub_server.py" "${stage}/hub_server.py"
+    chmod 644 "${stage}/hub_server.py"
+
+    if [ -e "$SHARE_DIR" ]; then
+        mv -- "$SHARE_DIR" "$backup"
+    fi
+    swapped=1
+    mv -- "$stage" "$SHARE_DIR"
+
+    idx=0
+    for target in "${targets[@]}"; do
+        tmp=$(mktemp "${target}.new.XXXXXX")
+        cp -f -- "$entry_stage" "$tmp"
+        chmod 755 "$tmp"
+        mv -f -- "$tmp" "$target"
+        idx=$((idx + 1))
+    done
+    success=1
+)
+
+stage_easytrojan_update_snapshot() {
+    local update_stage="$1" base_url="$2"
+    # Prefer a signed Release. Repository commits are only a documented legacy
+    # escape hatch and must be explicitly enabled by the operator.
+    if declare -F _easytrojan_fetch_release_snapshot >/dev/null \
+        && _easytrojan_fetch_release_snapshot "$update_stage" "$base_url"; then
+        return 0
+    fi
+    if [ "${EASYTROJAN_ALLOW_UNSIGNED_RELEASE:-0}" = "1" ]; then
+        warn "Signed Release unavailable; trying immutable repository snapshot because EASYTROJAN_ALLOW_UNSIGNED_RELEASE=1"
+        if declare -F _easytrojan_fetch_repository_snapshot >/dev/null \
+            && _easytrojan_fetch_repository_snapshot "$update_stage"; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
 do_update() {
     require_root
     if [ -f "$CADDYFILE" ] && [ ! -f "$MANAGED_MARKER" ] \
@@ -100,15 +207,15 @@ do_update() {
         local update_stage entry_stage dest base_url bundle_root script_source_ready=0
         update_stage=$(mktemp -d)
         base_url=$(release_asset_base "${release_version:-latest}")
-        if declare -F _easytrojan_fetch_repository_snapshot >/dev/null \
-            && _easytrojan_fetch_repository_snapshot "$update_stage"; then
+        # Installed updates consume the signed Release bundle first. The
+        # immutable repository snapshot is retained only as an explicit legacy
+        # compatibility path; otherwise a missing/invalid signature must stop
+        # before any installed file or Caddy binary is changed.
+        if stage_easytrojan_update_snapshot "$update_stage" "$base_url"; then
             script_source_ready=1
         else
-            warn "Current repository snapshot unavailable; trying the selected Release bundle"
-            if declare -F _easytrojan_fetch_release_snapshot >/dev/null \
-                && _easytrojan_fetch_release_snapshot "$update_stage" "$base_url"; then
-                script_source_ready=1
-            fi
+            rm -rf "$update_stage"
+            error "Signed EasyTrojan Release bundle unavailable; refusing update (set EASYTROJAN_ALLOW_UNSIGNED_RELEASE=1 only for legacy compatibility)"
         fi
         if [ "$script_source_ready" = "1" ]; then
             entry_stage="${update_stage}/unpack/easytrojan.sh"
@@ -151,21 +258,8 @@ do_update() {
                     || { rm -rf "$update_stage"; error "Downloaded hub_server.py failed syntax validation"; }
             fi
 
-            # Deploy the validated bundle; install the entry last so it never leads older modules.
-            mkdir -p "${LIB_SHARE_DIR:-/usr/local/share/easytrojan/lib}" /usr/local/share/easytrojan
-            for _m in "${_mods[@]}"; do
-                cp -f "${bundle_root}/lib/${_m}" "${LIB_SHARE_DIR}/${_m}"
-                chmod 644 "${LIB_SHARE_DIR}/${_m}"
-            done
-            cp -f "${bundle_root}/hub_server.py" /usr/local/share/easytrojan/hub_server.py
-            chmod 644 /usr/local/share/easytrojan/hub_server.py
-            cp -f "$entry_stage" "$SCRIPT_BIN"
-            cp -f "$entry_stage" "$SCRIPT_LEGACY"
-            chmod 755 "$SCRIPT_BIN" "$SCRIPT_LEGACY"
-            if [ -n "${dest:-}" ] && [ "$dest" != "$SCRIPT_BIN" ] && [ -f "$dest" ]; then
-                cp -f "$entry_stage" "$dest" 2>/dev/null || true
-                chmod 755 "$dest" 2>/dev/null || true
-            fi
+            deploy_easytrojan_bundle "$bundle_root" "$entry_stage" "${dest:-}" "${_mods[@]}" \
+                || { rm -rf "$update_stage"; error "Failed to atomically activate the EasyTrojan bundle; previous files were restored"; }
             rm -rf "$update_stage"
             ok "Script updated -> re-executing with new version"
             local reexec_args=(update)
@@ -175,12 +269,14 @@ do_update() {
             export EASYTROJAN_UPDATE_STAGE=1
             exec bash "$SCRIPT_BIN" "${reexec_args[@]}"
         else
-            warn "EasyTrojan script snapshot unavailable; continuing with current script for Caddy update..."
             rm -rf "$update_stage"
+            error "EasyTrojan update bundle is unavailable; installed files were not changed"
         fi
     fi
 
     local old_version new_version old_digest="" new_digest backup="" unit_refresh=0
+    local legacy_sysctl_file="${CADDY_SYSCTL_FILE:-/etc/sysctl.d/99-caddy-trojan.conf}"
+    local legacy_limits_file="/etc/security/limits.d/caddy-trojan.conf"
     if [ -f "$MANAGED_MARKER" ] || [ -f "$DOMAIN_FILE" ]; then
         ensure_cert_storage
         write_caddy_unit
@@ -189,6 +285,20 @@ do_update() {
         # Refresh BBR + proxy network tuning so existing nodes pick up newer
         # defaults without a full reinstall.
         enable_bbr || true
+        if [ -f "$legacy_sysctl_file" ] \
+            && grep -qF '# Caddy-Trojan system optimizations' "$legacy_sysctl_file" 2>/dev/null; then
+            warn "Migrating legacy global sysctl tuning in ${legacy_sysctl_file}"
+            if apply_sysctl_limits; then
+                warn "Legacy runtime-only sysctl values (including tcp_notsent_lowat/tcp_tw_reuse) cannot be inferred safely; review /proc/sys or reboot before relying on the new profile"
+            else
+                warn "Legacy sysctl migration could not be verified; inspect ${legacy_sysctl_file} and current /proc/sys values"
+            fi
+            if [ -f "$legacy_limits_file" ] \
+                && grep -qF '# Caddy-Trojan limits' "$legacy_limits_file" 2>/dev/null; then
+                rm -f "$legacy_limits_file"
+                warn "Removed the legacy PAM limits file; Caddy uses its systemd LimitNOFILE instead"
+            fi
+        fi
     fi
     old_version=$("$CADDY_BIN" version 2>/dev/null | awk '{print $1}' || echo "not-installed")
     info "Current Caddy version: $old_version"
@@ -327,9 +437,12 @@ do_renew() {
         fi
     fi
 
-    info "Waiting for certificate material..."
-    local count=0 max_wait=40
-    until find "${CADDY_DATA_DIR}/certificates" -name '*.crt' -type f 2>/dev/null | grep -q .; do
+    local domain
+    domain=$(read_installed_domain 2>/dev/null || true)
+    [ -n "$domain" ] || error "Installed domain is missing"
+    info "Waiting for certificate material for ${domain}..."
+    local count=0 max_wait=40 cert_file=""
+    until cert_file=$(find_domain_certificate "$domain"); do
         count=$((count + 1))
         if [ "$count" -gt "$max_wait" ]; then
             error "Certificate check failed. Check: journalctl -u caddy --no-pager -n 50"
@@ -337,8 +450,7 @@ do_renew() {
         sleep 3
     done
 
-    local cert_file expiry
-    cert_file=$(find "${CADDY_DATA_DIR}/certificates" -name '*.crt' -type f 2>/dev/null | head -1 || true)
+    local expiry
     if [ -n "$cert_file" ] && check_cmd openssl; then
         expiry=$(openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | cut -d= -f2 || true)
         ok "Certificate present (expires: ${expiry:-unknown})"
@@ -723,7 +835,7 @@ do_user() {
                     error "Password required: easytrojan user del --password PASSWORD"
                 fi
             fi
-            [ -n "$trojan_passwd" ] || error "Password cannot be empty"
+            validate_password_value "$trojan_passwd"
             local domain
             domain=$(read_installed_domain 2>/dev/null || true)
             [ -n "$domain" ] || error "Domain not found. Re-run install first."
@@ -732,7 +844,8 @@ do_user() {
             fi
             remove_password_from_file "$trojan_passwd"
             generate_caddyfile "$domain"
-            # With `caddy` upstream, delete storage key or Validate still succeeds after reload.
+            # With `memory caddy`, delete the persisted key as well as the
+            # in-memory entry or it can return after a process restart.
             if systemctl is-active --quiet caddy 2>/dev/null; then
                 wait_for_admin_api || true
                 if delete_trojan_user_storage "$trojan_passwd"; then
@@ -757,7 +870,7 @@ Usage:
   easytrojan user del --password PASSWORD
 
 Users are stored in passwd.txt, declared in Caddyfile (users "..."),
-and (with caddy upstream) keyed in Caddy storage. Delete clears all three.
+and keyed in Caddy storage behind the memory cache. Delete clears all three.
 EOF
             exit 0
             ;;

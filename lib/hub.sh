@@ -69,25 +69,32 @@ hub_save_local_name() {
     local name="$1" f
     name=$(printf '%s' "$name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
     [ -n "$name" ] || return 1
+    [ "${#name}" -le 128 ] || error "Hub display name is too long (maximum: 128 characters)"
+    if contains_control_chars "$name"; then
+        error "Hub display name must not contain control characters"
+    fi
     f=$(hub_local_name_file)
     mkdir -p "$(dirname "$f")"
     printf '%s\n' "$name" > "$f"
     chmod 600 "$f" 2>/dev/null || true
 }
 
-# Remove all local-hub nodes for this host's domain (+optional password), then re-register.
+# Atomically replace this host's local-hub nodes. Older runtimes fall back to
+# non-destructive upserts so a failed refresh never deletes working entries.
 hub_reregister_local_named() {
-    local name_base="$1" domain reg_token passwd
+    local name_base="$1" domain reg_token transport
     domain=$(read_installed_domain 2>/dev/null || true)
     reg_token=$(hub_read_cfg_field register_token)
     [ -n "$domain" ] && [ -n "$reg_token" ] && [ -f "$PASSWD_FILE" ] || return 0
     [ -n "$name_base" ] || name_base=$(hub_read_local_name)
     [ -n "$name_base" ] || name_base="$domain"
     wait_for_hub_api || return 1
-    while IFS= read -r passwd || [ -n "$passwd" ]; do
-        [ -n "$passwd" ] || continue
-        hub_unregister_password "http://${HUB_LISTEN}" "$reg_token" "$domain" "$passwd" || true
-    done < "$PASSWD_FILE"
+    transport=$(detect_share_transport)
+    if hub_sync_domain "http://${HUB_LISTEN}" "$reg_token" "$name_base" "$domain" "$domain" 443 "$transport"; then
+        ok "Synchronized local users into hub (${name_base})"
+        return 0
+    fi
+    warn "Atomic Hub sync unavailable; registering users without deleting existing nodes"
     hub_register_local "$name_base"
 }
 
@@ -191,34 +198,123 @@ hub_client_file() {
     printf '%s' "${HUB_CLIENT_FILE:-${TROJAN_DIR}/hub-client.json}"
 }
 
-hub_save_client_membership() {
+hub_save_client_membership() (
     local url="$1" token="$2" name="$3" server="$4" port="$5"
-    local f
+    local f payload secret_tmp=""
     f=$(hub_client_file)
     mkdir -p "$(dirname "$f")"
-    python3 - "$f" "$url" "$token" "$name" "$server" "$port" <<'PY' || true
+    payload=$(printf '{"url":"%s","token":"%s","name":"%s","server":"%s","port":%s}' \
+        "$(json_escape "${url%/}")" "$(json_escape "$token")" \
+        "$(json_escape "$name")" "$(json_escape "$server")" "$port")
+    secret_tmp=$(mktemp) || return 1
+    trap 'rm -f -- "${secret_tmp:-}"' EXIT
+    chmod 600 "$secret_tmp"
+    printf '%s' "$payload" > "$secret_tmp"
+    python3 - "$f" "$secret_tmp" <<'PY'
 import json, os, sys, time
-path, url, token, name, server, port = sys.argv[1:7]
-data = {
-    "url": url.rstrip("/"),
-    "token": token,
-    "name": name or "",
-    "server": server or "",
-    "port": int(port or 443),
-    "updated_at": int(time.time()),
-}
-tmp = path + ".tmp"
-with open(tmp, "w", encoding="utf-8") as f:
+path, source = sys.argv[1:3]
+with open(source, encoding="utf-8") as f:
+    data = json.load(f)
+data["port"] = int(data.get("port") or 443)
+data["updated_at"] = int(time.time())
+tmp_path = path + ".tmp"
+with open(tmp_path, "w", encoding="utf-8") as f:
     json.dump(data, f, ensure_ascii=False, indent=2)
     f.write("\n")
-os.replace(tmp, path)
+    f.flush()
+    os.fsync(f.fileno())
+os.chmod(tmp_path, 0o600)
+os.replace(tmp_path, path)
+dir_fd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
 try:
-    os.chmod(path, 0o600)
-except OSError:
-    pass
+    os.fsync(dir_fd)
+finally:
+    os.close(dir_fd)
 PY
     chmod 600 "$f" 2>/dev/null || true
+)
+
+_hub_sync_payload() {
+    local gzip_output="$1" name_base="$2" domain="$3" server="$4" port="$5" transport="$6"
+    python3 - "$PASSWD_FILE" "$name_base" "$domain" "$server" "$port" "$transport" "$gzip_output" <<'PY'
+import gzip, json, sys
+
+path, base, domain, server, port, transport, gzip_output = sys.argv[1:8]
+max_nodes, max_password = 10_000, 512
+
+def passwords():
+    with open(path, encoding="utf-8") as source:
+        while True:
+            # Limit each read before stripping line endings; this keeps a corrupt
+            # local password file from forcing an unbounded Python allocation.
+            line = source.readline(max_password + 3)
+            if not line:
+                break
+            if len(line) >= max_password + 3 and not line.endswith(("\r", "\n")):
+                raise SystemExit("password file contains an overlong line")
+            password = line.rstrip("\r\n")
+            if not password:
+                continue
+            if len(password) > max_password or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in password):
+                raise SystemExit("invalid password in Hub sync")
+            yield password
+
+password_list = list(passwords())
+if len(password_list) > max_nodes:
+    raise SystemExit("too many users for Hub sync")
+
+raw = open(gzip_output, "wb") if gzip_output else sys.stdout.buffer
+sink = gzip.GzipFile(filename="", fileobj=raw, mode="wb", mtime=0) if gzip_output else raw
+try:
+    def emit(value):
+        sink.write(value.encode("utf-8"))
+
+    emit(json.dumps({"domain": domain, "server": server}, ensure_ascii=False, separators=(",", ":"))[:-1])
+    emit(',"nodes":[')
+    for index, password in enumerate(password_list, 1):
+        suffix = "" if index == 1 else f"-{index}"
+        name = base[:128 - len(suffix)] + suffix
+        node = {
+            "name": name, "password": password, "server": server,
+            "port": int(port), "sni": domain, "host": domain, "path": "/",
+            "transport": transport, "alpn": "http/1.1",
+        }
+        if index > 1:
+            emit(",")
+        emit(json.dumps(node, ensure_ascii=False, separators=(",", ":")))
+    emit("]}")
+finally:
+    if gzip_output:
+        sink.close()
+        raw.close()
+PY
 }
+
+hub_sync_payload() {
+    _hub_sync_payload "" "$@"
+}
+
+hub_write_gzip_sync_payload() {
+    local output="$1"
+    shift
+    _hub_sync_payload "$output" "$@"
+}
+
+hub_sync_domain() (
+    local base_url="$1" token="$2" name_base="$3" domain="$4" server="$5" port="$6" transport="$7"
+    local cfg="" body=""
+    [[ "$token" =~ ^[A-Za-z0-9._~-]+$ ]] || return 2
+    cfg=$(mktemp) || return 1
+    body=$(mktemp) || { rm -f "$cfg"; return 1; }
+    trap 'rm -f -- "${cfg:-}" "${body:-}"' EXIT
+    chmod 600 "$cfg" "$body" 2>/dev/null || true
+    printf 'header = "Content-Type: application/json"\nheader = "Content-Encoding: gzip"\nheader = "X-Hub-Token: %s"\n' \
+        "$token" > "$cfg"
+    hub_write_gzip_sync_payload "$body" "$name_base" "$domain" "$server" "$port" "$transport" \
+        || return 1
+    curl -sf --connect-timeout 2 --max-time 30 -X POST --config "$cfg" \
+        --data-binary "@${body}" "${base_url%/}/api/sync" >/dev/null
+)
 
 hub_read_client_field() {
     hub_json_field "$(hub_client_file)" "$1"
@@ -239,19 +335,24 @@ install_hub_binary() {
     fi
     if [ -z "$src" ]; then
         mkdir -p "$SHARE_DIR"
-        local stage base_url bundle sums
+        local stage base_url bundle sums sigstore
         stage=$(mktemp -d)
         base_url=$(release_asset_base "${release_version:-latest}")
         bundle="${stage}/easytrojan_bundle.tar.gz"
         sums="${stage}/SHA256SUMS"
+        sigstore="${stage}/SHA256SUMS.sigstore.json"
         if curl -fsSL --connect-timeout 15 --max-time 60 "${base_url}/easytrojan_bundle.tar.gz" -o "$bundle" \
-            && curl -fsSL --connect-timeout 10 --max-time 30 "${base_url}/SHA256SUMS" -o "$sums" \
-            && verify_archive_sha256 "$bundle" "$sums" \
-            && tar -xzf "$bundle" -C "$stage" hub_server.py; then
-            cp -f "${stage}/hub_server.py" "$dest"
-            chmod 644 "$dest"
-            src="$dest"
-            ok "Downloaded hub_server.py from the versioned release bundle"
+            && curl -fsSL --connect-timeout 10 --max-time 30 "${base_url}/SHA256SUMS" -o "$sums"; then
+            curl -fsSL --connect-timeout 10 --max-time 30 "${base_url}/SHA256SUMS.sigstore.json" -o "$sigstore" 2>/dev/null || true
+            if declare -F _easytrojan_verify_release_manifest >/dev/null 2>&1 \
+                && _easytrojan_verify_release_manifest "$sums" "$sigstore" "$stage" \
+                && verify_archive_sha256 "$bundle" "$sums" \
+                && tar -xzf "$bundle" -C "$stage" hub_server.py; then
+                cp -f "${stage}/hub_server.py" "$dest"
+                chmod 644 "$dest"
+                src="$dest"
+                ok "Downloaded hub_server.py from the versioned release bundle"
+            fi
         fi
         rm -rf "$stage"
     fi
@@ -456,6 +557,10 @@ hub_reregister_to_remote() {
     [ -n "$server" ] || server="$domain"
     [ -n "$port" ] || port=443
     hub_url="${hub_url%/}"
+    if hub_sync_domain "$hub_url" "$token" "$name" "$domain" "$server" "$port" "$transport"; then
+        return 0
+    fi
+    warn "Remote hub does not support atomic sync; falling back to per-user registration"
     while IFS= read -r passwd || [ -n "$passwd" ]; do
         [ -n "$passwd" ] || continue
         i=$((i + 1))
@@ -670,6 +775,11 @@ EOF
                     *) error "Unknown hub url argument: $1" ;;
                 esac
             done
+            if [ -n "$server_q" ]; then
+                if ! server_q=$(normalize_server_address "$server_q"); then
+                    error "Invalid server address: $server_q"
+                fi
+            fi
             domain=$(read_installed_domain 2>/dev/null || true)
             sub_token=$(hub_read_cfg_field sub_token)
             [ -n "$domain" ] || error "Domain not found"
@@ -908,6 +1018,9 @@ EOF
     transport=$(detect_share_transport)
     [ -n "$name" ] || name="$domain"
     [ -n "$server" ] || server="$domain"
+    if ! server=$(normalize_server_address "$server"); then
+        error "Invalid server address: $server"
+    fi
     hub_url="${hub_url%/}"
 
     local i=0 reg_name payload resp

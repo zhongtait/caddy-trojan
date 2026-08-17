@@ -15,10 +15,19 @@ Unregister:
   POST /api/unregister
   Header: X-Hub-Token: <register_token>
   Body JSON: {"domain","password","name"?}
+
+Bulk sync:
+  POST /api/sync
+  Header: X-Hub-Token: <register_token>
+  Body JSON: {"domain","server","nodes":[...]}; Content-Encoding: gzip is
+  accepted for large batches. The complete scoped batch is validated before one
+  atomic state replacement.
 """
 from __future__ import annotations
 
 import base64
+import gzip
+import io
 import ipaddress
 import json
 import os
@@ -46,6 +55,12 @@ _nodes_cache: list[dict] | None = None
 _sub_cache_key: tuple | None = None
 _sub_cache_body: bytes | None = None
 MAX_BODY_BYTES = 64 * 1024
+# A full sync can legitimately be much larger than the ordinary mutation API.
+# Keep independent wire and expanded limits so gzip raises the practical batch
+# size without permitting an unbounded compressed-body expansion.
+MAX_SYNC_COMPRESSED_BYTES = 8 * 1024 * 1024
+MAX_SYNC_BODY_BYTES = 16 * 1024 * 1024
+SYNC_REQUEST_SLOTS = threading.BoundedSemaphore(4)
 MAX_NODES = 10_000
 MAX_NAME_LENGTH = 128
 MAX_PASSWORD_LENGTH = 512
@@ -102,6 +117,11 @@ def _save_json(path: Path, data: Any) -> None:
             except OSError:
                 pass
         os.replace(tmp, path)
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     except OSError as exc:
         # Turn disk/permission failures into a clean 503 instead of an uncaught
         # exception that drops the connection with no HTTP response.
@@ -310,7 +330,7 @@ def _validate_node(node: Any) -> None:
             raise ValueError(f"invalid {field}")
 
 
-def upsert_node(payload: dict) -> dict:
+def _node_from_payload(payload: dict) -> dict:
     if not isinstance(payload, dict):
         raise ValueError("invalid payload")
     domain = _host(payload.get("domain"), "domain")
@@ -335,7 +355,7 @@ def upsert_node(payload: dict) -> dict:
     if supplied_id is not None and (not isinstance(supplied_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", supplied_id)):
         raise ValueError("invalid id")
 
-    node = {
+    return {
         "id": str(supplied_id or new_node_id()),
         "name": name,
         "domain": domain,
@@ -350,6 +370,10 @@ def upsert_node(payload: dict) -> dict:
         "enabled": enabled,
         "updated_at": _now(),
     }
+
+
+def upsert_node(payload: dict) -> dict:
+    node = _node_from_payload(payload)
     with LOCK:
         nodes = _load_nodes_unlocked()
         found = False
@@ -367,6 +391,70 @@ def upsert_node(payload: dict) -> dict:
             nodes.append(node)
         _save_nodes_unlocked(nodes)
     return node
+
+
+def sync_domain_nodes(payload: dict) -> list[dict]:
+    """Atomically replace one domain's nodes after validating the full batch."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("nodes"), list):
+        raise ValueError("nodes must be an array")
+    domain = _host(payload.get("domain"), "domain")
+    scope_server = _host(payload.get("server"), "server")
+    raw_nodes = payload["nodes"]
+    if len(raw_nodes) > MAX_NODES:
+        raise ValueError("too many nodes")
+
+    incoming: list[dict] = []
+    identities: set[tuple[str, str]] = set()
+    for raw in raw_nodes:
+        if not isinstance(raw, dict):
+            raise ValueError("node must be an object")
+        item = dict(raw)
+        item["domain"] = domain
+        if item.get("server") is None:
+            item["server"] = scope_server
+        node = _node_from_payload(item)
+        if node["server"] != scope_server:
+            raise ValueError("node server does not match sync scope")
+        identity = (node["password"], node["name"])
+        if identity in identities:
+            raise ValueError("duplicate node identity")
+        identities.add(identity)
+        incoming.append(node)
+
+    with LOCK:
+        existing = _load_nodes_unlocked()
+        def in_scope(node: dict) -> bool:
+            # Older nodes.json entries may omit optional server; validation treats
+            # that as the domain, so sync must use the same effective value.
+            return node.get("domain") == domain and (node.get("server") or node.get("domain")) == scope_server
+
+        keep = [
+            n for n in existing
+            if not in_scope(n)
+        ]
+        by_identity = {
+            (n.get("password"), n.get("name")): n
+            for n in existing
+            if in_scope(n)
+        }
+        by_password: dict[str, list[dict]] = {}
+        for old in existing:
+            if in_scope(old):
+                by_password.setdefault(str(old.get("password") or ""), []).append(old)
+
+        now = _now()
+        for node in incoming:
+            old = by_identity.get((node["password"], node["name"]))
+            if old is None and len(by_password.get(node["password"], [])) == 1:
+                old = by_password[node["password"]][0]
+            if old is not None:
+                node["id"] = old.get("id") or node["id"]
+                node["created_at"] = old.get("created_at") or now
+            else:
+                node["created_at"] = now
+            keep.append(node)
+        _save_nodes_unlocked(keep)
+    return incoming
 
 
 def delete_node(nid: str) -> bool:
@@ -549,7 +637,13 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
-    def _read_json_object(self) -> dict | None:
+    def _read_json_object(
+        self,
+        *,
+        max_body_bytes: int = MAX_BODY_BYTES,
+        max_compressed_bytes: int | None = None,
+        allow_gzip: bool = False,
+    ) -> dict | None:
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
@@ -558,10 +652,30 @@ class Handler(BaseHTTPRequestHandler):
         if length < 0:
             self._json(400, {"error": "invalid content length"})
             return None
-        if length > MAX_BODY_BYTES:
+        encoding = (self.headers.get("Content-Encoding") or "identity").strip().lower()
+        if encoding not in ("", "identity", "gzip") or (encoding == "gzip" and not allow_gzip):
+            self._json(415, {"error": "unsupported content encoding"})
+            return None
+        wire_limit = max_body_bytes
+        if encoding == "gzip":
+            wire_limit = max_compressed_bytes or max_body_bytes
+        if length > wire_limit:
             self._json(413, {"error": "request body too large"})
             return None
         raw = self.rfile.read(length) if length > 0 else b"{}"
+        if len(raw) != length:
+            self._json(400, {"error": "incomplete request body"})
+            return None
+        if encoding == "gzip":
+            try:
+                with gzip.GzipFile(fileobj=io.BytesIO(raw), mode="rb") as stream:
+                    raw = stream.read(max_body_bytes + 1)
+            except (EOFError, OSError):
+                self._json(400, {"error": "invalid gzip body"})
+                return None
+            if len(raw) > max_body_bytes:
+                self._json(413, {"error": "request body too large after decompression"})
+                return None
         try:
             payload = json.loads(raw.decode("utf-8") or "{}")
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -676,6 +790,7 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/") or "/"
         routes = {
             "/api/register",
+            "/api/sync",
             "/api/delete",
             "/api/rename",
             "/api/unregister",
@@ -686,6 +801,33 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self._require_register_auth():
             return
+        if path == "/api/sync":
+            # Limit simultaneous large decompressions independently of the normal
+            # request pool. Authentication has already completed before this point.
+            if not SYNC_REQUEST_SLOTS.acquire(blocking=False):
+                self._json(429, {"error": "too many sync requests"})
+                return
+            try:
+                payload = self._read_json_object(
+                    max_body_bytes=MAX_SYNC_BODY_BYTES,
+                    max_compressed_bytes=MAX_SYNC_COMPRESSED_BYTES,
+                    allow_gzip=True,
+                )
+                if payload is None:
+                    return
+                try:
+                    nodes = sync_domain_nodes(payload)
+                except ValueError as e:
+                    self._json(400, {"error": str(e)})
+                    return
+                except DataStoreError as e:
+                    self._fail_state(e)
+                    return
+                self._json(200, {"ok": True, "count": len(nodes)})
+                return
+            finally:
+                SYNC_REQUEST_SLOTS.release()
+
         payload = self._read_json_object()
         if payload is None:
             return
@@ -728,20 +870,20 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200 if node else 404, {"ok": bool(node), "node": {"id": node["id"], "name": node["name"]} if node else None})
             return
 
-        if path in ("/api/unregister", "/api/delete_by_password"):
-            domain = str(payload.get("domain") or "").strip()
-            password = str(payload.get("password") or "")
-            name = str(payload.get("name") or "").strip() or None
-            if not domain or not password:
-                self._json(400, {"error": "domain and password are required"})
-                return
-            try:
-                removed = delete_by_credentials(domain, password, name)
-            except DataStoreError as exc:
-                self._fail_state(exc)
-                return
-            self._json(200, {"ok": True, "removed": removed})
+        # The route set above leaves only the two unregister aliases here.
+        domain = str(payload.get("domain") or "").strip()
+        password = str(payload.get("password") or "")
+        name = str(payload.get("name") or "").strip() or None
+        if not domain or not password:
+            self._json(400, {"error": "domain and password are required"})
             return
+        try:
+            removed = delete_by_credentials(domain, password, name)
+        except DataStoreError as exc:
+            self._fail_state(exc)
+            return
+        self._json(200, {"ok": True, "removed": removed})
+        return
 
     def do_DELETE(self) -> None:  # noqa: N802
         self.close_connection = True

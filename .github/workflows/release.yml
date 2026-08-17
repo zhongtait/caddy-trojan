@@ -2,22 +2,47 @@ name: Build Caddy-Trojan
 
 on:
   workflow_dispatch:
+    inputs:
+      upstream_sha:
+        description: 'Upstream imgk/caddy-trojan commit to build'
+        required: false
+        type: string
+      source_ref:
+        description: 'Exact caddy-trojan repository commit to release'
+        required: false
+        type: string
+      gate_only:
+        description: 'Run all build/test gates without signing or publishing'
+        required: false
+        default: false
+        type: boolean
   workflow_call:
     inputs:
       upstream_sha:
         description: 'Upstream imgk/caddy-trojan commit to build'
         required: false
         type: string
-  push:
-    paths:
-      - 'sha'
-
+      source_ref:
+        description: 'Exact caddy-trojan repository commit to release'
+        required: false
+        type: string
+      gate_only:
+        description: 'Run all build/test gates without signing or publishing'
+        required: false
+        default: false
+        type: boolean
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: easytrojan-release
+  cancel-in-progress: false
 
 jobs:
   build-caddy-trojan:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -31,17 +56,18 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+          persist-credentials: false
 
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          # caddy/v2 latest requires go >= 1.25.1 (GOTOOLCHAIN=local in runners)
           go-version: '1.25.x'
-          # no go.mod in this repo (xcaddy builds in a temp module)
           cache: false
 
-      - name: Install Xcaddy
-        run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+      - name: Install xcaddy v0.4.5
+        run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.5
 
       - name: Build Caddy-Trojan
         env:
@@ -50,6 +76,7 @@ jobs:
           CGO_ENABLED: '0'
           UPSTREAM_SHA: ${{ inputs.upstream_sha || '' }}
         run: |
+          set -euo pipefail
           mkdir -p output
           cd output
           UPSTREAM_SHA="${UPSTREAM_SHA:-$(tr -d '[:space:]' < ../sha)}"
@@ -61,9 +88,10 @@ jobs:
           git clone --filter=blob:none https://github.com/imgk/caddy-trojan.git caddy-trojan
           git -C caddy-trojan checkout --detach "${UPSTREAM_SHA}"
           git -C caddy-trojan apply ../../patches/caddy-trojan-outbound-ip.patch
+          git -C caddy-trojan diff --check
           xcaddy build --with "github.com/imgk/caddy-trojan=./caddy-trojan"
           FILENAME="caddy_trojan_${{ matrix.os }}_${{ matrix.arch }}.tar.gz"
-          tar -czvf "../${FILENAME}" caddy
+          tar -czf "../${FILENAME}" caddy
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
@@ -72,58 +100,254 @@ jobs:
           path: caddy_trojan_${{ matrix.os }}_${{ matrix.arch }}.tar.gz
           if-no-files-found: error
 
-  release:
+  validate:
+    name: Release validation gate
+    uses: ./.github/workflows/ci.yml
+    with:
+      source_ref: ${{ inputs.source_ref || github.sha }}
+
+  integration:
+    name: Real Linux integration gate
+    needs: build-caddy-trojan
+    uses: ./.github/workflows/integration.yml
+    with:
+      source_ref: ${{ inputs.source_ref || github.sha }}
+      upstream_sha: ${{ inputs.upstream_sha || '' }}
+      caddy_artifact: caddy_trojan_linux_amd64
+
+  version:
+    name: Inspect Caddy version in isolation
     needs: build-caddy-trojan
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Download amd64 Caddy artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: caddy_trojan_linux_amd64
+          path: artifact
+
+      - name: Validate archive and read version
+        id: version
+        run: |
+          set -euo pipefail
+          archive=artifact/caddy_trojan_linux_amd64.tar.gz
+          tar -tzf "$archive" | awk '
+            BEGIN { count=0 }
+            { count++; if ($0 != "caddy") bad=1 }
+            END { exit !(count == 1 && !bad) }
+          '
+          tar -tvzf "$archive" | awk '
+            BEGIN { count=0 }
+            { count++; if (substr($0, 1, 1) != "-") bad=1 }
+            END { exit !(count == 1 && !bad) }
+          '
+          tar -xzf "$archive" -C "$RUNNER_TEMP" caddy
+          VERSION=$("${RUNNER_TEMP}/caddy" version | awk '{print $1}')
+          if ! printf '%s' "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "Unexpected Caddy version: ${VERSION:-<empty>}" >&2
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+  metadata:
+    name: Prepare immutable release assets
+    needs: [build-caddy-trojan, version]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      upstream_sha: ${{ steps.meta.outputs.upstream_sha }}
+      source_sha: ${{ steps.meta.outputs.source_sha }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Download all artifacts
+      - name: Download all Caddy artifacts
         uses: actions/download-artifact@v5
         with:
           path: artifacts
           merge-multiple: true
 
-      - name: Prepare checksums and tag
+      - name: Validate artifacts and prepare release metadata
         id: meta
         env:
+          REQUESTED_SOURCE: ${{ inputs.source_ref || github.sha }}
           UPSTREAM_SHA: ${{ inputs.upstream_sha || '' }}
+          GATE_ONLY: ${{ inputs.gate_only || false }}
+          CADDY_VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          tar -xzf artifacts/caddy_trojan_linux_amd64.tar.gz -C /tmp
-          VERSION=$(/tmp/caddy version | awk '{print $1}')
+          if ! printf '%s' "$REQUESTED_SOURCE" | grep -Eq '^[0-9a-fA-F]{40}$'; then
+            echo "source_ref must be an exact 40-character commit SHA" >&2
+            exit 1
+          fi
+          SOURCE_SHA=$(git rev-parse HEAD)
+          if [ "${SOURCE_SHA,,}" != "${REQUESTED_SOURCE,,}" ]; then
+            echo "Checked out ${SOURCE_SHA}, expected ${REQUESTED_SOURCE}" >&2
+            exit 1
+          fi
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$SOURCE_SHA" origin/main || {
+            echo "Refusing to release a commit that is not on main: ${SOURCE_SHA}" >&2
+            exit 1
+          }
+
           UPSTREAM_SHA="${UPSTREAM_SHA:-$(tr -d '[:space:]' < sha)}"
           if ! printf '%s' "$UPSTREAM_SHA" | grep -Eq '^[0-9a-fA-F]{40}$'; then
             echo "Invalid upstream SHA: ${UPSTREAM_SHA:-<empty>}" >&2
             exit 1
           fi
-          SHORT_SHA=$(printf '%s' "$UPSTREAM_SHA" | cut -c1-7)
-          TAG="${VERSION}+trojan.${SHORT_SHA}"
+
+          for archive in artifacts/caddy_trojan_*.tar.gz; do
+            [ -f "$archive" ] || { echo "Missing Caddy archive" >&2; exit 1; }
+            tar -tzf "$archive" | awk '
+              BEGIN { count=0 }
+              { count++; if ($0 != "caddy") bad=1 }
+              END { exit !(count == 1 && !bad) }
+            '
+            tar -tvzf "$archive" | awk '
+              BEGIN { count=0 }
+              { count++; if (substr($0, 1, 1) != "-") bad=1 }
+              END { exit !(count == 1 && !bad) }
+            '
+          done
+
+          VERSION=$CADDY_VERSION
+          if ! printf '%s' "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "Invalid isolated Caddy version output: ${VERSION:-<empty>}" >&2
+            exit 1
+          fi
+
+          UPSTREAM_SHORT=$(printf '%s' "$UPSTREAM_SHA" | cut -c1-12)
+          SOURCE_SHORT=$(printf '%s' "$SOURCE_SHA" | cut -c1-12)
+          TAG="${VERSION}+trojan.${UPSTREAM_SHORT}.et.${SOURCE_SHORT}"
+          if [ "$GATE_ONLY" != "true" ]; then
+            [ "$GITHUB_REF" = "refs/heads/main" ] || {
+              echo "Release signing/publishing is only allowed from refs/heads/main" >&2
+              exit 1
+            }
+            set +e
+            git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1
+            tag_status=$?
+            set -e
+            case "$tag_status" in
+              0) echo "Release tag already exists and is immutable: ${TAG}" >&2; exit 1 ;;
+              2) ;;
+              *) echo "Could not verify release tag availability: ${TAG}" >&2; exit 1 ;;
+            esac
+          fi
+
           tar -czf artifacts/easytrojan_bundle.tar.gz easytrojan.sh hub_server.py lib
           (
             cd artifacts
-            sha256sum *.tar.gz > SHA256SUMS
+            sha256sum -- *.tar.gz > SHA256SUMS
           )
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=${VERSION}"
+            echo "tag=${TAG}"
+            echo "upstream_sha=${UPSTREAM_SHA}"
+            echo "source_sha=${SOURCE_SHA}"
+          } >> "$GITHUB_OUTPUT"
           cat artifacts/SHA256SUMS
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+      - name: Upload unsigned release assets
+        uses: actions/upload-artifact@v5
+        with:
+          name: release-assets-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  sign:
+    name: Sign release manifest
+    if: ${{ inputs.gate_only != true }}
+    needs: [validate, integration, metadata]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download unsigned release assets
+        uses: actions/download-artifact@v5
+        with:
+          name: release-assets-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts
+
+      - name: Install cosign v3.1.3
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        with:
+          cosign-release: v3.1.3
+
+      - name: Sign and verify release manifest
+        env:
+          RELEASE_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/heads/main
+          RELEASE_OIDC_ISSUER: https://token.actions.githubusercontent.com
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --bundle artifacts/SHA256SUMS.sigstore.json \
+            artifacts/SHA256SUMS >/dev/null
+          cosign verify-blob \
+            --bundle artifacts/SHA256SUMS.sigstore.json \
+            --certificate-identity "$RELEASE_IDENTITY" \
+            --certificate-oidc-issuer "$RELEASE_OIDC_ISSUER" \
+            artifacts/SHA256SUMS
+
+      - name: Upload signed release assets
+        uses: actions/upload-artifact@v5
+        with:
+          name: signed-release-assets-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS
+            artifacts/SHA256SUMS.sigstore.json
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish immutable GitHub Release
+    if: ${{ inputs.gate_only != true }}
+    needs: [metadata, sign]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download signed release assets
+        uses: actions/download-artifact@v5
+        with:
+          name: signed-release-assets-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts
+
+      - name: Create immutable Release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228
         with:
           body: |
-            Caddy-Trojan ${{ steps.meta.outputs.version }}
+            Caddy-Trojan ${{ needs.metadata.outputs.version }}
 
-            - Upstream plugin SHA: `${{ steps.meta.outputs.sha }}`
+            - Upstream plugin SHA: `${{ needs.metadata.outputs.upstream_sha }}`
+            - EasyTrojan source SHA: `${{ needs.metadata.outputs.source_sha }}`
             - Built with [imgk/caddy-trojan](https://github.com/imgk/caddy-trojan)
-            - EasyTrojan scripts are shipped as one versioned bundle
-            - Verify every download with `SHA256SUMS`
-          tag_name: ${{ steps.meta.outputs.tag }}
-          name: ${{ steps.meta.outputs.tag }}
+            - Verify every download with `SHA256SUMS` and `SHA256SUMS.sigstore.json`
+          tag_name: ${{ needs.metadata.outputs.tag }}
+          target_commitish: ${{ needs.metadata.outputs.source_sha }}
+          name: ${{ needs.metadata.outputs.tag }}
           draft: false
           prerelease: false
+          make_latest: true
+          overwrite_files: false
           files: |
             artifacts/*.tar.gz
             artifacts/SHA256SUMS
+            artifacts/SHA256SUMS.sigstore.json
           fail_on_unmatched_files: true

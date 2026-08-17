@@ -44,15 +44,32 @@ verify_archive_sha256() {
     ok "SHA256 verified for ${base}"
 }
 
-download_caddy() {
+validate_caddy_archive() {
+    local archive="$1"
+    # The release workflow emits one top-level regular file. Reject path
+    # traversal, links, hardlinks, and auxiliary entries before extraction.
+    tar -tzf "$archive" | awk '
+        BEGIN { count = 0 }
+        { count++; if ($0 != "caddy") bad = 1 }
+        END { exit !(count == 1 && !bad) }
+    ' || return 1
+    tar -tvzf "$archive" | awk '
+        BEGIN { count = 0 }
+        { count++; if (substr($0, 1, 1) != "-") bad = 1 }
+        END { exit !(count == 1 && !bad) }
+    ' || return 1
+}
+
+download_caddy() (
     local arch version base_url tmp_dir archive sums
     arch=$(detect_arch)
     version="${release_version:-latest}"
     base_url=$(release_asset_base "$version")
     tmp_dir=$(mktemp -d)
-    trap 'rm -rf "$tmp_dir"' RETURN
+    trap 'rm -rf -- "${tmp_dir:-}"' EXIT
     archive="${tmp_dir}/caddy_trojan_linux_${arch}.tar.gz"
     sums="${tmp_dir}/SHA256SUMS"
+    local sigstore="${tmp_dir}/SHA256SUMS.sigstore.json"
 
     info "Downloading Caddy-Trojan (${arch}, version=${version})..."
     if ! curl -fsSL --connect-timeout 15 --max-time 180 \
@@ -61,14 +78,20 @@ download_caddy() {
     fi
 
     if curl -fsSL --connect-timeout 10 --max-time 30 "${base_url}/SHA256SUMS" -o "$sums" 2>/dev/null; then
+        if ! declare -F _easytrojan_verify_release_manifest >/dev/null 2>&1; then
+            error "Release signature verifier is unavailable; refusing release metadata"
+        fi
+        curl -fsSL --connect-timeout 10 --max-time 30 \
+            "${base_url}/SHA256SUMS.sigstore.json" -o "$sigstore" 2>/dev/null || true
+        _easytrojan_verify_release_manifest "$sums" "$sigstore" "$tmp_dir" \
+            || error "Sigstore verification failed; refusing Caddy release asset"
         verify_archive_sha256 "$archive" "$sums"
     else
         error "SHA256SUMS not found for this release; refusing unverified Caddy binary"
     fi
 
-    if ! tar -tzf "$archive" | grep -qx 'caddy'; then
-        error "Archive does not contain expected 'caddy' binary"
-    fi
+    validate_caddy_archive "$archive" \
+        || error "Archive is not a single regular 'caddy' file; refusing extraction"
     if ! tar -xzf "$archive" -C "$tmp_dir" caddy; then
         error "Failed to extract Caddy binary"
     fi
@@ -83,16 +106,37 @@ download_caddy() {
     fi
     mv -f "${tmp_dir}/caddy" "$CADDY_BIN"
     chmod 755 "$CADDY_BIN"
-    trap - RETURN
-    rm -rf "$tmp_dir"
-}
+)
 
 wait_for_admin_api() {
     local _
     for _ in $(seq 1 15); do
-        curl -sf "${ADMIN_API}/config/" &>/dev/null && return 0
+        curl -sf --connect-timeout 1 --max-time 2 "${ADMIN_API}/config/" &>/dev/null && return 0
         sleep 1
     done
+    return 1
+}
+
+# Print the ACME certificate belonging to DOMAIN. Do not treat an unrelated
+# certificate left in Caddy storage as proof that the requested site is ready.
+find_domain_certificate() {
+    local domain="$1" cert_dir="${CADDY_DATA_DIR}/certificates" cert=""
+    [ -n "$domain" ] && [ -d "$cert_dir" ] || return 1
+    cert=$(find "$cert_dir" -type f -name "${domain}.crt" 2>/dev/null | head -1 || true)
+    if [ -n "$cert" ]; then
+        printf '%s' "$cert"
+        return 0
+    fi
+    # Accommodate storage layouts whose filename is not the domain when the
+    # installed OpenSSL supports RFC 6125 hostname verification.
+    if check_cmd openssl && openssl x509 -help 2>&1 | grep -q -- '-checkhost'; then
+        while IFS= read -r cert; do
+            if openssl x509 -in "$cert" -noout -checkhost "$domain" >/dev/null 2>&1; then
+                printf '%s' "$cert"
+                return 0
+            fi
+        done < <(find "$cert_dir" -type f -name '*.crt' 2>/dev/null)
+    fi
     return 1
 }
 
@@ -133,10 +177,24 @@ build_users_directive() {
     fi
 }
 
+# Serialize configuration readers/writers when flock is available. The fallback
+# keeps compatibility with minimal systems; normal supported Linux packages
+# provide flock through util-linux.
+with_config_lock() {
+    if command -v flock >/dev/null 2>&1; then
+        mkdir -p "$TROJAN_DIR"
+        ( flock -x 9; "$@" ) 9>"${CONFIG_LOCK_FILE:-${TROJAN_DIR}/.config.lock}"
+    else
+        "$@"
+    fi
+}
+
 # Generate /etc/caddy/Caddyfile from domain + passwd.txt.
-# Users are declared statically (imgk official style). With `caddy` upstream,
-# keys also live in Caddy storage; delete must clear storage via Admin API.
-generate_caddyfile() {
+# Users are declared statically (imgk official style). The `memory caddy`
+# upstream keeps authentication and counters on the hot path in memory while
+# asynchronously persisting them to Caddy storage; delete must clear storage
+# through the Admin API as well as updating passwd.txt/Caddyfile.
+_generate_caddyfile() {
     local site_domain="${1:-}"
     if [ -z "$site_domain" ]; then
         site_domain=$(read_installed_domain 2>/dev/null || true)
@@ -146,6 +204,28 @@ generate_caddyfile() {
     chown root:caddy "$CADDY_DIR" "$TROJAN_DIR" "$WWW_DIR" 2>/dev/null || true
     chmod 750 "$CADDY_DIR" "$TROJAN_DIR"
     local users_block tls_line hub_proxy="" config_tmp outbound_ip
+    local https_port="${CADDY_HTTPS_PORT:-443}" http_port="${CADDY_HTTP_PORT:-80}"
+    local admin_listen="${CADDY_ADMIN_LISTEN:-127.0.0.1:2019}"
+    local https_redirect_port="" https_site_label
+    case "$https_port" in
+        ''|*[!0-9]*) error "Invalid Caddy HTTPS port: $https_port" ;;
+    esac
+    case "$http_port" in
+        ''|*[!0-9]*) error "Invalid Caddy HTTP port: $http_port" ;;
+    esac
+    [ "$https_port" -ge 1 ] && [ "$https_port" -le 65535 ] \
+        || error "Invalid Caddy HTTPS port: $https_port"
+    [ "$http_port" -ge 1 ] && [ "$http_port" -le 65535 ] \
+        || error "Invalid Caddy HTTP port: $http_port"
+    if [ "$https_port" = "443" ]; then
+        https_site_label=":443, ${site_domain}"
+    else
+        # A bare :PORT site is a catch-all TLS automation policy. Pairing it
+        # with an explicit certificate-bearing hostname at a non-default port
+        # makes recent Caddy versions reject the config as conflicting policies.
+        https_site_label="${site_domain}:${https_port}"
+        https_redirect_port=":${https_port}"
+    fi
     users_block=$(build_users_directive)
     # NOTE: $(...) strips trailing newlines; keep ${tls_line} on its own line in the heredoc.
     tls_line=$(tls_directive_line "$site_domain")
@@ -173,25 +253,25 @@ generate_caddyfile() {
     cat > "$config_tmp" <<EOF
 # Managed by EasyTrojan. Do not edit this file manually.
 {
-    admin 127.0.0.1:2019
+    admin ${admin_listen}
     # Must run before catch-all SPA 'handle' (and hub handle blocks).
     # 'before file_server' is too late: after 9b4c7b0 SPA lives inside handle,
     # so WS upgrades hit file_server HTML (HTTP 200) and never Trojan.
     order trojan before handle
-    https_port 443
-    servers :443 {
+    https_port ${https_port}
+    servers :${https_port} {
         # Browsers may use h2; Trojan WebSocket clients must offer http/1.1 only.
         protocols h2 h1
     }
-    servers :80 {
+    servers :${http_port} {
         protocols h1
     }
     trojan {
-        caddy
+        memory caddy
         no_proxy ${outbound_ip}
 ${users_block}    }
 }
-:443, ${site_domain} {
+${https_site_label} {
 ${tls_line}
     log {
         level ERROR
@@ -208,11 +288,11 @@ ${hub_proxy}    # Camouflage SPA (IT-Tools): only when hub routes above did not 
     }
 }
 # HTTP-01 ACME needs port 80; do not blanket-redirect challenge paths
-:80 {
+:${http_port} {
     @not_acme {
         not path /.well-known/acme-challenge/*
     }
-    redir @not_acme https://{host}{uri} permanent
+    redir @not_acme https://{host}${https_redirect_port}{uri} permanent
     root * ${WWW_DIR}
     file_server
 }
@@ -245,6 +325,10 @@ EOF
     chmod 640 "$MANAGED_MARKER"
 }
 
+generate_caddyfile() {
+    with_config_lock _generate_caddyfile "$@"
+}
+
 # Best-effort clear of a user from caddy storage (imgk CaddyUpstream).
 # Required on delete: removing from Caddyfile alone does not drop storage keys.
 delete_trojan_user_storage() {
@@ -252,19 +336,23 @@ delete_trojan_user_storage() {
     payload=$(printf '{"password":"%s"}' "$(json_escape "$passwd")")
     # imgk/caddy-trojan: DELETE /trojan/users/delete  body: {"password":"..."}
     # Password goes through http_send_json's temp body file, never argv.
-    http_send_json DELETE "${ADMIN_API}/trojan/users/delete" "" "$payload" -sf
+    http_send_json DELETE "${ADMIN_API}/trojan/users/delete" "" "$payload" -sf --connect-timeout 2 --max-time 8
 }
 
-remove_password_from_file() {
+_remove_password_from_file() {
     local passwd="$1"
     [ -f "$PASSWD_FILE" ] || return 0
     local tmp
-    tmp=$(mktemp)
+    tmp=$(mktemp "${TROJAN_DIR}/.passwd.XXXXXX")
     # exact line match only
     grep -Fxv -- "$passwd" "$PASSWD_FILE" > "$tmp" || true
     mv -f "$tmp" "$PASSWD_FILE"
     chmod 640 "$PASSWD_FILE"
     chown root:caddy "$PASSWD_FILE" 2>/dev/null || true
+}
+
+remove_password_from_file() {
+    with_config_lock _remove_password_from_file "$@"
 }
 
 # Echo the share/subscription transport: "tcp" when the Caddyfile has no
@@ -346,19 +434,23 @@ mask_secret() {
     fi
 }
 
-persist_password() {
+_persist_password() {
     local passwd="$1"
+    validate_password_value "$passwd"
     mkdir -p "$TROJAN_DIR"
     chown root:caddy "$TROJAN_DIR" 2>/dev/null || true
     chmod 750 "$TROJAN_DIR"
-    touch "$PASSWD_FILE"
-    chown root:caddy "$PASSWD_FILE" 2>/dev/null || true
+    local tmp
+    tmp=$(mktemp "${TROJAN_DIR}/.passwd.XXXXXX")
+    {
+        [ -f "$PASSWD_FILE" ] && cat "$PASSWD_FILE"
+        printf '%s\n' "$passwd"
+    } | awk 'NF && !seen[$0]++' > "$tmp"
+    mv -f "$tmp" "$PASSWD_FILE"
     chmod 640 "$PASSWD_FILE"
-    if ! grep -Fxq "$passwd" "$PASSWD_FILE" 2>/dev/null; then
-        printf '%s\n' "$passwd" >> "$PASSWD_FILE"
-    fi
-    awk 'NF && !seen[$0]++' "$PASSWD_FILE" > "${PASSWD_FILE}.tmp"
-    mv -f "${PASSWD_FILE}.tmp" "$PASSWD_FILE"
-    chmod 640 "$PASSWD_FILE"
     chown root:caddy "$PASSWD_FILE" 2>/dev/null || true
+}
+
+persist_password() {
+    with_config_lock _persist_password "$@"
 }
