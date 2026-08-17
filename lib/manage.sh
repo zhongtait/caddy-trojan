@@ -34,8 +34,7 @@ do_doctor() {
     fi
 
     if [ -x "$CADDY_BIN" ]; then
-        if XDG_CONFIG_HOME=/etc XDG_DATA_HOME=/var/lib HOME=/var/lib/caddy \
-            "$CADDY_BIN" validate --config "$CADDYFILE" --adapter caddyfile >/dev/null 2>&1; then
+        if validate_caddy_config "$CADDYFILE" >/dev/null 2>&1; then
             doctor_ok "Caddyfile validates"
         else
             doctor_fail "Caddyfile validation failed"
