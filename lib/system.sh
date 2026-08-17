@@ -2,9 +2,168 @@
 # EasyTrojan module: system.sh
 # shellcheck shell=bash
 
+_easytrojan_sysctl_bbr_specs() {
+    printf '%s\n' \
+        'net.core.default_qdisc|fq' \
+        'net.ipv4.tcp_congestion_control|bbr'
+}
+
+_easytrojan_sysctl_tuning_specs() {
+    local key current target min default max extra baseline
+    local -a keys=(
+        net.core.somaxconn
+        net.core.rmem_max
+        net.core.wmem_max
+        net.ipv4.tcp_rmem
+        net.ipv4.tcp_wmem
+        net.ipv4.tcp_max_syn_backlog
+    )
+
+    for key in "${keys[@]}"; do
+        current=$(sysctl -n "$key" 2>/dev/null) || return 1
+        current=$(_easytrojan_sysctl_normalize "$current")
+        case "$key" in
+            net.ipv4.tcp_rmem|net.ipv4.tcp_wmem)
+                read -r min default max extra <<< "$current"
+                if [ -z "${min:-}" ] || [ -z "${default:-}" ] || [ -z "${max:-}" ] \
+                    || [ -n "${extra:-}" ] \
+                    || ! [[ "$min" =~ ^[0-9]+$ && "$default" =~ ^[0-9]+$ && "$max" =~ ^[0-9]+$ ]]; then
+                    return 1
+                fi
+                if [ "$max" -lt 16777216 ]; then
+                    max=16777216
+                fi
+                target="${min} ${default} ${max}"
+                ;;
+            net.core.somaxconn|net.core.rmem_max|net.core.wmem_max|net.ipv4.tcp_max_syn_backlog)
+                if ! [[ "$current" =~ ^[0-9]+$ ]]; then
+                    return 1
+                fi
+                case "$key" in
+                    net.core.somaxconn) baseline=32768 ;;
+                    net.core.rmem_max|net.core.wmem_max) baseline=16777216 ;;
+                    net.ipv4.tcp_max_syn_backlog) baseline=8192 ;;
+                esac
+                if [ "$current" -lt "$baseline" ]; then
+                    target=$baseline
+                else
+                    target=$current
+                fi
+                ;;
+            *) return 1 ;;
+        esac
+        printf '%s|%s\n' "$key" "$target"
+    done
+}
+
+_easytrojan_sysctl_normalize() {
+    printf '%s\n' "$1" | awk '{$1=$1; print}'
+}
+
+# Save each key's first observed value and EasyTrojan's target value. The
+# original value is immutable. A managed target may advance only while the
+# current kernel value still matches the previous target; otherwise an
+# administrator has changed the key and the old rollback boundary is retained.
+_easytrojan_capture_sysctl_backup() {
+    local backup_file="${CADDY_SYSCTL_BACKUP_FILE:-/etc/caddy/.easytrojan-sysctl-backup}"
+    local backup_dir backup_tmp rewrite_tmp spec key target current
+    local record record_status existing_original existing_target
+    local -a specs=("$@")
+
+    [ "${#specs[@]}" -gt 0 ] || return 0
+    backup_dir=$(dirname "$backup_file")
+    if ! mkdir -p "$backup_dir" 2>/dev/null; then
+        warn "Cannot create sysctl backup directory: ${backup_dir}"
+        return 1
+    fi
+    backup_tmp=$(mktemp "${backup_file}.tmp.XXXXXX" 2>/dev/null) || {
+        warn "Cannot stage sysctl backup: ${backup_file}"
+        return 1
+    }
+    if [ -f "$backup_file" ]; then
+        if ! cp -f "$backup_file" "$backup_tmp"; then
+            rm -f "$backup_tmp"
+            warn "Cannot read sysctl backup: ${backup_file}"
+            return 1
+        fi
+    else
+        printf '%s\n' \
+            '# EasyTrojan sysctl backup v1' \
+            '# key<TAB>original<TAB>managed-target' > "$backup_tmp" || {
+            rm -f "$backup_tmp"
+            warn "Cannot initialize sysctl backup: ${backup_file}"
+            return 1
+        }
+    fi
+
+    for spec in "${specs[@]}"; do
+        key=${spec%%|*}
+        target=${spec#*|}
+        target=$(_easytrojan_sysctl_normalize "$target")
+        current=$(sysctl -n "$key" 2>/dev/null) || {
+            rm -f "$backup_tmp"
+            warn "Cannot read current sysctl value for backup: ${key}"
+            return 1
+        }
+        current=$(_easytrojan_sysctl_normalize "$current")
+
+        record_status=0
+        record=$(awk -F '\t' -v wanted="$key" '
+            $1 == wanted {
+                count++
+                if (NF != 3 || $2 == "" || $3 == "") invalid=1
+                if (count == 1) record=$2 "\t" $3
+            }
+            END {
+                if (invalid || count > 1) exit 2
+                if (count == 0) exit 1
+                print record
+            }
+        ' "$backup_tmp") || record_status=$?
+        if [ "$record_status" -gt 1 ]; then
+            rm -f "$backup_tmp"
+            warn "Invalid sysctl backup record for ${key}: ${backup_file}"
+            return 1
+        fi
+        if [ "$record_status" -eq 0 ]; then
+            existing_original=${record%%$'\t'*}
+            existing_target=${record#*$'\t'}
+            existing_original=$(_easytrojan_sysctl_normalize "$existing_original")
+            existing_target=$(_easytrojan_sysctl_normalize "$existing_target")
+            if [ "$current" = "$existing_target" ] && [ "$target" != "$existing_target" ]; then
+                rewrite_tmp=$(mktemp "${backup_file}.rewrite.XXXXXX" 2>/dev/null) || {
+                    rm -f "$backup_tmp"
+                    warn "Cannot stage sysctl backup target update: ${key}"
+                    return 1
+                }
+                if ! awk -F '\t' -v OFS='\t' -v wanted="$key" -v replacement="$target" '
+                    $1 == wanted { $3=replacement; updated=1 }
+                    { print }
+                    END { if (!updated) exit 1 }
+                ' "$backup_tmp" > "$rewrite_tmp" || ! mv -f "$rewrite_tmp" "$backup_tmp"; then
+                    rm -f "$rewrite_tmp" "$backup_tmp"
+                    warn "Cannot update managed sysctl target in backup: ${key}"
+                    return 1
+                fi
+            fi
+            continue
+        fi
+        printf '%s\t%s\t%s\n' "$key" "$current" "$target" >> "$backup_tmp" || {
+            rm -f "$backup_tmp"
+            warn "Cannot append sysctl backup record: ${key}"
+            return 1
+        }
+    done
+    if ! chmod 600 "$backup_tmp" 2>/dev/null || ! mv -f "$backup_tmp" "$backup_file"; then
+        rm -f "$backup_tmp"
+        warn "Cannot persist sysctl backup: ${backup_file}"
+        return 1
+    fi
+}
+
 enable_bbr() {
     local config_file="${BBR_SYSCTL_FILE:-/etc/sysctl.d/99-easytrojan-bbr.conf}"
-    local available current
+    local config_tmp available current spec
 
     info "Enabling BBR congestion control and proxy network tuning..."
     if check_cmd modprobe; then
@@ -16,6 +175,16 @@ enable_bbr() {
         warn "BBR is not available on this kernel; continuing with the current congestion control"
         return 0
     fi
+    local -a bbr_specs=()
+    while IFS= read -r spec; do
+        [ -n "$spec" ] && bbr_specs+=("$spec")
+    done < <(_easytrojan_sysctl_bbr_specs)
+    if ! _easytrojan_capture_sysctl_backup "${bbr_specs[@]}"; then
+        # Do not mutate global kernel state when its original values cannot be
+        # recorded; a later uninstall could not safely put the host back.
+        warn "Could not save original BBR sysctl values; leaving runtime tuning unchanged"
+        return 0
+    fi
     if ! sysctl -w net.core.default_qdisc=fq &>/dev/null; then
         warn "Failed to enable the fq queue discipline; BBR was not changed"
         return 0
@@ -24,25 +193,28 @@ enable_bbr() {
         warn "Failed to enable BBR; continuing with the current congestion control"
         return 0
     fi
-    # Two safe, proxy-friendly tunables applied alongside BBR (both reversible):
-    #  - tcp_slow_start_after_idle=0 keeps long-lived Trojan/WS tunnels at full
-    #    speed after brief idle, instead of restarting from a small window.
-    #  - tcp_notsent_lowat=16384 caps unsent bytes queued per socket, lowering
-    #    per-connection memory and write latency under load.
-    sysctl -w net.ipv4.tcp_slow_start_after_idle=0 &>/dev/null || true
-    sysctl -w net.ipv4.tcp_notsent_lowat=16384 &>/dev/null || true
-    if ! {
-        printf '%s\n' \
-            '# Managed by EasyTrojan' \
-            'net.core.default_qdisc = fq' \
-            'net.ipv4.tcp_congestion_control = bbr' \
-            'net.ipv4.tcp_slow_start_after_idle = 0' \
-            'net.ipv4.tcp_notsent_lowat = 16384' > "$config_file"
-    }; then
+    # Keep the default profile limited to the congestion-control selection.
+    # tcp_notsent_lowat and tcp_slow_start_after_idle are workload-dependent
+    # global knobs; changing them here can increase wakeups or burst loss on
+    # high-RTT links. Advanced users can opt into them outside the installer.
+    if ! mkdir -p "$(dirname "$config_file")" 2>/dev/null; then
+        warn "BBR is active for this boot but its sysctl directory is unavailable"
+        return 0
+    fi
+    config_tmp=$(mktemp "${config_file}.tmp.XXXXXX" 2>/dev/null) || {
+        warn "BBR is active for this boot but its sysctl file could not be staged"
+        return 0
+    }
+    if ! printf '%s\n' \
+        '# Managed by EasyTrojan' \
+        'net.core.default_qdisc = fq' \
+        'net.ipv4.tcp_congestion_control = bbr' > "$config_tmp" \
+        || ! chmod 644 "$config_tmp" 2>/dev/null \
+        || ! mv -f "$config_tmp" "$config_file"; then
+        rm -f "$config_tmp"
         warn "BBR is active for this boot but could not be persisted to ${config_file}"
         return 0
     fi
-    chmod 644 "$config_file" 2>/dev/null || true
     current=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
     if [ "$current" = "bbr" ]; then
         ok "BBR enabled and persisted (${config_file})"
@@ -52,38 +224,158 @@ enable_bbr() {
 }
 
 apply_sysctl_limits() {
-    info "Applying system optimizations..."
-    cat > /etc/sysctl.d/99-caddy-trojan.conf <<'EOF'
-# Caddy-Trojan system optimizations (scoped, reversible)
-fs.file-max = 1048576
-fs.inotify.max_user_instances = 8192
-net.core.somaxconn = 32768
-net.core.netdev_max_backlog = 16384
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 16384 16777216
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_fin_timeout = 30
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.ip_local_port_range = 1024 65000
-net.ipv4.tcp_max_syn_backlog = 8192
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_notsent_lowat = 16384
-EOF
-    sysctl --system &>/dev/null || true
+    local config_file="${CADDY_SYSCTL_FILE:-/etc/sysctl.d/99-caddy-trojan.conf}"
+    local config_tmp load_output key expected actual failed=0 spec specs_output
+    local -a tuning_specs=()
 
-    cat > /etc/security/limits.d/caddy-trojan.conf <<'EOF'
-# Caddy-Trojan limits
-caddy soft nofile 1048576
-caddy hard nofile 1048576
-caddy soft nproc  65535
-caddy hard nproc  65535
-root  soft nofile 1048576
-root  hard nofile 1048576
+    if ! specs_output=$(_easytrojan_sysctl_tuning_specs); then
+        warn "Cannot derive safe non-decreasing sysctl targets from the current host values"
+        return 1
+    fi
+    while IFS= read -r spec; do
+        [ -n "$spec" ] && tuning_specs+=("$spec")
+    done <<< "$specs_output"
+
+    info "Applying optional system optimizations..."
+    _easytrojan_capture_sysctl_backup "${tuning_specs[@]}" \
+        || { warn "Optional system tuning was not applied because its rollback snapshot failed"; return 1; }
+    if ! mkdir -p "$(dirname "$config_file")" 2>/dev/null; then
+        warn "Cannot create sysctl configuration directory: $(dirname "$config_file")"
+        return 1
+    fi
+    config_tmp=$(mktemp "${config_file}.tmp.XXXXXX" 2>/dev/null) || {
+        warn "Cannot stage sysctl configuration: ${config_file}"
+        return 1
+    }
+    if ! cat > "$config_tmp" <<'EOF'
+# Caddy-Trojan optional high-BDP / connection-rate tuning.
+# Values are applied only when --tune-system is explicitly requested.
 EOF
-    ok "Optional system limits applied"
+    then
+        rm -f "$config_tmp"
+        warn "Cannot write sysctl configuration: ${config_file}"
+        return 1
+    fi
+    # Write the dynamically computed targets. Scalar values never decrease;
+    # TCP min/default windows are preserved while only the max is raised.
+    for spec in "${tuning_specs[@]}"; do
+        key=${spec%%|*}
+        expected=${spec#*|}
+        printf '%s = %s\n' "$key" "$expected" >> "$config_tmp" || {
+            rm -f "$config_tmp"
+            warn "Cannot write sysctl target: ${key}"
+            return 1
+        }
+    done
+    if ! chmod 644 "$config_tmp" 2>/dev/null || ! mv -f "$config_tmp" "$config_file"; then
+        rm -f "$config_tmp"
+        warn "Cannot persist sysctl configuration: ${config_file}"
+        return 1
+    fi
+
+    load_output=$(sysctl -p "$config_file" 2>&1) || {
+        failed=1
+        warn "One or more optional sysctl values could not be loaded"
+        [ -n "$load_output" ] && warn "$load_output"
+    }
+
+    # sysctl -p can report success even when a later config overrides a value,
+    # so read every managed key back from /proc/sys and compare normalized data.
+    for spec in "${tuning_specs[@]}"; do
+        key=${spec%%|*}
+        expected=${spec#*|}
+        actual=$(sysctl -n "$key" 2>/dev/null || true)
+        actual=$(_easytrojan_sysctl_normalize "$actual")
+        if [ "$actual" != "$expected" ]; then
+            warn "sysctl ${key} did not take effect (expected '${expected}', got '${actual:-unavailable}')"
+            failed=1
+        fi
+    done
+
+    if [ "$failed" -ne 0 ]; then
+        warn "Optional system optimizations were not fully applied; inspect ${config_file}"
+        return 1
+    fi
+    ok "Optional system optimizations applied and verified (${config_file})"
+}
+
+# Print read-only network counters and service limits. This intentionally does
+# not reset nstat counters or change qdisc/sysctl state; operators can run it
+# repeatedly while comparing a short measurement window from the host.
+doctor_network() {
+    local key value line cc available qdisc_summary ss_summary nstat_output
+    local pid fd_count nofile_limit softnet_drop=0 softnet_squeeze=0 drops squeeze
+
+    info "Network diagnostics (read-only)"
+
+    if check_cmd sysctl; then
+        cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+        available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+        [ -n "$cc" ] && info "TCP congestion control: ${cc}"
+        [ -n "$available" ] && info "TCP algorithms available: ${available}"
+        for key in net.core.default_qdisc net.core.somaxconn net.core.rmem_max \
+            net.core.wmem_max net.ipv4.tcp_max_syn_backlog; do
+            value=$(sysctl -n "$key" 2>/dev/null || true)
+            [ -n "$value" ] && info "${key}=${value}"
+        done
+    else
+        warn "sysctl is unavailable; kernel network settings were not inspected"
+    fi
+
+    if check_cmd tc; then
+        qdisc_summary=$(tc -s qdisc show 2>/dev/null | awk '
+            /^qdisc / || /^ Sent / || /^ backlog / || / dropped [0-9]+/ || / requeues [0-9]+/ {print}
+        ' | head -24 || true)
+        if [ -n "$qdisc_summary" ]; then
+            while IFS= read -r line; do
+                [ -n "$line" ] && info "qdisc: $line"
+            done <<< "$qdisc_summary"
+        else
+            warn "tc returned no qdisc statistics"
+        fi
+    else
+        warn "tc is unavailable; actual interface qdisc was not inspected"
+    fi
+
+    if check_cmd nstat; then
+        nstat_output=$(nstat -az 2>/dev/null || true)
+        info "nstat counters below are cumulative; compare two snapshots for a measurement window"
+        for key in TcpInSegs TcpOutSegs TcpRetransSegs TcpExtTCPTimeouts \
+            TcpExtTCPSynRetrans TcpExtTCPBacklogDrop TcpExtTCPRcvQDrop \
+            TcpExtListenOverflows TcpExtListenDrops; do
+            value=$(awk -v wanted="$key" '$1 == wanted {print $2; exit}' <<< "$nstat_output")
+            [ -n "$value" ] && info "nstat ${key}=${value}"
+        done
+    else
+        warn "nstat is unavailable; TCP counters were not inspected"
+    fi
+
+    if [ -r /proc/net/softnet_stat ]; then
+        while read -r _ drops squeeze _; do
+            [[ "$drops" =~ ^[[:xdigit:]]+$ ]] || continue
+            [[ "$squeeze" =~ ^[[:xdigit:]]+$ ]] || continue
+            softnet_drop=$((softnet_drop + 16#$drops))
+            softnet_squeeze=$((softnet_squeeze + 16#$squeeze))
+        done < /proc/net/softnet_stat
+        info "softnet drops=${softnet_drop} time_squeeze=${softnet_squeeze} (cumulative)"
+    fi
+
+    if check_cmd ss; then
+        ss_summary=$(ss -s 2>/dev/null || true)
+        while IFS= read -r line; do
+            [ -n "$line" ] && info "sockets: $line"
+        done <<< "$ss_summary"
+    fi
+
+    if check_cmd systemctl; then
+        nofile_limit=$(systemctl show caddy.service -p LimitNOFILE --value 2>/dev/null || true)
+        pid=$(systemctl show caddy.service -p MainPID --value 2>/dev/null || true)
+        [ -n "$nofile_limit" ] && info "caddy LimitNOFILE=${nofile_limit}"
+        if [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 0 ] && [ -d "/proc/${pid}/fd" ]; then
+            fd_count=$(find "/proc/${pid}/fd" -mindepth 1 -maxdepth 1 -type l 2>/dev/null | wc -l | tr -d '[:space:]')
+            [ -n "$fd_count" ] && info "caddy open file descriptors=${fd_count} (pid ${pid})"
+        fi
+    fi
 }
 
 # Echo a soft GOMEMLIMIT value in MiB (~75% of RAM), or nothing when RAM is
@@ -107,9 +399,14 @@ write_caddy_unit() {
     # Go's GC reclaim harder instead of the box OOM-killing Caddy. Omitted if RAM
     # is undetectable or tiny.
     local gomemlimit_env="" limit_mib
+    local unit_file="${CADDY_UNIT_FILE:-/etc/systemd/system/caddy.service}"
+    local xdg_config_home="${CADDY_XDG_CONFIG_HOME:-/etc}"
+    local xdg_data_home="${CADDY_XDG_DATA_HOME:-/var/lib}"
+    local data_dir="${CADDY_DATA_DIR:-${xdg_data_home}/caddy}"
     limit_mib=$(derive_gomemlimit_mib)
     [ -n "$limit_mib" ] && gomemlimit_env="Environment=GOMEMLIMIT=${limit_mib}MiB"
-    cat > /etc/systemd/system/caddy.service <<EOF
+    mkdir -p "$(dirname "$unit_file")"
+    cat > "$unit_file" <<EOF
 [Unit]
 # Managed by EasyTrojan
 Description=Caddy
@@ -121,7 +418,7 @@ Requires=network-online.target
 Type=notify
 User=caddy
 Group=caddy
-Environment=XDG_CONFIG_HOME=/etc XDG_DATA_HOME=/var/lib HOME=/var/lib/caddy
+Environment=XDG_CONFIG_HOME=${xdg_config_home} XDG_DATA_HOME=${xdg_data_home} HOME=${data_dir}
 ${gomemlimit_env}
 ExecStart=${CADDY_BIN} run --environ --config ${CADDYFILE}
 ExecReload=${CADDY_BIN} reload --config ${CADDYFILE} --force
@@ -130,7 +427,7 @@ LimitNOFILE=1048576
 LimitNPROC=512
 PrivateTmp=true
 ProtectSystem=full
-ReadWritePaths=/var/lib/caddy
+ReadWritePaths=${data_dir}
 NoNewPrivileges=true
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE

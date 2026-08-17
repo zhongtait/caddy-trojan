@@ -7,7 +7,9 @@
 ### 新增
 
 - 网络：安装时可选择 Trojan 出站 IPv4 或 IPv6 优先级，默认 IPv4；另一地址族保持自动回退，选择会持久化并显示在 status 中。
-- 系统：默认随 BBR 一并应用并持久化 `tcp_slow_start_after_idle=0` 与 `tcp_notsent_lowat=16384`（长连接空闲后恢复满速、降低每连接内存）；安装与 `update` 均生效。
+- 网络：出站 TCP/UDP DNS、IP literal 和双栈竞速统一受 10 秒总拨号预算约束，取消时清理未获胜连接；补充可取消拨号单测。
+- 系统：默认网络配置收敛为 `fq` + BBR，不再全局设置依赖具体负载的 `tcp_slow_start_after_idle` 与 `tcp_notsent_lowat`。
+- 系统：`--tune-system` 在 Caddy 创建 listener 前应用并逐项回读验证；新增 `doctor --network` 只读诊断。
 - 系统：为 Caddy 服务设置软内存上限 `GOMEMLIMIT`（约 75% 内存），作为小内存 VPS 的 OOM 兜底；内存无法探测或过小时自动跳过。
 - 系统：安装时在内核支持的情况下启用并持久化 `fq` + BBR；更广泛的 sysctl / limits 调优保持可选。
 - Hub：节点聚合 Hub `easytrojan hub enable|disable|status|url|token|list|remove|join`。
@@ -25,10 +27,11 @@
 - 文档：新增 `SECURITY.md`。
 - CI：将 `shellcheck`（warning 级）接入 `scripts/ci_validate.sh` 与 GitHub Actions，新增 `.shellcheckrc`。
 - CI：新增 `scripts/ci_validate.sh` 与 GitHub Actions CI Validate（shell 语法、模块清单、Hub 冒烟测试；不安装节点）。
-- 测试：Hub 单元测试自 7 增至 12（节点缓存与拷贝隔离、落盘失败、`build_link` 的 tcp/IPv6、`delete_by_credentials`、订阅体等）。
+- 测试：Hub 单元测试扩展至 34 项，`hub_server.py` 达到 100% 行与分支覆盖；覆盖 HTTP 路由、gzip 大批量同步、错误映射、并发槽位、状态落盘和启动入口。
 
 ### 变更
 
+- Caddy 性能：Trojan upstream 切换为 `memory caddy` 混合模式，鉴权与流量计数走内存热路径，同时保留 Caddy storage 持久化；有界异步队列会在正常关闭时刷完，并跳过临时 key、自动修复损坏的用户记录。真实 systemd 测试覆盖并发动态用户跨进程重启恢复。
 - Hub 性能：按文件标识（mtime / size / inode）缓存已校验的节点与默认订阅体，重复 `/sub` 拉取不再重复解析与校验；`/sub` 启用 HTTP/1.1 keep-alive（写操作强制关闭连接）。
 - 重构：抽取 `detect_share_transport`、`hub_json_field`、`hub_register_payload`、`hub_indexed_name`、`hub_unregister_password`、`validate_port`、`http_send_json` 等公共函数，消除多处重复逻辑。
 - 重构：拆分 `easytrojan.sh` 为入口 + `lib/*.sh` 模块（common / tls / caddy / camouflage / system / hub / manage / install）；安装与更新同步到 `/usr/local/share/easytrojan/lib`。
@@ -41,7 +44,7 @@
 - 伪装站：改为部署 [CorentinTh/it-tools](https://github.com/CorentinTh/it-tools) 静态包，下载失败时回退内置 ByteDeck 工具页；Caddyfile 对站点使用 SPA `try_files` 回退 `/index.html`。
 - Caddy：Caddyfile 明确限制 Admin API 监听 `127.0.0.1:2019`。
 - 系统：sysctl / limits 优化范围收敛，便于卸载回滚。
-- 发布：Release tag 使用 `caddy-version+trojan.<sha7>`，避免插件更新时 tag 冲突。
+- 发布：Release tag 使用 `caddy-version+trojan.<upstream-sha12>.et.<source-sha12>`，同时绑定上游插件与已测试的 EasyTrojan 源码提交；已存在 tag 和资产禁止覆盖。
 - 界面：`status` 默认隐藏分享链接，需 `--show-link`。
 - 界面：install / status 显示客户端 ALPN 为 `http/1.1` only（而非 h2）。
 - 界面：将预期内的防火墙与固定资源完整性提示改为信息级消息，warning 仅保留给真正的失败。
@@ -51,10 +54,22 @@
 
 ### 修复
 
+- 安全：入口引导不再在 GitHub commit API 不可用时执行可变的 `main` 分支归档；仓库与 Release 模块包拒绝符号链接条目。
+- 安全：拒绝含控制字符的 Trojan 密码与 Hub 显示名，分享链接服务器地址增加 IPv4/IPv6/域名校验并正确括起 IPv6。
+- 可靠性：ACME 就绪检查限定为当前域名证书；Caddy 下载临时目录在失败路径也会清理；控制面 HTTP 请求增加超时。
+- Hub：新增原子 `/api/sync` 批量同步接口，减少逐用户落盘并避免重同步先删后加导致节点丢失；membership 文件写入失败会正确返回错误并同步目录落盘。
+- 更新：脚本与模块采用完整 bundle 原子切换，激活失败时自动回滚旧版本；密码文件与 Caddyfile 生成共用配置锁，降低并发操作互相覆盖的风险。
+- 测试：加入标准 `unittest discover` 测试包标记、域名证书误判、IPv6 分享链接、密码控制字符和 Hub 原子同步回归测试。
+- 发布安全：Release 对 `SHA256SUMS` 生成 Sigstore keyless bundle；安装/更新固定 cosign 版本与摘要并校验 GitHub Actions workflow 身份，旧版无签名 Release 仅支持显式兼容开关。
+- 发布安全：上游候选先完成构建、Hub 覆盖率和真实 systemd 集成门禁，再更新 `sha`；打包、OIDC 签名与 GitHub 发布拆分为最小权限 job，发布 job 不再执行外部构建产物。
+- 测试：新增离线 Release 签名策略测试，覆盖签名缺失、显式 legacy 放宽、无效签名和有效签名路径。
+- CI：Release 必须先通过 Python/Shell 校验、Hub 100% 行与分支覆盖，以及真实 Linux + systemd + Caddy 集成测试，门禁通过后才创建 tag。
+
 - Caddy：Trojan-over-WebSocket 配置不再启用 raw `listener_wrappers { trojan }`，避免其在 TLS 前拦截普通 443 流量并造成间歇性空响应；从旧配置迁移时自动完整重启 Caddy，防止旧 listener 在 graceful reload 后继续存活。
 - Hub：`_save_json` 的磁盘 / 权限错误转为 `DataStoreError`（干净的 503）而非直接断连；负数 `Content-Length` 返回 400（原为 413）。
 - 命令行：`--port` 非数字即报错，避免注入非法 JSON；安装证书回滚分支在 `set -e` 下不再中途退出；`uninstall.sh` 接受 `yes`。
 - 安装：增加完整的运行依赖预检，按 Debian / RHEL 正确映射 `iproute2` / `iproute` 与 `passwd` / `shadow-utils`，并在安装后确认所需命令确实可用。
+- 安装：显式预检并安装 `flock`（`util-linux`），确保密码与 Caddyfile 配置锁在精简 Linux 系统上不会退化。
 - Caddy：Caddyfile 增加 `order trojan before handle`，避免 Trojan WebSocket 被伪装站 SPA `handle` 吞掉（客户端拿到 HTTP 200 HTML 而非 WS 101）；`update` 现在会重新生成 Caddyfile。
 - 客户端：强制 WebSocket 分享 / 订阅链接的 ALPN 为 `http/1.1`，h2 优先协商会导致延迟测试与连接间歇失败。
 - 客户端：分享 / 订阅链接默认 `alpn=http/1.1`，修复 Cloudflare WebSocket 延迟与 TLS 断连。

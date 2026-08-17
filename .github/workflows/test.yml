@@ -6,8 +6,11 @@ on:
     - cron: '30 2 * * *'
 
 permissions:
-  contents: write
-  actions: write
+  contents: read
+
+concurrency:
+  group: easytrojan-check-upstream
+  cancel-in-progress: false
 
 jobs:
   check:
@@ -17,8 +20,10 @@ jobs:
       remote_sha: ${{ steps.check.outputs.remote_sha }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
-      - name: Check Upstream SHA
+      - name: Check upstream SHA
         id: check
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -30,40 +35,73 @@ jobs:
             -H "User-Agent: Caddy-Trojan-CI" \
             "https://api.github.com/repos/imgk/caddy-trojan/commits?per_page=1" \
             | jq -r '.[0].sha')
-
-          if [ -z "$REMOTE_SHA" ] || [ "$REMOTE_SHA" = "null" ]; then
-            echo "Failed to fetch upstream SHA"
+          if ! printf '%s' "$REMOTE_SHA" | grep -Eq '^[0-9a-fA-F]{40}$'; then
+            echo "Failed to fetch a valid upstream SHA" >&2
             exit 1
           fi
-          echo "remote_sha=${REMOTE_SHA}" >> "$GITHUB_OUTPUT"
+          LOCAL_SHA=$(tr -d '[:space:]' < sha)
+          {
+            echo "remote_sha=${REMOTE_SHA}"
+            if [ "$REMOTE_SHA" != "$LOCAL_SHA" ]; then
+              echo "updated=true"
+              echo "Upstream candidate: ${LOCAL_SHA:-none} -> ${REMOTE_SHA}" >&2
+            else
+              echo "updated=false"
+              echo "No changes detected" >&2
+            fi
+          } >> "$GITHUB_OUTPUT"
 
-          LOCAL_SHA=$(cat sha 2>/dev/null || echo "")
-
-          if [ "$REMOTE_SHA" != "$LOCAL_SHA" ]; then
-            printf '%s\n' "$REMOTE_SHA" > sha
-            echo "updated=true" >> "$GITHUB_OUTPUT"
-            echo "Upstream updated: ${LOCAL_SHA:-none} -> ${REMOTE_SHA}"
-          else
-            echo "updated=false" >> "$GITHUB_OUTPUT"
-            echo "No changes detected"
-          fi
-
-      - name: Commit and Push
-        if: steps.check.outputs.updated == 'true'
-        run: |
-          set -euo pipefail
-          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git add sha
-          git commit -m "chore: update upstream sha to $(cut -c1-7 sha)"
-          git push
-
-  # GITHUB_TOKEN pushes do NOT trigger other workflows (GitHub security).
-  # Explicitly call the build workflow when upstream changed.
-  build:
+  gate:
     needs: check
     if: needs.check.outputs.updated == 'true'
     uses: ./.github/workflows/release.yml
     with:
       upstream_sha: ${{ needs.check.outputs.remote_sha }}
+      source_ref: ${{ github.sha }}
+      gate_only: true
+
+  commit:
+    needs: [check, gate]
+    if: needs.check.outputs.updated == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      commit_sha: ${{ steps.commit.outputs.commit_sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Commit tested upstream SHA
+        id: commit
+        env:
+          REMOTE_SHA: ${{ needs.check.outputs.remote_sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          [ "$(git rev-parse origin/main)" = "$GITHUB_SHA" ] || {
+            echo "main advanced while the candidate was tested; refusing to publish untested source" >&2
+            exit 1
+          }
+          printf '%s\n' "$REMOTE_SHA" > sha
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add sha
+          git commit -m "chore: update upstream sha to $(printf '%s' "$REMOTE_SHA" | cut -c1-7)"
+          git push origin HEAD:refs/heads/main
+          echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: [check, commit]
+    if: needs.check.outputs.updated == 'true'
+    permissions:
+      contents: write
+      id-token: write
+    uses: ./.github/workflows/release.yml
+    with:
+      upstream_sha: ${{ needs.check.outputs.remote_sha }}
+      source_ref: ${{ needs.commit.outputs.commit_sha }}
+      gate_only: false
     secrets: inherit

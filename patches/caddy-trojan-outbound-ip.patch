@@ -1,5 +1,5 @@
 diff --git a/app/proxy.go b/app/proxy.go
-index d1844bb..e2a5ec9 100644
+index d1844bb..6d72b81 100644
 --- a/app/proxy.go
 +++ b/app/proxy.go
 @@ -2,6 +2,7 @@ package app
@@ -10,15 +10,17 @@ index d1844bb..e2a5ec9 100644
  	"encoding/base64"
  	"encoding/json"
  	"errors"
-@@ -10,6 +11,7 @@ import (
+@@ -9,7 +10,9 @@ import (
+ 	"io"
  	"net"
  	"net/http"
++	"net/netip"
  	"sync"
 +	"time"
  
  	"golang.org/x/net/proxy"
  
-@@ -34,7 +36,19 @@ func init() {
+@@ -34,7 +37,19 @@ func init() {
  	fn := ProxyParser(nil)
  
  	fn = func(args []string) (json.RawMessage, error) {
@@ -39,50 +41,80 @@ index d1844bb..e2a5ec9 100644
  	}
  	RegisterProxyParser("none", fn)
  	RegisterProxyParser("no_proxy", fn)
-@@ -95,7 +109,9 @@ type Proxy interface {
+@@ -95,7 +110,14 @@ type Proxy interface {
  	trojan.Dialer
  }
  
 -type NoProxy struct{}
++const (
++	noProxyDialTimeout   = 10 * time.Second
++	noProxyFallbackDelay = 300 * time.Millisecond
++)
++
 +type NoProxy struct {
 +	Network string `json:"network,omitempty"`
 +}
  
  func (NoProxy) CaddyModule() caddy.ModuleInfo {
  	return caddy.ModuleInfo{
-@@ -108,14 +124,114 @@ func (*NoProxy) Close() error {
+@@ -108,14 +130,158 @@ func (*NoProxy) Close() error {
  	return nil
  }
  
 -func (*NoProxy) Dial(network, addr string) (net.Conn, error) {
 -	return net.Dial(network, addr)
 +func (p *NoProxy) Dial(network, addr string) (net.Conn, error) {
-+	if p.Network == "" || (network != "tcp" && network != "udp") {
-+		return net.Dial(network, addr)
++	ctx, cancel := context.WithTimeout(context.Background(), noProxyDialTimeout)
++	defer cancel()
++	return p.dialContext(ctx, network, addr)
++}
++
++func (p *NoProxy) dialContext(ctx context.Context, network, addr string) (net.Conn, error) {
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
++	if p.Network == "" || !isTCPOrUDP(network) {
++		return (&net.Dialer{}).DialContext(ctx, network, addr)
 +	}
 +	host, port, err := net.SplitHostPort(addr)
-+	if err != nil || net.ParseIP(host) != nil {
-+		return net.Dial(network, addr)
++	if err != nil || isIPLiteral(host) {
++		return (&net.Dialer{}).DialContext(ctx, network, addr)
 +	}
-+	ips, err := net.LookupIP(host)
++	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
 +	if err != nil {
 +		return nil, err
 +	}
 +	primary, fallback := p.prioritizedIPs(ips)
-+	if network == "udp" {
++	if isUDPNetwork(network) {
 +		if len(primary) == 0 {
 +			primary = fallback
 +		}
 +		if len(primary) == 0 {
 +			return nil, fmt.Errorf("no IP address found for %s", host)
 +		}
-+		return net.Dial(network, net.JoinHostPort(primary[0].String(), port))
++		return (&net.Dialer{}).DialContext(ctx, network, net.JoinHostPort(primary[0].String(), port))
 +	}
-+	return dialTCPPreferred(port, primary, fallback)
++	return dialTCPPreferred(ctx, network, port, primary, fallback)
++}
++
++func isTCPOrUDP(network string) bool {
++	return isTCPNetwork(network) || isUDPNetwork(network)
++}
++
++func isTCPNetwork(network string) bool {
++	return network == "tcp" || network == "tcp4" || network == "tcp6"
++}
++
++func isUDPNetwork(network string) bool {
++	return network == "udp" || network == "udp4" || network == "udp6"
++}
++
++func isIPLiteral(host string) bool {
++	_, err := netip.ParseAddr(host)
++	return err == nil
  }
  
--func (*NoProxy) ListenPacket(network, addr string) (net.PacketConn, error) {
-+func (p *NoProxy) ListenPacket(network, addr string) (net.PacketConn, error) {
+ func (*NoProxy) ListenPacket(network, addr string) (net.PacketConn, error) {
  	return net.ListenPacket(network, addr)
  }
  
@@ -98,7 +130,7 @@ index d1844bb..e2a5ec9 100644
 +	return primary, fallback
 +}
 +
-+func dialTCPPreferred(port string, primary, fallback []net.IP) (net.Conn, error) {
++func dialTCPPreferred(parent context.Context, network, port string, primary, fallback []net.IP) (net.Conn, error) {
 +	type result struct {
 +		conn net.Conn
 +		err  error
@@ -110,42 +142,54 @@ index d1844bb..e2a5ec9 100644
 +	if len(primary) == 0 {
 +		return nil, errors.New("no IP address found")
 +	}
-+	ctx, cancel := context.WithCancel(context.Background())
++	ctx, cancel := context.WithCancel(parent)
 +	defer cancel()
-+	results := make(chan result)
++	results := make(chan result, len(primary)+len(fallback))
++	var workers sync.WaitGroup
 +	dial := func(ip net.IP, ipv4 bool) {
++		workers.Add(1)
 +		go func() {
-+			conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", net.JoinHostPort(ip.String(), port))
-+			got := result{conn: conn, err: err, ipv4: ipv4}
-+			if ctx.Err() != nil {
-+				if conn != nil {
-+					conn.Close()
-+				}
-+				return
-+			}
-+			select {
-+			case results <- got:
-+			case <-ctx.Done():
-+				if conn != nil {
-+					conn.Close()
++			defer workers.Done()
++			conn, err := (&net.Dialer{}).DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
++			results <- result{conn: conn, err: err, ipv4: ipv4}
++		}()
++	}
++	cleanup := func() {
++		cancel()
++		go func() {
++			workers.Wait()
++			close(results)
++			for got := range results {
++				if got.conn != nil {
++					_ = got.conn.Close()
 +				}
 +			}
 +		}()
 +	}
++
 +	dial(primary[0], primary[0].To4() != nil)
 +	primaryNext, fallbackNext, pending := 1, 0, 1
-+	timer := time.NewTimer(300 * time.Millisecond)
++	timer := time.NewTimer(noProxyFallbackDelay)
 +	defer timer.Stop()
++	var timerC <-chan time.Time = timer.C
++	primaryV4 := primary[0].To4() != nil
 +	var lastErr error
 +	for pending > 0 {
 +		select {
++		case <-ctx.Done():
++			cleanup()
++			return nil, ctx.Err()
 +		case got := <-results:
 +			pending--
 +			if got.err == nil {
++				cleanup()
 +				return got.conn, nil
 +			}
++			if got.conn != nil {
++				_ = got.conn.Close()
++			}
 +			lastErr = got.err
-+			if got.ipv4 == (primary[0].To4() != nil) && primaryNext < len(primary) {
++			if got.ipv4 == primaryV4 && primaryNext < len(primary) {
 +				dial(primary[primaryNext], primary[primaryNext].To4() != nil)
 +				primaryNext++
 +				pending++
@@ -154,17 +198,450 @@ index d1844bb..e2a5ec9 100644
 +				fallbackNext++
 +				pending++
 +			}
-+		case <-timer.C:
++		case <-timerC:
++			if ctx.Err() != nil {
++				cleanup()
++				return nil, ctx.Err()
++			}
 +			if fallbackNext < len(fallback) {
 +				dial(fallback[fallbackNext], fallback[fallbackNext].To4() != nil)
 +				fallbackNext++
 +				pending++
 +			}
++			timerC = nil
 +		}
 +	}
++	cancel()
 +	return nil, lastErr
 +}
 +
  type noProxy struct {
  	NoProxy
  }
+diff --git a/app/proxy_outbound_test.go b/app/proxy_outbound_test.go
+new file mode 100644
+index 0000000..12a6ee2
+--- /dev/null
++++ b/app/proxy_outbound_test.go
+@@ -0,0 +1,66 @@
++package app
++
++import (
++	"context"
++	"errors"
++	"net"
++	"testing"
++	"time"
++)
++
++func TestNoProxyDialTimeout(t *testing.T) {
++	if noProxyDialTimeout != 10*time.Second {
++		t.Fatalf("noProxyDialTimeout = %v, want 10s", noProxyDialTimeout)
++	}
++}
++
++func TestNoProxyDialContextCanceledDNS(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++
++	conn, err := (&NoProxy{Network: "ipv4"}).dialContext(ctx, "tcp", "timeout.invalid:443")
++	if conn != nil {
++		_ = conn.Close()
++		t.Fatal("dialContext returned a connection for a canceled DNS lookup")
++	}
++	if !errors.Is(err, context.Canceled) {
++		t.Fatalf("dialContext error = %v, want context.Canceled", err)
++	}
++}
++
++func TestNoProxyDialContextCanceledIPLiteral(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++
++	conn, err := (&NoProxy{Network: "ipv4"}).dialContext(ctx, "tcp", "192.0.2.1:443")
++	if conn != nil {
++		_ = conn.Close()
++		t.Fatal("dialContext returned a connection for a canceled IP-literal dial")
++	}
++	if !errors.Is(err, context.Canceled) {
++		t.Fatalf("dialContext error = %v, want context.Canceled", err)
++	}
++}
++
++func TestDialTCPPreferredCanceled(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++
++	conn, err := dialTCPPreferred(ctx, "tcp", "443", []net.IP{net.ParseIP("127.0.0.1")}, nil)
++	if conn != nil {
++		_ = conn.Close()
++		t.Fatal("dialTCPPreferred returned a connection for a canceled context")
++	}
++	if !errors.Is(err, context.Canceled) {
++		t.Fatalf("dialTCPPreferred error = %v, want context.Canceled", err)
++	}
++}
++
++func TestIsIPLiteralWithIPv6Zone(t *testing.T) {
++	if !isIPLiteral("fe80::1%eth0") {
++		t.Fatal("isIPLiteral rejected an IPv6 literal with a zone")
++	}
++	if isIPLiteral("example.com") {
++		t.Fatal("isIPLiteral accepted a domain name")
++	}
++}
+diff --git a/app/upstream.go b/app/upstream.go
+index 732c54a..74dc6ca 100644
+--- a/app/upstream.go
++++ b/app/upstream.go
+@@ -2,7 +2,9 @@ package app
+ 
+ import (
+ 	"context"
++	"encoding/hex"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"strings"
+ 	"sync"
+@@ -41,6 +43,10 @@ const (
+ 	TaskConsume
+ )
+ 
++const memoryUpstreamQueueSize = 256
++
++var errMemoryUpstreamClosed = errors.New("memory upstream is closed")
++
+ type Task struct {
+ 	Type  TaskType
+ 	Value struct {
+@@ -56,8 +62,11 @@ type MemoryUpstream struct {
+ 	ch chan Task
+ 	up Upstream
+ 
+-	mu sync.RWMutex
+-	mm map[string]Traffic
++	mu        sync.RWMutex
++	mm        map[string]Traffic
++	persistMu sync.RWMutex
++	closed    bool
++	worker    sync.WaitGroup
+ }
+ 
+ func (*MemoryUpstream) CaddyModule() caddy.ModuleInfo {
+@@ -71,7 +80,6 @@ func (u *MemoryUpstream) Provision(ctx caddy.Context) error {
+ 	u.mm = make(map[string]Traffic)
+ 
+ 	if u.UpstreamRaw == nil {
+-		u.ch = make(chan Task)
+ 		return nil
+ 	}
+ 
+@@ -86,15 +94,17 @@ func (u *MemoryUpstream) Provision(ctx caddy.Context) error {
+ 		u.Consume(k, nr, nw)
+ 	})
+ 
+-	u.up = up
+-	u.ch = make(chan Task, 16)
++	u.startPersistenceWorker(up)
++	return nil
++}
+ 
++func (u *MemoryUpstream) startPersistenceWorker(up Upstream) {
++	u.up = up
++	u.ch = make(chan Task, memoryUpstreamQueueSize)
++	u.worker.Add(1)
+ 	go func(up Upstream, ch chan Task) {
+-		for {
+-			t, ok := <-ch
+-			if !ok {
+-				break
+-			}
++		defer u.worker.Done()
++		for t := range ch {
+ 			switch t.Type {
+ 			case TaskAdd:
+ 				up.Add(t.Value.Password)
+@@ -106,15 +116,31 @@ func (u *MemoryUpstream) Provision(ctx caddy.Context) error {
+ 			}
+ 		}
+ 	}(u.up, u.ch)
++}
+ 
++func (u *MemoryUpstream) Cleanup() error {
++	u.persistMu.Lock()
++	if !u.closed {
++		u.closed = true
++		if u.ch != nil {
++			close(u.ch)
++		}
++	}
++	u.persistMu.Unlock()
++	u.worker.Wait()
+ 	return nil
+ }
+ 
+-func (u *MemoryUpstream) Cleanup() error {
+-	if u.ch == nil {
+-		return nil
++func (u *MemoryUpstream) applyAndPersist(task Task, apply func()) error {
++	u.persistMu.RLock()
++	defer u.persistMu.RUnlock()
++	if u.closed {
++		return errMemoryUpstreamClosed
++	}
++	apply()
++	if u.up != nil {
++		u.ch <- task
+ 	}
+-	close(u.ch)
+ 	return nil
+ }
+ 
+@@ -122,16 +148,11 @@ func (u *MemoryUpstream) Add(s string) error {
+ 	b := [trojan.HeaderLen]byte{}
+ 	trojan.GenKey(s, b[:])
+ 
+-	u.AddKey(string(b[:]))
+-
+-	if u.up == nil {
+-		return nil
+-	}
+-
+ 	t := Task{Type: TaskAdd}
+ 	t.Value.Password = s
+-	u.ch <- t
+-	return nil
++	return u.applyAndPersist(t, func() {
++		u.AddKey(string(b[:]))
++	})
+ }
+ 
+ func (u *MemoryUpstream) AddKey(key string) {
+@@ -147,18 +168,13 @@ func (u *MemoryUpstream) Delete(s string) error {
+ 	b := [trojan.HeaderLen]byte{}
+ 	trojan.GenKey(s, b[:])
+ 	key := x.ByteSliceToString(b[:])
+-	u.mu.Lock()
+-	delete(u.mm, key)
+-	u.mu.Unlock()
+-
+-	if u.up == nil {
+-		return nil
+-	}
+-
+ 	t := Task{Type: TaskDelete}
+ 	t.Value.Password = s
+-	u.ch <- t
+-	return nil
++	return u.applyAndPersist(t, func() {
++		u.mu.Lock()
++		delete(u.mm, key)
++		u.mu.Unlock()
++	})
+ }
+ 
+ func (u *MemoryUpstream) Range(fn func(string, int64, int64)) {
+@@ -177,23 +193,18 @@ func (u *MemoryUpstream) Validate(k string) bool {
+ }
+ 
+ func (u *MemoryUpstream) Consume(k string, nr, nw int64) error {
+-	u.mu.Lock()
+-	traffic := u.mm[k]
+-	traffic.Up += nr
+-	traffic.Down += nw
+-	u.mm[k] = traffic
+-	u.mu.Unlock()
+-
+-	if u.up == nil {
+-		return nil
+-	}
+-
+ 	t := Task{Type: TaskConsume}
+ 	t.Value.Key = k
+ 	t.Value.Up = nr
+ 	t.Value.Down = nw
+-	u.ch <- t
+-	return nil
++	return u.applyAndPersist(t, func() {
++		u.mu.Lock()
++		traffic := u.mm[k]
++		traffic.Up += nr
++		traffic.Down += nw
++		u.mm[k] = traffic
++		u.mu.Unlock()
++	})
+ }
+ 
+ type CaddyUpstream struct {
+@@ -221,7 +232,14 @@ func (u *CaddyUpstream) Add(s string) error {
+ 	trojan.GenKey(s, b[:])
+ 	key := u.prefix + string(b[:])
+ 	if u.storage.Exists(context.Background(), key) {
+-		return nil
++		stored, err := u.storage.Load(context.Background(), key)
++		traffic := Traffic{}
++		if err == nil && json.Unmarshal(stored, &traffic) == nil {
++			return nil
++		}
++		if u.logger != nil {
++			u.logger.Warn("repairing invalid Trojan user record", zap.String("key", key))
++		}
+ 	}
+ 	traffic := Traffic{
+ 		Up:   0,
+@@ -250,19 +268,31 @@ func (u *CaddyUpstream) Range(fn func(k string, up, down int64)) {
+ 		return
+ 	}
+ 
+-	traffic := Traffic{}
+ 	for _, k := range prekeys {
++		userKey := strings.TrimPrefix(k, u.prefix)
++		if !isTrojanStorageKey(userKey) {
++			continue
++		}
+ 		b, err := u.storage.Load(context.Background(), k)
+ 		if err != nil {
+ 			u.logger.Error(fmt.Sprintf("load user error: %v", err))
+ 			continue
+ 		}
++		traffic := Traffic{}
+ 		if err := json.Unmarshal(b, &traffic); err != nil {
+ 			u.logger.Error(fmt.Sprintf("load user error: %v", err))
+ 			continue
+ 		}
+-		fn(strings.TrimPrefix(k, u.prefix), traffic.Up, traffic.Down)
++		fn(userKey, traffic.Up, traffic.Down)
++	}
++}
++
++func isTrojanStorageKey(key string) bool {
++	if len(key) != trojan.HeaderLen {
++		return false
+ 	}
++	_, err := hex.DecodeString(key)
++	return err == nil
+ }
+ 
+ func (u *CaddyUpstream) Validate(k string) bool {
+diff --git a/app/upstream_memory_test.go b/app/upstream_memory_test.go
+new file mode 100644
+index 0000000..ea765e8
+--- /dev/null
++++ b/app/upstream_memory_test.go
+@@ -0,0 +1,115 @@
++package app
++
++import (
++	"errors"
++	"sync"
++	"testing"
++)
++
++type recordedTask struct {
++	typ  TaskType
++	key  string
++	up   int64
++	down int64
++}
++
++type recordingUpstream struct {
++	mu    sync.Mutex
++	tasks []recordedTask
++}
++
++func (u *recordingUpstream) Add(password string) error {
++	u.record(TaskAdd, password, 0, 0)
++	return nil
++}
++
++func (u *recordingUpstream) Delete(password string) error {
++	u.record(TaskDelete, password, 0, 0)
++	return nil
++}
++
++func (u *recordingUpstream) Consume(key string, up, down int64) error {
++	u.record(TaskConsume, key, up, down)
++	return nil
++}
++
++func (*recordingUpstream) Range(func(string, int64, int64)) {}
++
++func (*recordingUpstream) Validate(string) bool { return false }
++
++func (u *recordingUpstream) record(typ TaskType, key string, up, down int64) {
++	u.mu.Lock()
++	u.tasks = append(u.tasks, recordedTask{typ: typ, key: key, up: up, down: down})
++	u.mu.Unlock()
++}
++
++func TestMemoryUpstreamCleanupFlushesPersistenceQueue(t *testing.T) {
++	persist := new(recordingUpstream)
++	u := &MemoryUpstream{mm: make(map[string]Traffic)}
++	u.startPersistenceWorker(persist)
++
++	if err := u.Add("password"); err != nil {
++		t.Fatal(err)
++	}
++	if err := u.Consume("key", 12, 34); err != nil {
++		t.Fatal(err)
++	}
++	if err := u.Delete("password"); err != nil {
++		t.Fatal(err)
++	}
++	if err := u.Cleanup(); err != nil {
++		t.Fatal(err)
++	}
++	if err := u.Cleanup(); err != nil {
++		t.Fatalf("second Cleanup returned an error: %v", err)
++	}
++
++	persist.mu.Lock()
++	defer persist.mu.Unlock()
++	if len(persist.tasks) != 3 {
++		t.Fatalf("persisted %d tasks, want 3", len(persist.tasks))
++	}
++	if persist.tasks[0].typ != TaskAdd || persist.tasks[0].key != "password" {
++		t.Fatalf("first task = %#v, want add", persist.tasks[0])
++	}
++	if persist.tasks[1] != (recordedTask{typ: TaskConsume, key: "key", up: 12, down: 34}) {
++		t.Fatalf("second task = %#v, want consume", persist.tasks[1])
++	}
++	if persist.tasks[2].typ != TaskDelete || persist.tasks[2].key != "password" {
++		t.Fatalf("third task = %#v, want delete", persist.tasks[2])
++	}
++}
++
++func TestMemoryUpstreamRejectsChangesAfterCleanup(t *testing.T) {
++	persist := new(recordingUpstream)
++	u := &MemoryUpstream{mm: make(map[string]Traffic)}
++	u.startPersistenceWorker(persist)
++	if err := u.Cleanup(); err != nil {
++		t.Fatal(err)
++	}
++
++	if err := u.Add("late"); !errors.Is(err, errMemoryUpstreamClosed) {
++		t.Fatalf("Add error = %v, want errMemoryUpstreamClosed", err)
++	}
++	if err := u.Delete("late"); !errors.Is(err, errMemoryUpstreamClosed) {
++		t.Fatalf("Delete error = %v, want errMemoryUpstreamClosed", err)
++	}
++	if err := u.Consume("late", 1, 2); !errors.Is(err, errMemoryUpstreamClosed) {
++		t.Fatalf("Consume error = %v, want errMemoryUpstreamClosed", err)
++	}
++	if u.Validate("late") {
++		t.Fatal("closed upstream accepted a late in-memory mutation")
++	}
++}
++
++func TestTrojanStorageKeyValidation(t *testing.T) {
++	valid := "e440ce027e5051c38cdf3e47a3d469734e2de6e50d21ed2f0f460ba4"
++	if !isTrojanStorageKey(valid) {
++		t.Fatal("valid Trojan storage key was rejected")
++	}
++	for _, invalid := range []string{"1213882035", valid[:55], valid[:55] + "z"} {
++		if isTrojanStorageKey(invalid) {
++			t.Fatalf("invalid Trojan storage key was accepted: %q", invalid)
++		}
++	}
++}

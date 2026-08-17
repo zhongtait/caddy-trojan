@@ -5,3 +5,6 @@
 *.gz binary
 *.zip binary
 caddy binary
+
+# Patch files intentionally contain diff-prefix whitespace and source tabs.
+patches/*.patch whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab

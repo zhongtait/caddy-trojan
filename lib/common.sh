@@ -12,7 +12,7 @@ Usage:
   bash easytrojan.sh update  [--version VERSION]
   bash easytrojan.sh renew [--force]
   bash easytrojan.sh status [--show-link] [--server ADDR] [--port PORT] [--name NAME]
-  bash easytrojan.sh doctor
+  bash easytrojan.sh doctor [--network]
   bash easytrojan.sh link [--server ADDR] [--port PORT] [--password PASSWORD] [--name NAME]
   bash easytrojan.sh cert auto
   bash easytrojan.sh cert origin --cert PATH --key PATH
@@ -55,11 +55,13 @@ Notes:
   - --server ADDR: share-link address for Cloudflare preferred IP (SNI/Host still use domain)
   - --port PORT: connect port for share links / subscription (default 443; CF HTTPS ports ok)
   - --tls-mode auto: Caddy ACME (default). origin: Cloudflare Origin / file certs
-  - --outbound-ip ipv4|ipv6: prefer this address family for Trojan outbound
-    connections, while retaining fallback to the other family (default: ipv4)
-  - BBR + safe proxy network tuning (tcp_slow_start_after_idle, tcp_notsent_lowat)
-    are enabled automatically when supported by the host kernel
-  - --tune-system: opt in to additional global sysctl and security limit tuning
+  - --outbound-ip ipv4|ipv6: prefer this address family for Trojan outbound TCP
+    connections, while retaining fallback to the other family (default: ipv4);
+    UDP forwarding follows the host resolver/socket policy
+  - BBR + fq are enabled automatically when supported by the host kernel
+  - --tune-system: opt in to high-BDP/connection-rate sysctl tuning; values are
+    applied before Caddy starts and verified by reading them back
+  - doctor --network: print read-only qdisc, TCP counters, softnet and Caddy FD diagnostics
   - Reinstall without --tls-mode keeps previous TLS mode; origin reuses /etc/caddy/certs if present
   - Trojan WebSocket client ALPN must be http/1.1 only (do not add h2)
   - Camouflage site defaults to CorentinTh/it-tools (override: IT_TOOLS_VERSION=..., IT_TOOLS_SHA256=...)
@@ -89,6 +91,70 @@ is_ipv4() {
     # shellcheck disable=SC2086
     set -- $ip
     [ "$1" -le 255 ] && [ "$2" -le 255 ] && [ "$3" -le 255 ] && [ "$4" -le 255 ]
+}
+
+is_ipv6() {
+    local ip="$1" suffix segment count=0
+    ip=${ip#[}
+    ip=${ip%]}
+    [[ "$ip" == *:* ]] && [[ "$ip" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+    [[ "$ip" != *:::* ]] || return 1
+    if [[ "$ip" == *::* ]]; then
+        suffix=${ip#*::}
+        [[ "$suffix" != *::* ]] || return 1
+    fi
+    local IFS=:
+    # shellcheck disable=SC2206
+    local parts=( $ip )
+    for segment in "${parts[@]}"; do
+        [ -n "$segment" ] || continue
+        [ "${#segment}" -le 4 ] || return 1
+        count=$((count + 1))
+    done
+    if [[ "$ip" == *::* ]]; then
+        [ "$count" -lt 8 ]
+    else
+        [ "$count" -eq 8 ]
+    fi
+}
+
+contains_control_chars() {
+    local value="$1"
+    case "$value" in
+        *$'\n'*|*$'\r'*) return 0 ;;
+    esac
+    printf '%s' "$value" | LC_ALL=C grep -q '[[:cntrl:]]'
+}
+
+normalize_server_address() {
+    local addr="$1"
+    [ -n "$addr" ] || return 1
+    if contains_control_chars "$addr"; then
+        return 1
+    fi
+    if [[ "$addr" == \[*\] ]]; then
+        addr=${addr#[}
+        addr=${addr%]}
+    fi
+    if is_ipv4 "$addr" || is_ipv6 "$addr"; then
+        printf '%s' "$addr"
+        return 0
+    fi
+    if [ "${#addr}" -le 253 ] \
+        && [[ "$addr" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]; then
+        printf '%s' "$addr" | tr '[:upper:]' '[:lower:]'
+        return 0
+    fi
+    return 1
+}
+
+validate_password_value() {
+    local value="$1"
+    [ -n "$value" ] || error "Password cannot be empty"
+    [ "${#value}" -le 512 ] || error "Password is too long (maximum: 512 characters)"
+    if contains_control_chars "$value"; then
+        error "Password must not contain control characters (including tabs or newlines)"
+    fi
 }
 
 normalize_outbound_ip_priority() {
@@ -140,12 +206,21 @@ prompt_outbound_ip_priority() {
 #   http_send_json <METHOD> <URL> <TOKEN> <PAYLOAD> [extra curl flags...]
 #
 # TOKEN or PAYLOAD may be "" to omit. Echoes curl stdout; returns curl's status.
-http_send_json() {
+http_send_json() (
     local method="$1" url="$2" token="$3" payload="$4"
     shift 4
     local cfg="" body="" rc
     local -a args=(-X "$method")
+    # shellcheck disable=SC2329  # invoked indirectly by the EXIT trap
+    cleanup_http_send_json() {
+        [ -n "$cfg" ] && rm -f "$cfg"
+        [ -n "$body" ] && rm -f "$body"
+    }
+    trap cleanup_http_send_json EXIT
     if [ -n "$token" ] || [ -n "$payload" ]; then
+        if [ -n "$token" ] && ! [[ "$token" =~ ^[A-Za-z0-9._~-]+$ ]]; then
+            return 2
+        fi
         cfg=$(mktemp) || return 1
         chmod 600 "$cfg" 2>/dev/null || true
         : > "$cfg"
@@ -159,12 +234,10 @@ http_send_json() {
         printf '%s' "$payload" > "$body"
         args+=(--data-binary "@${body}")
     fi
-    curl "$@" "${args[@]}" "$url"
+    curl --connect-timeout 5 --max-time 30 "$@" "${args[@]}" "$url"
     rc=$?
-    [ -n "$cfg" ] && rm -f "$cfg"
-    [ -n "$body" ] && rm -f "$body"
     return "$rc"
-}
+)
 
 # Validate a user-supplied TCP port (1-65535); error out with a clear message.
 # Ports flow unquoted into JSON payloads, so reject non-numeric input early.
@@ -240,6 +313,9 @@ ensure_install_dependencies() {
     install_pkg unzip
     install_pkg openssl
     install_pkg file
+    # Configuration writes are serialized with flock; util-linux provides it
+    # on Debian and RHEL-family systems.
+    install_pkg flock util-linux util-linux
 
     # ip and ss share one package, whose name differs by distribution family.
     install_pkg ip iproute2 iproute
@@ -291,7 +367,7 @@ prompt_password() {
             error "Password required. Use --password or run interactively."
         fi
     fi
-    [ -n "$trojan_passwd" ] || error "Password cannot be empty"
+    validate_password_value "$trojan_passwd"
     if [ "${#trojan_passwd}" -lt 12 ]; then
         warn "Password is shorter than 12 characters. A strong random password is recommended."
     fi
@@ -430,9 +506,13 @@ build_share_link() {
     local encoded display_name addr
     encoded=$(urlencode "$passwd")
     display_name=$(urlencode "$name")
-    addr="${server:-$domain}"
+    if ! addr=$(normalize_server_address "${server:-$domain}"); then
+        error "Invalid server address: ${server:-$domain}"
+    fi
     port="${port:-443}"
-    [ -n "$addr" ] || error "Share link needs domain or --server address"
+    if is_ipv6 "$addr"; then
+        addr="[${addr}]"
+    fi
     if [ "$transport" = "ws" ]; then
         # Address may be CF anycast IP; SNI + WS Host must remain the real domain.
         # WebSocket Upgrade is HTTP/1.1; h2-first ALPN causes intermittent handshake failures.

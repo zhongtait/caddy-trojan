@@ -10,7 +10,7 @@
 #   bash easytrojan.sh update  [--version VER]
 #   bash easytrojan.sh renew [--force]
 #   bash easytrojan.sh status [--show-link] [--server ADDR] [--port PORT] [--name NAME]
-#   bash easytrojan.sh doctor
+#   bash easytrojan.sh doctor [--network]
 #   bash easytrojan.sh link [--server ADDR] [--port PORT] [--password PASS] [--name NAME]
 #   bash easytrojan.sh cert {auto|origin|status} ...
 #   bash easytrojan.sh user {add|list|del} ...
@@ -41,6 +41,7 @@ CADDY_DATA_DIR="${CADDY_XDG_DATA_HOME}/caddy"
 CADDY_DATA_MARKER="${CADDY_DATA_DIR}/.easytrojan-managed"
 TROJAN_DIR="${CADDY_DIR}/trojan"
 PASSWD_FILE="${TROJAN_DIR}/passwd.txt"
+CONFIG_LOCK_FILE="${TROJAN_DIR}/.config.lock"
 DOMAIN_FILE="${TROJAN_DIR}/domain.txt"
 OUTBOUND_IP_PRIORITY_FILE="${TROJAN_DIR}/outbound-ip-priority.txt"
 TLS_MODE_FILE="${TROJAN_DIR}/tls-mode.txt"
@@ -67,6 +68,14 @@ IT_TOOLS_REPO="CorentinTh/it-tools"
 IT_TOOLS_PINNED_VERSION="v2024.10.22-7ca5933"
 IT_TOOLS_PINNED_SHA256="eef276d675db6053bdc65cd8482a566785561c70eed5035a0e05b0e627b0989d"
 IT_TOOLS_VERSION="${IT_TOOLS_VERSION:-$IT_TOOLS_PINNED_VERSION}"
+
+# Release manifests are signed by the main GitHub Actions workflow. Keep the
+# cosign bootstrap immutable before a release bundle is sourced as root.
+EASYTROJAN_COSIGN_VERSION="v3.1.3"
+EASYTROJAN_COSIGN_LINUX_AMD64_SHA256="4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71"
+EASYTROJAN_COSIGN_LINUX_ARM64_SHA256="c5d324e091826b0d7a78eb16fef316450b4eb9aaec045611c08ba06f5e73220a"
+EASYTROJAN_RELEASE_OIDC_ISSUER="https://token.actions.githubusercontent.com"
+EASYTROJAN_RELEASE_SIGNER_IDENTITY="https://github.com/${REPO_OWNER}/${REPO_NAME}/.github/workflows/release.yml@refs/heads/main"
 
 EASYTROJAN_LIB_MODULES=(
     common.sh
@@ -124,40 +133,134 @@ _easytrojan_is_installed_entry() {
     [ "$src" = "$SCRIPT_BIN" ] || [ "$src" = "$SCRIPT_LEGACY" ]
 }
 
+_easytrojan_sha256_file() {
+    local file="$1"
+    if check_cmd sha256sum; then
+        sha256sum "$file" | awk '{print $1}'
+    elif check_cmd shasum; then
+        shasum -a 256 "$file" | awk '{print $1}'
+    elif check_cmd openssl; then
+        openssl dgst -sha256 "$file" | awk '{print $NF}'
+    else
+        return 1
+    fi
+}
+
+_easytrojan_cosign_arch() {
+    case "$(uname -s 2>/dev/null)" in
+        Linux) ;;
+        *) return 1 ;;
+    esac
+    case "$(uname -m 2>/dev/null)" in
+        x86_64|amd64)
+            printf '%s\t%s\n' amd64 "$EASYTROJAN_COSIGN_LINUX_AMD64_SHA256"
+            ;;
+        aarch64|arm64)
+            printf '%s\t%s\n' arm64 "$EASYTROJAN_COSIGN_LINUX_ARM64_SHA256"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+_easytrojan_resolve_cosign() (
+    local stage="${1:-}" arch expected cache_dir target tmp
+    # A test-only binary hook keeps offline regression tests deterministic. It
+    # is intentionally unavailable to normal invocations so production always
+    # executes the pinned, hash-verified cosign release below.
+    if [ "${EASYTROJAN_SOURCE_ONLY_ACTIVE:-0}" = "1" ] \
+        && [ -n "${EASYTROJAN_COSIGN_BIN:-}" ]; then
+        [ -x "$EASYTROJAN_COSIGN_BIN" ] || return 1
+        printf '%s\n' "$EASYTROJAN_COSIGN_BIN"
+        return 0
+    fi
+    IFS=$'\t' read -r arch expected < <(_easytrojan_cosign_arch) || return 1
+
+    # Keep the verifier inside the caller's private mktemp directory. A
+    # persistent cache could be replaced between hashing and execution.
+    cache_dir="${stage:-}"
+    [ -n "$cache_dir" ] || return 1
+    target="${cache_dir}/cosign-${EASYTROJAN_COSIGN_VERSION}-${arch}"
+    if [ -x "$target" ] && [ "$(_easytrojan_sha256_file "$target" 2>/dev/null || true)" = "$expected" ]; then
+        printf '%s\n' "$target"
+        return 0
+    fi
+
+    [ -d "$cache_dir" ] && [ -w "$cache_dir" ] || return 1
+    tmp=$(mktemp "${target}.tmp.XXXXXX") || return 1
+    trap 'rm -f -- "${tmp:-}"' EXIT
+    curl -fsSL --connect-timeout 15 --max-time 240 \
+        "https://github.com/sigstore/cosign/releases/download/${EASYTROJAN_COSIGN_VERSION}/cosign-linux-${arch}" \
+        -o "$tmp" || return 1
+    [ "$(_easytrojan_sha256_file "$tmp" 2>/dev/null || true)" = "$expected" ] || return 1
+    chmod 755 "$tmp"
+    mv -f -- "$tmp" "$target"
+    trap - EXIT
+    printf '%s\n' "$target"
+)
+
+_easytrojan_verify_release_manifest() {
+    local manifest="$1" bundle="$2" stage="${3:-}" cosign
+    if [ ! -s "$bundle" ]; then
+        if [ "${EASYTROJAN_ALLOW_UNSIGNED_RELEASE:-0}" = "1" ]; then
+            warn "Release has no Sigstore bundle; accepting legacy unsigned metadata because EASYTROJAN_ALLOW_UNSIGNED_RELEASE=1"
+            return 0
+        fi
+        warn "Release is missing ${bundle##*/}; refusing unsigned release metadata"
+        return 1
+    fi
+    cosign=$(_easytrojan_resolve_cosign "$stage") || {
+        warn "Unable to bootstrap the pinned cosign verifier"
+        return 1
+    }
+    if ! "$cosign" verify-blob \
+        --bundle "$bundle" \
+        --certificate-identity "$EASYTROJAN_RELEASE_SIGNER_IDENTITY" \
+        --certificate-oidc-issuer "$EASYTROJAN_RELEASE_OIDC_ISSUER" \
+        "$manifest" >/dev/null 2>&1; then
+        warn "Sigstore verification failed for ${manifest##*/}; refusing release metadata"
+        return 1
+    fi
+    ok "Sigstore verified ${manifest##*/}"
+}
+
 _easytrojan_fetch_repository_snapshot() {
     local stage="$1"
     local repo_meta="${stage}/repo.json" archive="${stage}/repository.tar.gz"
-    local repo_ref="" archive_ref="refs/heads/main" source_label="main branch"
+    local repo_ref=""
 
     mkdir -p "$stage"
-    if curl -fsSL --connect-timeout 10 --max-time 30 \
+    if ! curl -fsSL --connect-timeout 10 --max-time 30 \
         -H "Accept: application/vnd.github+json" \
         -H "User-Agent: easytrojan" \
         "${REPO_API}/commits/main" -o "$repo_meta" 2>/dev/null; then
-        repo_ref=$(sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-fA-F]\{40\}\)".*/\1/p' "$repo_meta" | head -1)
-        if printf '%s' "$repo_ref" | grep -Eq '^[0-9a-fA-F]{40}$'; then
-            archive_ref="$repo_ref"
-            source_label="repository commit ${repo_ref:0:7}"
-        fi
+        # Never execute a mutable branch snapshot. The caller will fall back to
+        # the checksummed Release bundle when immutable commit metadata is unavailable.
+        return 1
     fi
+    repo_ref=$(sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-fA-F]\{40\}\)".*/\1/p' "$repo_meta" | head -1)
+    printf '%s' "$repo_ref" | grep -Eq '^[0-9a-fA-F]{40}$' || return 1
 
     if ! curl -fsSL --connect-timeout 15 --max-time 120 \
-        "https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/${archive_ref}.tar.gz" -o "$archive"; then
+        "https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/${repo_ref}.tar.gz" -o "$archive"; then
         return 1
     fi
     tar -tzf "$archive" | awk '/^\// || /(^|\/)\.\.($|\/)/ {bad=1} END {exit bad}' || return 1
+    # Git archives may contain symlinks. Only regular files/directories are safe
+    # here because the extracted modules are subsequently copied and sourced as root.
+    tar -tvzf "$archive" | awk 'substr($0,1,1) !~ /^[-d]$/ {bad=1} END {exit bad}' || return 1
     rm -rf "${stage}/unpack"
     mkdir -p "${stage}/unpack"
     tar -xzf "$archive" --strip-components=1 --no-same-owner --no-same-permissions \
         -C "${stage}/unpack" || return 1
     [ -f "${stage}/unpack/easytrojan.sh" ] || return 1
     [ -f "${stage}/unpack/lib/common.sh" ] || return 1
-    info "Loading EasyTrojan modules from ${source_label}"
+    info "Loading EasyTrojan modules from repository commit ${repo_ref:0:7}"
 }
 
 _easytrojan_fetch_release_snapshot() {
     local stage="$1" base_url="${2:-https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/latest/download}"
     local bundle="${stage}/easytrojan_bundle.tar.gz" sums="${stage}/SHA256SUMS"
+    local sigstore="${stage}/SHA256SUMS.sigstore.json"
     local expected actual
 
     mkdir -p "$stage"
@@ -167,6 +270,11 @@ _easytrojan_fetch_release_snapshot() {
             "${base_url}/SHA256SUMS" -o "$sums" 2>/dev/null; then
         return 1
     fi
+    # A present signature is never bypassed. The explicit compatibility flag
+    # only permits old releases that predate Sigstore and have no bundle.
+    curl -fsSL --connect-timeout 10 --max-time 30 \
+        "${base_url}/SHA256SUMS.sigstore.json" -o "$sigstore" 2>/dev/null || true
+    _easytrojan_verify_release_manifest "$sums" "$sigstore" "$stage" || return 1
     expected=$(awk '$2 == "easytrojan_bundle.tar.gz" {print $1; exit}' "$sums")
     [ -n "$expected" ] || return 1
     if check_cmd sha256sum; then actual=$(sha256sum "$bundle" | awk '{print $1}')
@@ -176,6 +284,7 @@ _easytrojan_fetch_release_snapshot() {
     fi
     [ "$actual" = "$expected" ] || return 1
     tar -tzf "$bundle" | awk '!/^(easytrojan\.sh|hub_server\.py|lib\/?|lib\/[A-Za-z0-9._-]+)$/ {bad=1} END {exit bad}' || return 1
+    tar -tvzf "$bundle" | awk 'substr($0,1,1) !~ /^[-d]$/ {bad=1} END {exit bad}' || return 1
     rm -rf "${stage}/unpack"
     mkdir -p "${stage}/unpack"
     tar -xzf "$bundle" -C "${stage}/unpack" || return 1
@@ -292,6 +401,14 @@ install_self() {
         [ -f "${SHARE_DIR}/hub_server.py" ] && chmod 644 "${SHARE_DIR}/hub_server.py"
     fi
 }
+
+# Test harnesses can source the bootstrap verifier without loading modules or
+# entering the command dispatcher. This does not affect normal invocations.
+if [ "${EASYTROJAN_SOURCE_ONLY:-0}" = "1" ] \
+    && [ "${BASH_SOURCE[0]}" != "$0" ]; then
+    EASYTROJAN_SOURCE_ONLY_ACTIVE=1
+    return 0 2>/dev/null || exit 0
+fi
 
 # Load modules then dispatch
 easytrojan_load_all

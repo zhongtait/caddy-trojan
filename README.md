@@ -15,9 +15,9 @@
 - 默认部署 [IT-Tools](https://github.com/CorentinTh/it-tools) 伪装站，下载失败时回退到内置页面
 - 支持多用户、分享链接、Cloudflare 优选 IP 和非 443 HTTPS 端口
 - 可选多节点 Hub，输出 base64 格式的 `trojan://` 订阅
-- Release 资源通过 `SHA256SUMS` 校验
+- Release 资源先通过 Sigstore/cosign 身份校验，再通过 `SHA256SUMS` 校验
 - Caddy Admin API 仅监听 `127.0.0.1:2019`
-- 默认启用 BBR 及安全的代理网络调优（提升长连接速度、降低每连接内存）；更激进的全局 sysctl/limits 调优可用 `--tune-system` 开启
+- 内核支持时默认启用 BBR + fq；高 BDP / 高建连速率的额外 sysctl 调优可用 `--tune-system` 开启
 - 小内存 VPS 自动为 Caddy 设置软内存上限（`GOMEMLIMIT ≈ 75% 内存`）作为 OOM 兜底
 
 ## 开始之前
@@ -34,7 +34,7 @@
 | 架构 | `x86_64/amd64` 或 `aarch64/arm64` |
 
 安装脚本会预检并自动安装缺失的运行依赖，包括 `curl`、`tar`、`unzip`、
-`openssl`、`file`、`iproute` 工具、系统用户管理工具和 CA 证书。
+`openssl`、`file`、`flock`（由 `util-linux` 提供）、`iproute` 工具、系统用户管理工具和 CA 证书。
 Hub 所需的 `python3 >= 3.8` 会在启用 Hub 时按需安装。
 
 放行端口示例（按实际防火墙选择一种）：
@@ -93,8 +93,8 @@ sudo bash easytrojan.sh install --domain example.com --outbound-ip ipv6
 ```
 
 选择 IPv4 时会优先出站 IPv4；IPv4 不可用或目标仅有 AAAA 记录时会自动回退 IPv6。
-选择 IPv6 时则反向优先。该选项控制的是 Trojan 代客户端访问目标网站时的出站连接，
-不影响域名解析、入站监听或证书申请。
+选择 IPv6 时则反向优先。该选项控制的是 Trojan 代客户端访问目标网站时的出站 TCP 连接，
+不影响域名解析、入站监听或证书申请；UDP 转发仍遵循系统 resolver/socket 地址族策略。
 
 ### Cloudflare 橙云
 
@@ -142,9 +142,8 @@ sudo IT_TOOLS_VERSION=v2024.10.22-7ca5933 \
 sudo IT_TOOLS_VERSION=v2024.10.22-7ca5933 IT_TOOLS_SHA256='<64位SHA256>' \
   bash easytrojan.sh install --domain example.com
 
-# 安装时会在内核支持时自动启用 BBR，并附带两项安全的代理网络调优
-# （tcp_slow_start_after_idle=0、tcp_notsent_lowat=16384）；
-# 以下选项额外启用更激进的全局 sysctl（更大 socket 缓冲、端口范围等）和 limits 调优
+# 默认安装会在内核支持时启用 BBR + fq；以下选项额外启用更大的
+# socket 缓冲和连接队列，并在 Caddy 启动前逐项验证实际生效值
 sudo bash easytrojan.sh install --domain example.com --tune-system
 ```
 
@@ -154,9 +153,10 @@ sudo bash easytrojan.sh install --domain example.com --tune-system
 sudo bash easytrojan.sh 'password' example.com
 ```
 
-仅下载入口脚本时，脚本会优先获取当前 `main` 提交的完整模块快照，并覆盖机器上
-可能残留的旧模块；仓库快照不可用时才回退到校验过的 Release 模块包。从完整仓库
-运行时优先使用同目录的 `lib/`。
+仅下载入口脚本时，脚本会优先获取当前 `main` 提交对应的不可变 commit 快照，并覆盖
+机器上可能残留的旧模块；commit 元数据或仓库快照不可用时会回退到带 SHA256 校验的
+Release 模块包，不会执行可变的 `main` 分支归档。从完整仓库运行时优先使用同目录的
+`lib/`。
 
 ## 管理命令
 
@@ -167,6 +167,7 @@ sudo bash easytrojan.sh 'password' example.com
 | `easytrojan status` | 查看服务、TLS、域名与用户状态，默认隐藏分享链接 |
 | `easytrojan status --show-link` | 查看状态并打印分享链接 |
 | `easytrojan doctor` | 只读检查 Caddy、TLS、Hub 和管理状态 |
+| `easytrojan doctor --network` | 只读检查 qdisc、TCP/softnet 计数器和 Caddy FD 使用率 |
 | `easytrojan link` | 生成分享链接 |
 | `easytrojan update [--version VER]` | 更新脚本模块与 Caddy 二进制 |
 | `easytrojan renew [--force]` | 执行 ACME 维护；`--force` 会删除证书并重新申请 |
@@ -196,7 +197,9 @@ sudo easytrojan user del --password 'password-to-remove'
 ```
 
 用户数据以 `/etc/caddy/trojan/passwd.txt` 为源，并写入 Caddyfile 的静态
-`users` 配置。删除用户时，脚本还会清理 Caddy storage 中对应的键并 reload。
+`users` 配置。鉴权与流量计数使用 `memory caddy` 混合后端：连接热路径在内存中
+完成，变更与计数异步持久化到 Caddy storage。删除用户时，脚本会同时清理
+storage 中对应的键并 reload。
 
 ### TLS 管理
 
@@ -330,18 +333,32 @@ Hub 相关数据：
 
 节点默认已做好基础调优，通常无需额外配置：
 
-- **BBR + 网络调优（默认开启）**：内核支持时，安装与 `update` 会启用 BBR 拥塞控制，
-  并附带 `tcp_slow_start_after_idle=0`（长连接空闲后立即恢复满速）与
-  `tcp_notsent_lowat=16384`（降低每连接发送缓冲内存与写延迟）。写入
-  `/etc/sysctl.d/99-easytrojan-bbr.conf`。
+- **BBR + fq（默认开启）**：内核支持时，安装与 `update` 会启用 BBR 拥塞控制和
+  `fq` 队列调度。默认不修改 `tcp_notsent_lowat`、`tcp_slow_start_after_idle` 等
+  依赖具体负载的全局参数，避免在高 RTT 或高连接数场景引入额外唤醒和突发流量。
+  配置写入 `/etc/sysctl.d/99-easytrojan-bbr.conf`。
 - **软内存上限（小内存 VPS）**：Caddy 服务按约 75% 物理内存设置 `GOMEMLIMIT` 作为
   OOM 兜底。正常单客户负载不会触发；异常或内存泄漏时由 Go GC 更积极回收，避免小内存
   机器被 OOM 杀掉。内存无法探测或过小时自动跳过。
-- **更激进的吞吐调优（可选）**：`--tune-system` 额外启用更大的 socket 缓冲、连接队列等
-  全局 sysctl 与 limits，适合高延迟 / 跨区域链路，但会增加内存占用；写入
-  `/etc/sysctl.d/99-caddy-trojan.conf` 与 `/etc/security/limits.d/caddy-trojan.conf`。
+- **内存鉴权缓存（持久化）**：Trojan 使用 `memory caddy` 混合后端，连接鉴权和流量
+  计数不再逐次访问 Caddy 文件存储，同时仍把用户和计数异步持久化；正常关闭会等待
+  持久化队列刷完，启动时会忽略临时 key 并修复损坏的用户记录。真实 systemd 集成测试
+  会并发添加用户，并验证它们在 Caddy 进程重启后仍能恢复。
+- **更激进的吞吐调优（可选）**：`--tune-system` 额外启用较大的 socket 缓冲和连接队列，
+  适合确认存在高 BDP 或建连突发的机器，但会增加内存占用。参数会在 Caddy 启动前
+  应用并逐项回读校验，写入 `/etc/sysctl.d/99-caddy-trojan.conf`。
+- **只读网络诊断**：`sudo easytrojan doctor --network` 输出实际 qdisc、拥塞算法、TCP
+  重传/超时计数、softnet 丢包和 Caddy 文件描述符使用情况，不会重置计数器或修改内核参数。
 
-以上调优均可逆，卸载脚本会移除对应文件。
+如果 `doctor --network` 或 `ss -ti` 显示监听丢包为 0，但客户端侧 RTT 很高、出现
+`reordering`/`rcv_ooopack` 且重传持续超过约 1%，优先检查客户端 TUN 分流和链路，而不是
+继续增大服务器 backlog：将节点域名及其解析到的 A/AAAA 地址设为 DIRECT，确认
+`ip route get` 走预期出口，再用 `ping -M do`/等效工具测试 TUN MTU（可对 1400、1360、
+1300 做 A/B）和 MSS clamp，并分别测试 IPv4、IPv6 或 Cloudflare WebSocket 入口。Caddy
+承担双向中继，进出流量合计约为实际业务字节的两倍是正常现象。
+
+以上调优均可逆，卸载脚本会在未检测到管理员后续改动时恢复原值，再移除对应文件。
+历史版本若从未生成原值快照，卸载时会明确提示仍需人工检查或重启；不会猜测并覆盖管理员的 sysctl 设置。
 
 ## 常见问题
 
@@ -427,6 +444,27 @@ sudo easytrojan update
 sudo easytrojan update --version 'v2.11.3+trojan.932ef9b'
 ```
 
+Release 同时提供 `SHA256SUMS` 与 `SHA256SUMS.sigstore.json`。安装/更新会固定
+cosign `v3.1.3` 的下载摘要，并要求签名来自本仓库 `main` 分支的 Release workflow；
+签名缺失或无效会停止更新。发布 Sigstore 之前的旧 Release 只能在明确设置
+`EASYTROJAN_ALLOW_UNSIGNED_RELEASE=1` 时兼容，且该开关不会绕过已存在但无效的签名：
+
+```bash
+sudo env EASYTROJAN_ALLOW_UNSIGNED_RELEASE=1 \
+  easytrojan update --version '<legacy-release-tag>'
+```
+
+手动验证 manifest：
+
+```bash
+cosign verify-blob \
+  --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity 'https://github.com/zhongtait/caddy-trojan/.github/workflows/release.yml@refs/heads/main' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+  SHA256SUMS
+sha256sum -c SHA256SUMS
+```
+
 重装使用与首次安装相同的命令。同域名重装会尽量复用证书；域名变化时会清理旧
 ACME 材料并重新申请。未指定 TLS 模式时会保留当前设置。
 
@@ -449,8 +487,10 @@ bash scripts/ci_validate.sh
 ```
 
 该脚本检查 Bash 语法、`shellcheck` 静态检查（warning 级）、模块清单、LF 换行、
-命令加载、Python 编译和 Hub API 基本行为。本机安装了 `shellcheck` 时会一并运行，
-未安装则自动跳过（CI 中一定运行）。
+命令加载、Python 编译和 Hub API 基本行为；安装 `coverage` 时还会强制
+`hub_server.py` 100% 行与分支覆盖。GitHub CI 在 Release 前会额外运行真实 Linux +
+systemd + Caddy 集成测试。本机安装了 `shellcheck` 时会一并运行，未安装则自动跳过（CI
+中一定运行）。
 
 ## 项目结构
 
@@ -461,6 +501,9 @@ bash scripts/ci_validate.sh
 | `hub_server.py` | 可选的节点聚合 Hub |
 | `uninstall.sh` | 卸载脚本 |
 | `scripts/ci_validate.sh` | 本地与 CI 校验入口 |
+| `scripts/test_release_signature.sh` | Release manifest 签名策略离线回归测试 |
+| `scripts/integration_linux.sh` | 一次性 Linux + systemd + Caddy 集成测试（仅 disposable runner） |
+| `.github/workflows/integration.yml` | 可复用的真实 Linux 集成测试 workflow |
 | `.shellcheckrc` | shellcheck 规则配置 |
 | `sha` | 上游 commit 标记，用于检测插件变化并固定构建 |
 | `SECURITY.md` | 安全边界与报告策略 |

@@ -9,8 +9,8 @@ on:
       - 'hub_server.py'
       - 'tests/**'
       - 'lib/**'
-      - 'scripts/ci_validate.sh'
-      - '.github/workflows/ci.yml'
+      - 'scripts/**'
+      - '.github/workflows/**'
   pull_request:
     branches: [main]
     paths:
@@ -19,14 +19,40 @@ on:
       - 'hub_server.py'
       - 'tests/**'
       - 'lib/**'
-      - 'scripts/ci_validate.sh'
-      - '.github/workflows/ci.yml'
+      - 'scripts/**'
+      - '.github/workflows/**'
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      source_ref:
+        description: Exact repository commit to validate
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 jobs:
+  workflow-lint:
+    name: GitHub Actions syntax and policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25.x'
+          cache: false
+
+      - name: Run actionlint v1.7.12
+        run: |
+          set -euo pipefail
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          actionlint
+
   validate:
     name: scripts + hub (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
@@ -36,6 +62,9 @@ jobs:
         python-version: ['3.8', '3.12', '3.13']
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+          persist-credentials: false
 
       - name: Setup Python
         uses: actions/setup-python@v6
@@ -47,9 +76,18 @@ jobs:
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq curl ca-certificates shellcheck
+          python -m pip install --disable-pip-version-check --no-input 'coverage==7.4.4'
 
       - name: Run validation
         run: |
           set -euo pipefail
           chmod +x scripts/ci_validate.sh
           bash scripts/ci_validate.sh
+
+      - name: Enforce Hub unit coverage
+        if: matrix.python-version == '3.12'
+        run: |
+          set -euo pipefail
+          python -m coverage erase
+          python -m coverage run --branch -m unittest discover -v
+          python -m coverage report --include='hub_server.py' --show-missing --fail-under=100

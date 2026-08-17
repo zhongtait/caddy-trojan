@@ -12,8 +12,11 @@ Thumbs.db
 
 # Python leftovers
 __pycache__/
+.coverage
+htmlcov/
 *.py
 !hub_server.py
+!tests/__init__.py
 !tests/test_*.py
 .venv/
 venv/

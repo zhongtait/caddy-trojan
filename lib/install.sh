@@ -127,6 +127,16 @@ do_install() {
     info "Generating Caddyfile..."
     generate_caddyfile "$site_domain"
 
+    # Apply optional sysctl tuning before Caddy creates its listening sockets.
+    # In particular, somaxconn is consumed by listen(2) and changing it after
+    # the service starts would leave the current listener at the old cap.
+    if [ "${tune_system:-0}" = "1" ]; then
+        apply_sysctl_limits \
+            || error "Optional system tuning failed; Caddy was not started. Inspect the reported sysctl values."
+    else
+        info "Skipping global sysctl tuning (use --tune-system to enable)"
+    fi
+
     info "Creating systemd service..."
     write_caddy_unit
 
@@ -151,8 +161,8 @@ do_install() {
         fi
     else
         info "Obtaining SSL certificate (this may take up to 2 minutes)..."
-        local count=0 max_wait=40
-        until find "${CADDY_DATA_DIR}/certificates" -name '*.crt' -type f 2>/dev/null | grep -q .; do
+        local count=0 max_wait=40 cert_file=""
+        until cert_file=$(find_domain_certificate "$site_domain"); do
             count=$((count + 1))
             if [ "$count" -gt "$max_wait" ]; then
                 if [ -n "$cert_backup" ] && [ -d "${cert_backup}/certificates" ]; then
@@ -163,6 +173,9 @@ do_install() {
                     chown -R caddy:caddy "$CADDY_DATA_DIR" || true
                     systemctl restart caddy.service || true
                     ok "Certificates restored from backup"
+                    cert_file=$(find_domain_certificate "$site_domain" || true)
+                    [ -n "$cert_file" ] \
+                        || error "Certificate issuance failed and the restored backup has no certificate for ${site_domain}"
                 else
                     error "Certificate application failed after $((max_wait * 3))s.\nPlease check:\n  1. TCP ports 80 and 443 are open\n  2. Domain A record points to this server\n  3. journalctl -u caddy --no-pager -n 30"
                 fi
@@ -170,17 +183,12 @@ do_install() {
             fi
             sleep 3
         done
-        if find "${CADDY_DATA_DIR}/certificates" -name '*.crt' -type f 2>/dev/null | grep -q .; then
-            ok "SSL certificate ready"
-        fi
+        [ -n "$cert_file" ] || cert_file=$(find_domain_certificate "$site_domain" || true)
+        [ -n "$cert_file" ] || error "Certificate for ${site_domain} was not found after Caddy became ready"
+        ok "SSL certificate ready for ${site_domain}"
     fi
     [ -n "$cert_backup" ] && rm -rf "$cert_backup"
 
-    if [ "${tune_system:-0}" = "1" ]; then
-        apply_sysctl_limits
-    else
-        info "Skipping global sysctl tuning (use --tune-system to enable)"
-    fi
     setup_renew_timer
 
     info "Verifying installation..."

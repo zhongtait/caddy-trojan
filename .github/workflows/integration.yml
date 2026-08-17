@@ -1,0 +1,139 @@
+name: Linux Integration
+
+on:
+  workflow_call:
+    inputs:
+      source_ref:
+        description: Exact repository commit to test
+        required: false
+        type: string
+      upstream_sha:
+        description: Upstream imgk/caddy-trojan commit to build
+        required: false
+        type: string
+      caddy_artifact:
+        description: Existing amd64 Caddy artifact from the calling workflow
+        required: false
+        default: ''
+        type: string
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact repository commit to test
+        required: false
+        type: string
+      upstream_sha:
+        description: Upstream imgk/caddy-trojan commit to build
+        required: false
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - 'easytrojan.sh'
+      - 'patches/caddy-trojan-outbound-ip.patch'
+      - 'lib/caddy.sh'
+      - 'lib/common.sh'
+      - 'lib/system.sh'
+      - 'lib/tls.sh'
+      - 'lib/install.sh'
+      - 'lib/manage.sh'
+      - 'scripts/integration_linux.sh'
+      - '.github/workflows/integration.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'sha'
+      - 'easytrojan.sh'
+      - 'patches/caddy-trojan-outbound-ip.patch'
+      - 'lib/caddy.sh'
+      - 'lib/common.sh'
+      - 'lib/system.sh'
+      - 'lib/tls.sh'
+      - 'lib/install.sh'
+      - 'lib/manage.sh'
+      - 'scripts/integration_linux.sh'
+      - '.github/workflows/integration.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    name: real Caddy + systemd
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # runner context is unavailable in reusable-workflow job-level env. A
+      # per-job /tmp path is sufficient because each runner is isolated.
+      CADDY_UNDER_TEST: /tmp/easytrojan-caddy-integration
+      UPSTREAM_SHA: ${{ inputs.upstream_sha || '' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+          persist-credentials: false
+
+      - name: Download caller Caddy artifact
+        if: inputs.caddy_artifact != ''
+        uses: actions/download-artifact@v5
+        with:
+          name: ${{ inputs.caddy_artifact }}
+          path: ${{ runner.temp }}/caddy-artifact
+
+      - name: Extract caller Caddy artifact
+        if: inputs.caddy_artifact != ''
+        run: |
+          set -euo pipefail
+          tar -xzf "${RUNNER_TEMP}/caddy-artifact/caddy_trojan_linux_amd64.tar.gz" \
+            -C "$RUNNER_TEMP" caddy
+          install -m 0755 "${RUNNER_TEMP}/caddy" "$CADDY_UNDER_TEST"
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25.x'
+          cache: false
+
+      - name: Test patched Trojan plugin
+        run: |
+          set -euo pipefail
+          UPSTREAM_SHA="${UPSTREAM_SHA:-$(tr -d '[:space:]' < sha)}"
+          if ! printf '%s' "$UPSTREAM_SHA" | grep -Eq '^[0-9a-fA-F]{40}$'; then
+            echo "Invalid upstream SHA: ${UPSTREAM_SHA:-<empty>}" >&2
+            exit 1
+          fi
+          plugin_dir="${RUNNER_TEMP}/caddy-trojan-plugin"
+          git clone --filter=blob:none https://github.com/imgk/caddy-trojan.git "$plugin_dir"
+          git -C "$plugin_dir" checkout --detach "$UPSTREAM_SHA"
+          git -C "$plugin_dir" apply \
+            "$GITHUB_WORKSPACE/patches/caddy-trojan-outbound-ip.patch"
+          git -C "$plugin_dir" diff --check
+          (cd "$plugin_dir" && go test -race ./app)
+          (cd "$plugin_dir" && go vet ./app)
+
+      - name: Build Caddy-Trojan for integration
+        if: inputs.caddy_artifact == ''
+        run: |
+          set -euo pipefail
+          go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.5
+          plugin_dir="${RUNNER_TEMP}/caddy-trojan-plugin"
+          xcaddy build --output "$CADDY_UNDER_TEST" \
+            --with "github.com/imgk/caddy-trojan=${plugin_dir}"
+
+      - name: Install integration dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl iproute2 openssl shellcheck
+
+      - name: Check integration script
+        run: shellcheck --severity=warning scripts/integration_linux.sh
+
+      - name: Run real Linux integration
+        run: |
+          set -euo pipefail
+          sudo env \
+            CI=true \
+            EASYTROJAN_INTEGRATION_TEST=1 \
+            CADDY_UNDER_TEST="$CADDY_UNDER_TEST" \
+            bash scripts/integration_linux.sh
