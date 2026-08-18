@@ -117,6 +117,21 @@ wait_for_admin_api() {
     return 1
 }
 
+# Caddy provisions app modules during `validate`. The Trojan memory+caddy
+# backend therefore writes users while checking a config, so validation must
+# never point at the live Caddy storage (especially when invoked as root).
+validate_caddy_config() (
+    local config="$1" validation_root=""
+    [ -x "$CADDY_BIN" ] && [ -f "$config" ] || return 1
+    validation_root=$(mktemp -d) || return 1
+    trap 'rm -rf -- "$validation_root"' EXIT
+    mkdir -p "$validation_root/config" "$validation_root/data" "$validation_root/home"
+    XDG_CONFIG_HOME="$validation_root/config" \
+        XDG_DATA_HOME="$validation_root/data" \
+        HOME="$validation_root/home" \
+        "$CADDY_BIN" validate --config "$config" --adapter caddyfile
+)
+
 # Print the ACME certificate belonging to DOMAIN. Do not treat an unrelated
 # certificate left in Caddy storage as proof that the requested site is ready.
 find_domain_certificate() {
@@ -301,8 +316,7 @@ EOF
         rm -f "$config_tmp"
         error "Caddy binary missing; refusing to install an unvalidated Caddyfile"
     fi
-    if ! XDG_CONFIG_HOME=/etc XDG_DATA_HOME="${CADDY_XDG_DATA_HOME:-/var/lib}" HOME="${CADDY_DATA_DIR:-/var/lib/caddy}" \
-        "$CADDY_BIN" validate --config "$config_tmp" --adapter caddyfile >/dev/null 2>&1; then
+    if ! validate_caddy_config "$config_tmp" >/dev/null 2>&1; then
         rm -f "$config_tmp"
         error "Generated Caddyfile failed validation; active configuration was not changed"
     fi

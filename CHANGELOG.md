@@ -31,7 +31,7 @@
 
 ### 变更
 
-- Caddy 性能：Trojan upstream 切换为 `memory caddy` 混合模式，鉴权与流量计数走内存热路径，同时保留 Caddy storage 持久化；有界异步队列会在正常关闭时刷完，并跳过临时 key、自动修复损坏的用户记录。真实 systemd 测试覆盖并发动态用户跨进程重启恢复。
+- Caddy 性能：Trojan upstream 切换为 `memory caddy` 混合模式，鉴权与流量计数走内存热路径，同时保留 Caddy storage 持久化；有界异步队列会在正常关闭时刷完，并跳过临时 key、自动修复损坏的用户记录。用户增删会等待 storage 确认并向 Admin API 返回错误，配置校验使用隔离 storage，避免 root 校验污染运行目录。真实 systemd 测试覆盖并发动态用户跨进程重启恢复。
 - Hub 性能：按文件标识（mtime / size / inode）缓存已校验的节点与默认订阅体，重复 `/sub` 拉取不再重复解析与校验；`/sub` 启用 HTTP/1.1 keep-alive（写操作强制关闭连接）。
 - 重构：抽取 `detect_share_transport`、`hub_json_field`、`hub_register_payload`、`hub_indexed_name`、`hub_unregister_password`、`validate_port`、`http_send_json` 等公共函数，消除多处重复逻辑。
 - 重构：拆分 `easytrojan.sh` 为入口 + `lib/*.sh` 模块（common / tls / caddy / camouflage / system / hub / manage / install）；安装与更新同步到 `/usr/local/share/easytrojan/lib`。

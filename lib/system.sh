@@ -440,7 +440,10 @@ EOF
 }
 
 ensure_cert_storage() {
-    # Keep runtime/ACME state writable by Caddy, while configuration stays root-owned.
+    # Keep all runtime state writable by Caddy, while configuration stays root-owned.
+    # Older installs (or a root-run `caddy validate/run`) may have created the
+    # trojan storage tree as root.  Caddy then fails during startup when it
+    # tries to load a persisted user record from that tree.
     local data_dir="${CADDY_DATA_DIR:-/var/lib/caddy}"
     if [ -d "${CADDY_DIR}/certificates" ] && [ ! -d "${data_dir}/certificates" ]; then
         mkdir -p "$data_dir"
@@ -453,7 +456,10 @@ ensure_cert_storage() {
     mkdir -p "$data_dir/certificates" "$data_dir/acme" "$CADDY_DIR" "$TROJAN_DIR"
     chown root:caddy "$CADDY_DIR" "$TROJAN_DIR" 2>/dev/null || true
     chmod 750 "$CADDY_DIR" "$TROJAN_DIR"
-    chown caddy:caddy "$data_dir" "$data_dir/certificates" "$data_dir/acme" 2>/dev/null || true
+    # The whole data tree belongs to the service user: besides certificates and
+    # ACME state, the Trojan memory+caddy app persists records under
+    # $data_dir/trojan.  Re-own existing files so reinstalls are idempotent.
+    chown -R caddy:caddy "$data_dir" 2>/dev/null || true
     chmod 700 "$data_dir" "$data_dir/certificates" "$data_dir/acme"
     printf 'managed_by=easytrojan\nversion=1\n' > "${CADDY_DATA_MARKER:-$data_dir/.easytrojan-managed}"
     chown root:caddy "${CADDY_DATA_MARKER:-$data_dir/.easytrojan-managed}" 2>/dev/null || true

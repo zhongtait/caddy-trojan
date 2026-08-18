@@ -108,8 +108,8 @@ jobs:
           git -C "$plugin_dir" apply \
             "$GITHUB_WORKSPACE/patches/caddy-trojan-outbound-ip.patch"
           git -C "$plugin_dir" diff --check
-          (cd "$plugin_dir" && go test -race ./app)
-          (cd "$plugin_dir" && go vet ./app)
+          (cd "$plugin_dir" && go test -race ./...)
+          (cd "$plugin_dir" && go vet ./app ./modules/admin)
 
       - name: Build Caddy-Trojan for integration
         if: inputs.caddy_artifact == ''

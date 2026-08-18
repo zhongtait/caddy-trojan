@@ -168,7 +168,9 @@ persist_password integration-initial-password
 generate_caddyfile "$test_domain"
 
 log "validating generated Caddyfile with the real plugin binary"
-"$CADDY_BIN" validate --config "$CADDYFILE" --adapter caddyfile
+validate_caddy_config "$CADDYFILE"
+[ ! -e "$CADDY_DATA_DIR/trojan" ] \
+    || die "Caddyfile validation mutated the live Caddy storage"
 grep -q "admin 127.0.0.1:${admin_port}" "$CADDYFILE" \
     || die "generated config did not use the isolated Admin API port"
 grep -q "servers :${https_port}" "$CADDYFILE" \

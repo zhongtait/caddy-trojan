@@ -303,6 +303,31 @@ done
   || fail "shared account-tools dependency should only be installed once"
 pass "install preflight covers required Debian/RHEL package mappings"
 
+# ---------- Caddy runtime storage ownership repair ----------
+info "Caddy runtime storage ownership repair"
+storage_test_root=$(mktemp -d)
+if ! bash -c '
+  set -euo pipefail
+  test_root=$1
+  CADDY_DIR="${test_root}/etc/caddy"
+  TROJAN_DIR="${CADDY_DIR}/trojan"
+  CADDY_DATA_DIR="${test_root}/var/lib/caddy"
+  CADDY_DATA_MARKER="${CADDY_DATA_DIR}/.easytrojan-managed"
+  ownership_log="${test_root}/chown.log"
+  mkdir -p "$TROJAN_DIR" "${CADDY_DATA_DIR}/trojan"
+  printf "root-owned-user-record\n" > "${CADDY_DATA_DIR}/trojan/user-hash"
+  chown() { printf "%s\n" "$*" >> "$ownership_log"; }
+  . lib/system.sh
+  ensure_cert_storage
+  grep -qxF -- "-R caddy:caddy ${CADDY_DATA_DIR}" "$ownership_log"
+  [ "$(tail -n 1 "$ownership_log")" = "root:caddy ${CADDY_DATA_MARKER}" ]
+' _ "$storage_test_root"; then
+  rm -rf "$storage_test_root"
+  fail "Caddy runtime storage ownership was not repaired recursively"
+fi
+rm -rf "$storage_test_root"
+pass "Caddy runtime storage is re-owned recursively before startup"
+
 # ---------- camouflage cleanup must be isolated from the caller ----------
 info "camouflage temporary-directory cleanup"
 camo_test_root=$(mktemp -d)
@@ -341,6 +366,8 @@ mkdir -p "${caddy_test_root}/bin" "${caddy_test_root}/www" "${caddy_test_root}/t
 cat > "${caddy_test_root}/bin/caddy" <<'EOF'
 #!/usr/bin/env bash
 [ "${1:-}" = validate ]
+mkdir -p "${XDG_DATA_HOME}/caddy/trojan"
+printf 'validation-side-effect\n' > "${XDG_DATA_HOME}/caddy/trojan/probe"
 EOF
 chmod +x "${caddy_test_root}/bin/caddy"
 if ! bash -c '
@@ -349,6 +376,8 @@ if ! bash -c '
   CADDY_DIR=$test_root
   CADDYFILE="${test_root}/Caddyfile"
   CADDY_BIN="${test_root}/bin/caddy"
+  CADDY_XDG_DATA_HOME="${test_root}/live-data"
+  CADDY_DATA_DIR="${CADDY_XDG_DATA_HOME}/caddy"
   WWW_DIR="${test_root}/www"
   TROJAN_DIR="${test_root}/trojan"
   PASSWD_FILE="${TROJAN_DIR}/passwd.txt"
@@ -366,6 +395,7 @@ if ! bash -c '
   tls_directive_line() { :; }
   . lib/caddy.sh
   generate_caddyfile example.com
+  [ ! -e "${CADDY_DATA_DIR}/trojan" ]
   grep -q "^[[:space:]]*websocket$" "$CADDYFILE"
   grep -q "^[[:space:]]*memory caddy$" "$CADDYFILE"
   grep -q "^[[:space:]]*no_proxy ipv4$" "$CADDYFILE"
@@ -373,6 +403,7 @@ if ! bash -c '
   ! grep -q "listener_wrappers" "$CADDYFILE"
   CADDY_HTTPS_PORT=18443 CADDY_HTTP_PORT=18080 CADDY_ADMIN_LISTEN=127.0.0.1:20191 \
     generate_caddyfile example.com
+  [ ! -e "${CADDY_DATA_DIR}/trojan" ]
   grep -q "^example.com:18443" "$CADDYFILE"
   grep -q "https_port 18443" "$CADDYFILE"
   grep -q "admin 127.0.0.1:20191" "$CADDYFILE"
@@ -422,7 +453,7 @@ if ! bash -c '
   fail "legacy Trojan listener removal did not force a full Caddy restart"
 fi
 rm -rf "$caddy_test_root"
-pass "generated Caddyfile uses memory+caddy persistence and WS-only routing; legacy listener migration forces restart"
+pass "generated Caddyfile validation is storage-isolated; memory+caddy and WS-only routing are preserved"
 
 info "domain-specific certificate lookup"
 cert_test_root=$(mktemp -d)

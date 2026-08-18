@@ -1,3 +1,18 @@
+diff --git a/app/app.go b/app/app.go
+index fd5bc98..8500b97 100644
+--- a/app/app.go
++++ b/app/app.go
+@@ -75,7 +75,9 @@ func (app *App) Provision(ctx caddy.Context) error {
+ 	}
+ 
+ 	for _, v := range app.Users {
+-		app.upstream.Add(v)
++		if err := app.upstream.Add(v); err != nil {
++			return fmt.Errorf("adding configured Trojan user: %w", err)
++		}
+ 	}
+ 
+ 	app.lg = ctx.Logger(app)
 diff --git a/app/proxy.go b/app/proxy.go
 index d1844bb..6d72b81 100644
 --- a/app/proxy.go
@@ -291,10 +306,10 @@ index 0000000..12a6ee2
 +	}
 +}
 diff --git a/app/upstream.go b/app/upstream.go
-index 732c54a..74dc6ca 100644
+index 732c54a..d100db8 100644
 --- a/app/upstream.go
 +++ b/app/upstream.go
-@@ -2,7 +2,9 @@ package app
+@@ -2,8 +2,11 @@ package app
  
  import (
  	"context"
@@ -302,9 +317,11 @@ index 732c54a..74dc6ca 100644
  	"encoding/json"
 +	"errors"
  	"fmt"
++	"io/fs"
  	"strings"
  	"sync"
-@@ -41,6 +43,10 @@ const (
+ 
+@@ -41,6 +44,10 @@ const (
  	TaskConsume
  )
  
@@ -315,7 +332,15 @@ index 732c54a..74dc6ca 100644
  type Task struct {
  	Type  TaskType
  	Value struct {
-@@ -56,8 +62,11 @@ type MemoryUpstream struct {
+@@ -48,6 +55,7 @@ type Task struct {
+ 		Key      string
+ 		Traffic
+ 	}
++	Done chan error
+ }
+ 
+ type MemoryUpstream struct {
+@@ -56,8 +64,12 @@ type MemoryUpstream struct {
  	ch chan Task
  	up Upstream
  
@@ -326,18 +351,22 @@ index 732c54a..74dc6ca 100644
 +	persistMu sync.RWMutex
 +	closed    bool
 +	worker    sync.WaitGroup
++	logger    *zap.Logger
  }
  
  func (*MemoryUpstream) CaddyModule() caddy.ModuleInfo {
-@@ -71,7 +80,6 @@ func (u *MemoryUpstream) Provision(ctx caddy.Context) error {
+@@ -69,9 +81,9 @@ func (*MemoryUpstream) CaddyModule() caddy.ModuleInfo {
+ 
+ func (u *MemoryUpstream) Provision(ctx caddy.Context) error {
  	u.mm = make(map[string]Traffic)
++	u.logger = ctx.Logger(u)
  
  	if u.UpstreamRaw == nil {
 -		u.ch = make(chan Task)
  		return nil
  	}
  
-@@ -86,15 +94,17 @@ func (u *MemoryUpstream) Provision(ctx caddy.Context) error {
+@@ -86,35 +98,77 @@ func (u *MemoryUpstream) Provision(ctx caddy.Context) error {
  		u.Consume(k, nr, nw)
  	})
  
@@ -359,11 +388,25 @@ index 732c54a..74dc6ca 100644
 -			}
 +		defer u.worker.Done()
 +		for t := range ch {
++			var err error
  			switch t.Type {
  			case TaskAdd:
- 				up.Add(t.Value.Password)
-@@ -106,15 +116,31 @@ func (u *MemoryUpstream) Provision(ctx caddy.Context) error {
+-				up.Add(t.Value.Password)
++				err = up.Add(t.Value.Password)
+ 			case TaskDelete:
+-				up.Delete(t.Value.Password)
++				err = up.Delete(t.Value.Password)
+ 			case TaskConsume:
+-				up.Consume(t.Value.Key, t.Value.Up, t.Value.Down)
++				err = up.Consume(t.Value.Key, t.Value.Up, t.Value.Down)
+ 			default:
  			}
++			if t.Done != nil {
++				t.Done <- err
++				close(t.Done)
++			} else if err != nil && u.logger != nil {
++				u.logger.Error("persisting Trojan upstream state", zap.Error(err))
++			}
  		}
  	}(u.up, u.ch)
 +}
@@ -384,7 +427,24 @@ index 732c54a..74dc6ca 100644
 -func (u *MemoryUpstream) Cleanup() error {
 -	if u.ch == nil {
 -		return nil
-+func (u *MemoryUpstream) applyAndPersist(task Task, apply func()) error {
++func (u *MemoryUpstream) persistAndApply(task Task, apply func()) error {
++	u.persistMu.RLock()
++	defer u.persistMu.RUnlock()
++	if u.closed {
++		return errMemoryUpstreamClosed
++	}
++	if u.up != nil {
++		task.Done = make(chan error, 1)
++		u.ch <- task
++		if err := <-task.Done; err != nil {
++			return err
++		}
++	}
++	apply()
++	return nil
++}
++
++func (u *MemoryUpstream) applyAndQueue(task Task, apply func()) error {
 +	u.persistMu.RLock()
 +	defer u.persistMu.RUnlock()
 +	if u.closed {
@@ -398,7 +458,7 @@ index 732c54a..74dc6ca 100644
  	return nil
  }
  
-@@ -122,16 +148,11 @@ func (u *MemoryUpstream) Add(s string) error {
+@@ -122,23 +176,17 @@ func (u *MemoryUpstream) Add(s string) error {
  	b := [trojan.HeaderLen]byte{}
  	trojan.GenKey(s, b[:])
  
@@ -412,13 +472,22 @@ index 732c54a..74dc6ca 100644
  	t.Value.Password = s
 -	u.ch <- t
 -	return nil
-+	return u.applyAndPersist(t, func() {
++	return u.persistAndApply(t, func() {
 +		u.AddKey(string(b[:]))
 +	})
  }
  
  func (u *MemoryUpstream) AddKey(key string) {
-@@ -147,18 +168,13 @@ func (u *MemoryUpstream) Delete(s string) error {
+ 	u.mu.Lock()
+-	u.mm[key] = Traffic{
+-		Up:   0,
+-		Down: 0,
++	if _, exists := u.mm[key]; !exists {
++		u.mm[key] = Traffic{}
+ 	}
+ 	u.mu.Unlock()
+ }
+@@ -147,18 +195,13 @@ func (u *MemoryUpstream) Delete(s string) error {
  	b := [trojan.HeaderLen]byte{}
  	trojan.GenKey(s, b[:])
  	key := x.ByteSliceToString(b[:])
@@ -434,7 +503,7 @@ index 732c54a..74dc6ca 100644
  	t.Value.Password = s
 -	u.ch <- t
 -	return nil
-+	return u.applyAndPersist(t, func() {
++	return u.persistAndApply(t, func() {
 +		u.mu.Lock()
 +		delete(u.mm, key)
 +		u.mu.Unlock()
@@ -442,7 +511,7 @@ index 732c54a..74dc6ca 100644
  }
  
  func (u *MemoryUpstream) Range(fn func(string, int64, int64)) {
-@@ -177,23 +193,18 @@ func (u *MemoryUpstream) Validate(k string) bool {
+@@ -177,23 +220,18 @@ func (u *MemoryUpstream) Validate(k string) bool {
  }
  
  func (u *MemoryUpstream) Consume(k string, nr, nw int64) error {
@@ -463,7 +532,7 @@ index 732c54a..74dc6ca 100644
  	t.Value.Down = nw
 -	u.ch <- t
 -	return nil
-+	return u.applyAndPersist(t, func() {
++	return u.applyAndQueue(t, func() {
 +		u.mu.Lock()
 +		traffic := u.mm[k]
 +		traffic.Up += nr
@@ -474,23 +543,39 @@ index 732c54a..74dc6ca 100644
  }
  
  type CaddyUpstream struct {
-@@ -221,7 +232,14 @@ func (u *CaddyUpstream) Add(s string) error {
+@@ -220,8 +258,17 @@ func (u *CaddyUpstream) Add(s string) error {
+ 	b := [trojan.HeaderLen]byte{}
  	trojan.GenKey(s, b[:])
  	key := u.prefix + string(b[:])
- 	if u.storage.Exists(context.Background(), key) {
+-	if u.storage.Exists(context.Background(), key) {
 -		return nil
-+		stored, err := u.storage.Load(context.Background(), key)
++	stored, err := u.storage.Load(context.Background(), key)
++	if err == nil {
 +		traffic := Traffic{}
-+		if err == nil && json.Unmarshal(stored, &traffic) == nil {
++		if json.Unmarshal(stored, &traffic) == nil {
 +			return nil
 +		}
 +		if u.logger != nil {
 +			u.logger.Warn("repairing invalid Trojan user record", zap.String("key", key))
 +		}
++	} else if !errors.Is(err, fs.ErrNotExist) {
++		return fmt.Errorf("load Trojan user record: %w", err)
  	}
  	traffic := Traffic{
  		Up:   0,
-@@ -250,19 +268,31 @@ func (u *CaddyUpstream) Range(fn func(k string, up, down int64)) {
+@@ -238,8 +285,10 @@ func (u *CaddyUpstream) Delete(s string) error {
+ 	b := [trojan.HeaderLen]byte{}
+ 	trojan.GenKey(s, b[:])
+ 	key := u.prefix + x.ByteSliceToString(b[:])
+-	if !u.storage.Exists(context.Background(), key) {
++	if _, err := u.storage.Load(context.Background(), key); errors.Is(err, fs.ErrNotExist) {
+ 		return nil
++	} else if err != nil {
++		return err
+ 	}
+ 	return u.storage.Delete(context.Background(), key)
+ }
+@@ -250,24 +299,41 @@ func (u *CaddyUpstream) Range(fn func(k string, up, down int64)) {
  		return
  	}
  
@@ -512,30 +597,44 @@ index 732c54a..74dc6ca 100644
  		}
 -		fn(strings.TrimPrefix(k, u.prefix), traffic.Up, traffic.Down)
 +		fn(userKey, traffic.Up, traffic.Down)
-+	}
-+}
-+
+ 	}
+ }
+ 
 +func isTrojanStorageKey(key string) bool {
 +	if len(key) != trojan.HeaderLen {
 +		return false
- 	}
++	}
 +	_, err := hex.DecodeString(key)
 +	return err == nil
++}
++
+ func (u *CaddyUpstream) Validate(k string) bool {
+ 	key := u.prefix + k
+-	return u.storage.Exists(context.Background(), key)
++	b, err := u.storage.Load(context.Background(), key)
++	if err != nil {
++		return false
++	}
++	traffic := Traffic{}
++	return json.Unmarshal(b, &traffic) == nil
  }
  
- func (u *CaddyUpstream) Validate(k string) bool {
+ func (u *CaddyUpstream) Consume(k string, nr, nw int64) error {
 diff --git a/app/upstream_memory_test.go b/app/upstream_memory_test.go
 new file mode 100644
-index 0000000..ea765e8
+index 0000000..d7bf32e
 --- /dev/null
 +++ b/app/upstream_memory_test.go
-@@ -0,0 +1,115 @@
+@@ -0,0 +1,196 @@
 +package app
 +
 +import (
 +	"errors"
 +	"sync"
 +	"testing"
++	"time"
++
++	"github.com/imgk/caddy-trojan/pkgs/trojan"
 +)
 +
 +type recordedTask struct {
@@ -546,23 +645,26 @@ index 0000000..ea765e8
 +}
 +
 +type recordingUpstream struct {
-+	mu    sync.Mutex
-+	tasks []recordedTask
++	mu         sync.Mutex
++	tasks      []recordedTask
++	addErr     error
++	deleteErr  error
++	consumeErr error
 +}
 +
 +func (u *recordingUpstream) Add(password string) error {
 +	u.record(TaskAdd, password, 0, 0)
-+	return nil
++	return u.addErr
 +}
 +
 +func (u *recordingUpstream) Delete(password string) error {
 +	u.record(TaskDelete, password, 0, 0)
-+	return nil
++	return u.deleteErr
 +}
 +
 +func (u *recordingUpstream) Consume(key string, up, down int64) error {
 +	u.record(TaskConsume, key, up, down)
-+	return nil
++	return u.consumeErr
 +}
 +
 +func (*recordingUpstream) Range(func(string, int64, int64)) {}
@@ -573,6 +675,18 @@ index 0000000..ea765e8
 +	u.mu.Lock()
 +	u.tasks = append(u.tasks, recordedTask{typ: typ, key: key, up: up, down: down})
 +	u.mu.Unlock()
++}
++
++type blockingUpstream struct {
++	recordingUpstream
++	consumeStarted chan struct{}
++	releaseConsume chan struct{}
++}
++
++func (u *blockingUpstream) Consume(key string, up, down int64) error {
++	close(u.consumeStarted)
++	<-u.releaseConsume
++	return u.recordingUpstream.Consume(key, up, down)
 +}
 +
 +func TestMemoryUpstreamCleanupFlushesPersistenceQueue(t *testing.T) {
@@ -634,6 +748,69 @@ index 0000000..ea765e8
 +	}
 +}
 +
++func TestMemoryUpstreamCleanupWaitsForAsyncPersistence(t *testing.T) {
++	persist := &blockingUpstream{
++		consumeStarted: make(chan struct{}),
++		releaseConsume: make(chan struct{}),
++	}
++	u := &MemoryUpstream{mm: make(map[string]Traffic)}
++	u.startPersistenceWorker(persist)
++
++	if err := u.Consume("key", 1, 2); err != nil {
++		t.Fatal(err)
++	}
++	<-persist.consumeStarted
++	cleanupDone := make(chan error, 1)
++	go func() { cleanupDone <- u.Cleanup() }()
++
++	select {
++	case err := <-cleanupDone:
++		t.Fatalf("Cleanup returned before persistence completed: %v", err)
++	case <-time.After(20 * time.Millisecond):
++	}
++	close(persist.releaseConsume)
++	if err := <-cleanupDone; err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestMemoryUpstreamPersistenceFailureDoesNotMutateUsers(t *testing.T) {
++	persistErr := errors.New("storage unavailable")
++	persist := &recordingUpstream{addErr: persistErr, deleteErr: persistErr}
++	u := &MemoryUpstream{mm: make(map[string]Traffic)}
++	u.startPersistenceWorker(persist)
++	defer u.Cleanup()
++
++	password := "password"
++	keyBytes := [trojan.HeaderLen]byte{}
++	trojan.GenKey(password, keyBytes[:])
++	key := string(keyBytes[:])
++	if err := u.Add(password); !errors.Is(err, persistErr) {
++		t.Fatalf("Add error = %v, want persistence error", err)
++	}
++	if u.Validate(key) {
++		t.Fatal("failed persistent add still mutated the memory upstream")
++	}
++
++	u.AddKey(key)
++	if err := u.Delete(password); !errors.Is(err, persistErr) {
++		t.Fatalf("Delete error = %v, want persistence error", err)
++	}
++	if !u.Validate(key) {
++		t.Fatal("failed persistent delete removed the in-memory user")
++	}
++}
++
++func TestMemoryUpstreamAddKeyPreservesTraffic(t *testing.T) {
++	u := &MemoryUpstream{mm: map[string]Traffic{"key": {Up: 12, Down: 34}}}
++	u.AddKey("key")
++	var got Traffic
++	u.Range(func(_ string, up, down int64) { got = Traffic{Up: up, Down: down} })
++	if got != (Traffic{Up: 12, Down: 34}) {
++		t.Fatalf("traffic = %#v, want existing counters preserved", got)
++	}
++}
++
 +func TestTrojanStorageKeyValidation(t *testing.T) {
 +	valid := "e440ce027e5051c38cdf3e47a3d469734e2de6e50d21ed2f0f460ba4"
 +	if !isTrojanStorageKey(valid) {
@@ -643,5 +820,77 @@ index 0000000..ea765e8
 +		if isTrojanStorageKey(invalid) {
 +			t.Fatalf("invalid Trojan storage key was accepted: %q", invalid)
 +		}
++	}
++}
+diff --git a/modules/admin/admin.go b/modules/admin/admin.go
+index 7a988a8..1963c73 100644
+--- a/modules/admin/admin.go
++++ b/modules/admin/admin.go
+@@ -108,7 +108,9 @@ func (al *Admin) AddUser(w http.ResponseWriter, r *http.Request) error {
+ 		return err
+ 	}
+ 	if user.Password != "" {
+-		al.upstream.Add(user.Password)
++		if err := al.upstream.Add(user.Password); err != nil {
++			return err
++		}
+ 	}
+ 
+ 	w.WriteHeader(http.StatusOK)
+@@ -137,7 +139,9 @@ func (al *Admin) DeleteUser(w http.ResponseWriter, r *http.Request) error {
+ 		return err
+ 	}
+ 	if user.Password != "" {
+-		al.upstream.Delete(user.Password)
++		if err := al.upstream.Delete(user.Password); err != nil {
++			return err
++		}
+ 	}
+ 
+ 	w.WriteHeader(http.StatusOK)
+diff --git a/modules/admin/admin_test.go b/modules/admin/admin_test.go
+new file mode 100644
+index 0000000..12086fb
+--- /dev/null
++++ b/modules/admin/admin_test.go
+@@ -0,0 +1,40 @@
++package admin
++
++import (
++	"bytes"
++	"errors"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++)
++
++type errorUpstream struct {
++	addErr    error
++	deleteErr error
++}
++
++func (u *errorUpstream) Add(string) error                 { return u.addErr }
++func (u *errorUpstream) Delete(string) error              { return u.deleteErr }
++func (*errorUpstream) Range(func(string, int64, int64))   {}
++func (*errorUpstream) Validate(string) bool               { return false }
++func (*errorUpstream) Consume(string, int64, int64) error { return nil }
++
++func TestAddUserReturnsPersistenceError(t *testing.T) {
++	want := errors.New("add failed")
++	handler := &Admin{upstream: &errorUpstream{addErr: want}}
++	req := httptest.NewRequest(http.MethodPost, "/trojan/users/add", bytes.NewBufferString(`{"password":"secret"}`))
++	err := handler.AddUser(httptest.NewRecorder(), req)
++	if !errors.Is(err, want) {
++		t.Fatalf("AddUser error = %v, want %v", err, want)
++	}
++}
++
++func TestDeleteUserReturnsPersistenceError(t *testing.T) {
++	want := errors.New("delete failed")
++	handler := &Admin{upstream: &errorUpstream{deleteErr: want}}
++	req := httptest.NewRequest(http.MethodDelete, "/trojan/users/delete", bytes.NewBufferString(`{"password":"secret"}`))
++	err := handler.DeleteUser(httptest.NewRecorder(), req)
++	if !errors.Is(err, want) {
++		t.Fatalf("DeleteUser error = %v, want %v", err, want)
 +	}
 +}

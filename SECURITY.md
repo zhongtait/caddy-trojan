@@ -57,7 +57,8 @@ Trojan 密码会保存在：
 
 使用 `memory caddy` 混合 upstream 时，用户密钥会缓存在内存并落在 Caddy 本地
 storage（前缀 `trojan/`）。`easytrojan user del` 会同时更新 passwd.txt、Caddyfile，
-并调用 Admin API 删除内存与 storage 中的键。
+并调用 Admin API 删除内存与 storage 中的键。用户增删只有在 storage 操作成功后才会
+更新内存状态；Caddyfile 校验使用独立临时 storage，不会以 root 身份创建运行时用户键。
 
 节点与 Hub 之间的注册、注销、删除，以及删除 Caddy storage 用户等 API 调用，密码和令牌都通过 `0600` 临时文件传给 `curl`，不会作为命令行参数出现在进程列表（`ps auxww`）中。
 
