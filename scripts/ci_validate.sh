@@ -269,6 +269,53 @@ if bash -c 'error() { exit 1; }; . lib/common.sh; validate_password_value "$1"' 
 fi
 pass "pinned camouflage URL and archive paths; validated WS links/passwords"
 
+# ---------- traffic CLI formatting, sorting, and error handling ----------
+info "traffic CLI formatting and filtering"
+traffic_test_root=$(mktemp -d)
+if ! bash -c '
+  set -euo pipefail
+  test_root=$1
+  PASSWD_FILE="${test_root}/passwd.txt"
+  ADMIN_API="http://127.0.0.1:2019"
+  require_root() { :; }
+  error() { echo -e "[ERROR] $*" >&2; return 1; }
+  check_cmd() { command -v "$1" >/dev/null 2>&1; }
+  printf "%s\n" "secret_password_123" > "$PASSWD_FILE"
+  # Mock curl to write sample traffic json to -o target
+  curl() {
+    local out=""
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "-o" ]; then
+        out="$2"
+        shift 2
+      else
+        shift
+      fi
+    done
+    if [ -n "$out" ]; then
+      printf "%s\n" "[{\"key\":\"edad48b03cfefa312419559881d61447d16417d72e7b65682dd0bd08\",\"target\":\"googlevideo.com:443\",\"up\":1048576,\"down\":10485760},{\"key\":\"edad48b03cfefa312419559881d61447d16417d72e7b65682dd0bd08\",\"target\":\"example.com:443\",\"up\":1024,\"down\":2048}]" > "$out"
+    fi
+  }
+  . lib/manage.sh
+  out=$(do_traffic)
+  echo "$out" | grep -qF "CLIENT"
+  echo "$out" | grep -qF "se***23"
+  echo "$out" | grep -qF "googlevideo.com:443"
+  echo "$out" | grep -qF "TOTAL (2 targets):"
+  # verify --json
+  json_out=$(do_traffic --json)
+  echo "$json_out" | grep -qF "googlevideo.com"
+  # verify --top 1
+  top_out=$(do_traffic --top 1)
+  echo "$top_out" | grep -qF "googlevideo.com"
+  ! echo "$top_out" | grep -qF "example.com:443"
+' _ "$traffic_test_root"; then
+  rm -rf "$traffic_test_root"
+  fail "traffic CLI formatting, sorting, or filtering failed"
+fi
+rm -rf "$traffic_test_root"
+pass "traffic CLI supports sorting, top N, password masking, and summary output"
+
 # ---------- install dependency package mapping ----------
 info "install dependency package mapping"
 dependency_calls=$(bash -c '

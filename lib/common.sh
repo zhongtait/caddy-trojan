@@ -13,6 +13,7 @@ Usage:
   bash easytrojan.sh renew [--force]
   bash easytrojan.sh status [--show-link] [--server ADDR] [--port PORT] [--name NAME]
   bash easytrojan.sh doctor [--network]
+  bash easytrojan.sh traffic [--key HASH] [--password PASS] [--target HOST:PORT] [--top N] [--sort total|up|down|target|client] [--json]
   bash easytrojan.sh link [--server ADDR] [--port PORT] [--password PASSWORD] [--name NAME]
   bash easytrojan.sh cert auto
   bash easytrojan.sh cert origin --cert PATH --key PATH
@@ -43,6 +44,9 @@ Examples:
   bash easytrojan.sh status
   bash easytrojan.sh status --show-link
   bash easytrojan.sh status --show-link --server 104.16.1.1
+  bash easytrojan.sh traffic
+  bash easytrojan.sh traffic --top 20
+  bash easytrojan.sh traffic --target example.com:443
   bash easytrojan.sh link --server 104.16.1.1
   bash easytrojan.sh user add
   bash easytrojan.sh user list

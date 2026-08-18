@@ -94,6 +94,142 @@ do_doctor() {
     ok "doctor: no blocking issues found"
 }
 
+do_traffic() (
+    require_root
+    local filter_key="" filter_password="" filter_target="" json=0 limit=0 sort_by="total"
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --key)
+                [ -n "${2:-}" ] || error "--key requires a value"
+                filter_key="$2"
+                shift 2
+                ;;
+            --password|-p)
+                [ -n "${2:-}" ] || error "--password requires a value"
+                filter_password="$2"
+                shift 2
+                ;;
+            --target)
+                [ -n "${2:-}" ] || error "--target requires a value"
+                filter_target="$2"
+                shift 2
+                ;;
+            -n|--top|--limit)
+                [ -n "${2:-}" ] || error "$1 requires a positive number"
+                case "$2" in
+                    ''|*[!0-9]*) error "$1 must be a positive integer" ;;
+                esac
+                [ "$2" -gt 0 ] || error "$1 must be greater than 0"
+                limit="$2"
+                shift 2
+                ;;
+            --sort)
+                [ -n "${2:-}" ] || error "--sort requires a value (total|up|down|target|client)"
+                case "$2" in
+                    total|up|down|target|client) sort_by="$2" ;;
+                    *) error "Invalid --sort value: $2 (allowed: total|up|down|target|client)" ;;
+                esac
+                shift 2
+                ;;
+            --json) json=1; shift ;;
+            -h|--help)
+                cat <<'EOF'
+Usage: easytrojan traffic [--key HASH] [--password PASS] [--target HOST:PORT] [--top N] [--sort total|up|down|target|client] [--json]
+
+Show persisted traffic by Trojan client key and destination. The Admin API
+remains bound to localhost; this command must be run as root.
+EOF
+                exit 0
+                ;;
+            *) error "Unknown traffic argument: $1" ;;
+        esac
+    done
+
+    if [ -n "$filter_password" ] && [ -z "$filter_key" ]; then
+        if check_cmd openssl; then
+            filter_key=$(printf '%s' "$filter_password" | openssl dgst -sha224 2>/dev/null | awk '{print $NF}' || true)
+        fi
+        if [ -z "$filter_key" ] && check_cmd python3; then
+            filter_key=$(python3 -c "import hashlib, sys; print(hashlib.sha224(sys.argv[1].encode()).hexdigest())" "$filter_password" 2>/dev/null || true)
+        fi
+        [ -n "$filter_key" ] || error "Cannot calculate SHA-224 hash for password"
+    fi
+
+    local url="${ADMIN_API}/trojan/traffic" tmp curl_args=()
+    [ -z "$filter_key" ] || curl_args+=(--data-urlencode "key=${filter_key}")
+    [ -z "$filter_target" ] || curl_args+=(--data-urlencode "target=${filter_target}")
+    tmp=$(mktemp)
+    trap 'rm -f -- "${tmp:-}"' EXIT
+    if ! curl -fsS --get --connect-timeout 2 --max-time 10 ${curl_args[@]+"${curl_args[@]}"} "$url" -o "$tmp"; then
+        error "Traffic API unavailable. Update/restart Caddy, then retry: easytrojan traffic"
+        return 1
+    fi
+    if [ "$json" = "1" ] || ! check_cmd python3; then
+        cat "$tmp"
+        return 0
+    fi
+    python3 - "$tmp" "$PASSWD_FILE" "$sort_by" "$limit" <<'PY'
+import hashlib
+import json
+import sys
+
+rows = json.load(open(sys.argv[1], encoding="utf-8"))
+passwords = {}
+try:
+    for line in open(sys.argv[2], encoding="utf-8"):
+        password = line.rstrip("\r\n")
+        if password:
+            passwords[hashlib.sha224(password.encode()).hexdigest()] = password
+except OSError:
+    pass
+
+sort_by = sys.argv[3] if len(sys.argv) > 3 else "total"
+limit = int(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4].isdigit() else 0
+
+def size(value):
+    value = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            return f"{value:.1f} {unit}"
+        value /= 1024
+
+for row in rows:
+    row["up_int"] = int(row.get("up", 0))
+    row["down_int"] = int(row.get("down", 0))
+    row["total_int"] = row["up_int"] + row["down_int"]
+    key = row.get("key", "")
+    password = passwords.get(key)
+    row["client"] = (password[:2] + "***" + password[-2:]) if password and len(password) > 8 else ("****" if password else (key[:16] if key else "-"))
+
+if sort_by == "total":
+    rows.sort(key=lambda r: r["total_int"], reverse=True)
+elif sort_by == "up":
+    rows.sort(key=lambda r: r["up_int"], reverse=True)
+elif sort_by == "down":
+    rows.sort(key=lambda r: r["down_int"], reverse=True)
+elif sort_by == "target":
+    rows.sort(key=lambda r: r.get("target", "").lower())
+elif sort_by == "client":
+    rows.sort(key=lambda r: (r["client"].lower(), -r["total_int"]))
+
+total_up = sum(r["up_int"] for r in rows)
+total_down = sum(r["down_int"] for r in rows)
+total_count = len(rows)
+
+if limit > 0:
+    rows = rows[:limit]
+
+print(f"{'CLIENT':18} {'TARGET':42} {'UP':>12} {'DOWN':>12} {'TOTAL':>12}")
+for row in rows:
+    print(f"{row['client']:18} {row.get('target', '')[:42]:42} {size(row['up_int']):>12} {size(row['down_int']):>12} {size(row['total_int']):>12}")
+
+if total_count > 0:
+    print("-" * 102)
+    summary_label = f"TOTAL ({total_count} targets):"
+    print(f"{summary_label:61} {size(total_up):>12} {size(total_down):>12} {size(total_up + total_down):>12}")
+PY
+)
+
 deploy_easytrojan_bundle() (
     # Stage the complete runtime tree, then swap it as one unit. The caller is
     # still running the old entry script, so this avoids a partially copied
