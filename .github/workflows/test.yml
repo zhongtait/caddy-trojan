@@ -6,7 +6,10 @@ on:
     - cron: '30 2 * * *'
 
 permissions:
-  contents: read
+  # Reusable release jobs can only use permissions granted by the caller.
+  # Individual jobs below narrow these defaults where they do not publish.
+  contents: write
+  id-token: write
 
 concurrency:
   group: easytrojan-check-upstream
@@ -15,6 +18,9 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: none
     outputs:
       updated: ${{ steps.check.outputs.updated }}
       remote_sha: ${{ steps.check.outputs.remote_sha }}
@@ -54,6 +60,11 @@ jobs:
   gate:
     needs: check
     if: needs.check.outputs.updated == 'true'
+    permissions:
+      contents: read
+      # release.yml declares an OIDC signing job even when gate_only skips it;
+      # the caller must grant this permission for workflow validation to pass.
+      id-token: write
     uses: ./.github/workflows/release.yml
     with:
       upstream_sha: ${{ needs.check.outputs.remote_sha }}
@@ -66,6 +77,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: none
     outputs:
       commit_sha: ${{ steps.commit.outputs.commit_sha }}
     steps:
