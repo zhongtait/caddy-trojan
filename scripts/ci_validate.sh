@@ -280,7 +280,7 @@ if ! bash -c '
   require_root() { :; }
   error() { echo -e "[ERROR] $*" >&2; return 1; }
   check_cmd() { command -v "$1" >/dev/null 2>&1; }
-  printf "%s\n" "secret_password_123" > "$PASSWD_FILE"
+  printf "%s\n" "secret_password_123 # Clash-Mac" > "$PASSWD_FILE"
   # Mock curl to write sample traffic json to -o target
   curl() {
     local out=""
@@ -293,18 +293,25 @@ if ! bash -c '
       fi
     done
     if [ -n "$out" ]; then
-      printf "%s\n" "[{\"key\":\"edad48b03cfefa312419559881d61447d16417d72e7b65682dd0bd08\",\"target\":\"googlevideo.com:443\",\"up\":1048576,\"down\":10485760},{\"key\":\"edad48b03cfefa312419559881d61447d16417d72e7b65682dd0bd08\",\"target\":\"example.com:443\",\"up\":1024,\"down\":2048}]" > "$out"
+      printf "%s\n" "[{\"key\":\"edad48b03cfefa312419559881d61447d16417d72e7b65682dd0bd08\",\"ip\":\"220.181.38.10\",\"target\":\"googlevideo.com:443\",\"up\":1048576,\"down\":10485760},{\"key\":\"edad48b03cfefa312419559881d61447d16417d72e7b65682dd0bd08\",\"ip\":\"117.136.28.14\",\"target\":\"example.com:443\",\"up\":1024,\"down\":2048}]" > "$out"
     fi
   }
   . lib/manage.sh
   out=$(do_traffic)
-  echo "$out" | grep -qF "CLIENT"
-  echo "$out" | grep -qF "se***23"
+  echo "$out" | grep -qF "Clash-Mac"
+  echo "$out" | grep -qF "220.181.38.10"
   echo "$out" | grep -qF "googlevideo.com:443"
-  echo "$out" | grep -qF "TOTAL (2 targets):"
+  echo "$out" | grep -qF "GRAND TOTAL (1 clients, 2 targets):"
+  # verify --show-password
+  unmask_out=$(do_traffic --show-password)
+  echo "$unmask_out" | grep -qF "secret_password_123"
+  # verify --flat
+  flat_out=$(do_traffic --flat)
+  echo "$flat_out" | grep -qF "USER / CLIENT"
+  echo "$flat_out" | grep -qF "CLIENT IP"
   # verify --json
   json_out=$(do_traffic --json)
-  echo "$json_out" | grep -qF "googlevideo.com"
+  echo "$json_out" | grep -qF "220.181.38.10"
   # verify --top 1
   top_out=$(do_traffic --top 1)
   echo "$top_out" | grep -qF "googlevideo.com"
@@ -314,7 +321,7 @@ if ! bash -c '
   fail "traffic CLI formatting, sorting, or filtering failed"
 fi
 rm -rf "$traffic_test_root"
-pass "traffic CLI supports sorting, top N, password masking, and summary output"
+pass "traffic CLI supports IP tracking, remarks, grouping, and unmasking"
 
 # ---------- install dependency package mapping ----------
 info "install dependency package mapping"

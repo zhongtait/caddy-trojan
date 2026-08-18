@@ -96,7 +96,8 @@ do_doctor() {
 
 do_traffic() (
     require_root
-    local filter_key="" filter_password="" filter_target="" json=0 limit=0 sort_by="total"
+    local filter_key="" filter_password="" filter_ip="" filter_target="" json=0 limit=0 sort_by="total"
+    local show_password=0 flat_mode=0
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --key)
@@ -107,6 +108,11 @@ do_traffic() (
             --password|-p)
                 [ -n "${2:-}" ] || error "--password requires a value"
                 filter_password="$2"
+                shift 2
+                ;;
+            --ip)
+                [ -n "${2:-}" ] || error "--ip requires a value"
+                filter_ip="$2"
                 shift 2
                 ;;
             --target)
@@ -124,19 +130,23 @@ do_traffic() (
                 shift 2
                 ;;
             --sort)
-                [ -n "${2:-}" ] || error "--sort requires a value (total|up|down|target|client)"
+                [ -n "${2:-}" ] || error "--sort requires a value (total|up|down|target|client|ip)"
                 case "$2" in
-                    total|up|down|target|client) sort_by="$2" ;;
-                    *) error "Invalid --sort value: $2 (allowed: total|up|down|target|client)" ;;
+                    total|up|down|target|client|ip) sort_by="$2" ;;
+                    *) error "Invalid --sort value: $2 (allowed: total|up|down|target|client|ip)" ;;
                 esac
                 shift 2
                 ;;
+            --show-password|--unmask) show_password=1; shift ;;
+            --flat) flat_mode=1; shift ;;
             --json) json=1; shift ;;
             -h|--help)
                 cat <<'EOF'
-Usage: easytrojan traffic [--key HASH] [--password PASS] [--target HOST:PORT] [--top N] [--sort total|up|down|target|client] [--json]
+Usage: easytrojan traffic [--key HASH] [--password PASS] [--ip CLIENT_IP] [--target HOST:PORT]
+                          [--top N] [--sort total|up|down|target|client|ip]
+                          [--show-password] [--flat] [--json]
 
-Show persisted traffic by Trojan client key and destination. The Admin API
+Show persisted traffic grouped by User/Client, Source IP, and destination. The Admin API
 remains bound to localhost; this command must be run as root.
 EOF
                 exit 0
@@ -157,6 +167,7 @@ EOF
 
     local url="${ADMIN_API}/trojan/traffic" tmp curl_args=()
     [ -z "$filter_key" ] || curl_args+=(--data-urlencode "key=${filter_key}")
+    [ -z "$filter_ip" ] || curl_args+=(--data-urlencode "ip=${filter_ip}")
     [ -z "$filter_target" ] || curl_args+=(--data-urlencode "target=${filter_target}")
     tmp=$(mktemp)
     trap 'rm -f -- "${tmp:-}"' EXIT
@@ -168,65 +179,149 @@ EOF
         cat "$tmp"
         return 0
     fi
-    python3 - "$tmp" "$PASSWD_FILE" "$sort_by" "$limit" <<'PY'
+    python3 - "$tmp" "$PASSWD_FILE" "$sort_by" "$limit" "$show_password" "$flat_mode" <<'PY'
 import hashlib
 import json
 import sys
 
 rows = json.load(open(sys.argv[1], encoding="utf-8"))
-passwords = {}
+passwd_file = sys.argv[2]
+sort_by = sys.argv[3] if len(sys.argv) > 3 else "total"
+limit = int(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4].isdigit() else 0
+show_password = (sys.argv[5] == "1") if len(sys.argv) > 5 else False
+flat_mode = (sys.argv[6] == "1") if len(sys.argv) > 6 else False
+
+user_map = {}
 try:
-    for line in open(sys.argv[2], encoding="utf-8"):
-        password = line.rstrip("\r\n")
-        if password:
-            passwords[hashlib.sha224(password.encode()).hexdigest()] = password
+    idx = 1
+    for line in open(passwd_file, encoding="utf-8"):
+        raw = line.rstrip("\r\n").strip()
+        if not raw or raw.startswith("#"):
+            continue
+        comment = ""
+        if "#" in raw:
+            pwd, comment = raw.split("#", 1)
+            pwd = pwd.strip()
+            comment = comment.strip()
+        else:
+            pwd = raw
+        if pwd:
+            h = hashlib.sha224(pwd.encode()).hexdigest()
+            user_map[h] = (idx, pwd, comment)
+            idx += 1
 except OSError:
     pass
 
-sort_by = sys.argv[3] if len(sys.argv) > 3 else "total"
-limit = int(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4].isdigit() else 0
+def mask(pwd):
+    if not pwd:
+        return "-"
+    if show_password:
+        return pwd
+    n = len(pwd)
+    if n <= 2:
+        return pwd[0] + "*" if n == 2 else "*"
+    elif n <= 4:
+        return pwd[0] + "**" + pwd[-1]
+    elif n <= 8:
+        return pwd[0] + "***" + pwd[-1]
+    else:
+        return pwd[:2] + "***" + pwd[-2:]
 
-def size(value):
-    value = float(value)
+def size(val):
+    val = float(val)
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-        if value < 1024 or unit == "TiB":
-            return f"{value:.1f} {unit}"
-        value /= 1024
+        if val < 1024 or unit == "TiB":
+            return f"{val:.1f} {unit}"
+        val /= 1024
 
-for row in rows:
-    row["up_int"] = int(row.get("up", 0))
-    row["down_int"] = int(row.get("down", 0))
-    row["total_int"] = row["up_int"] + row["down_int"]
-    key = row.get("key", "")
-    password = passwords.get(key)
-    row["client"] = (password[:2] + "***" + password[-2:]) if password and len(password) > 8 else ("****" if password else (key[:16] if key else "-"))
+clients = {}
+for r in rows:
+    k = r.get("key", "")
+    r["up_int"] = int(r.get("up", 0))
+    r["down_int"] = int(r.get("down", 0))
+    r["total_int"] = r["up_int"] + r["down_int"]
+    r["ip_str"] = r.get("ip", "") or "-"
+    if k not in clients:
+        info = user_map.get(k)
+        if info:
+            u_idx, u_pwd, u_comment = info
+            if u_comment:
+                name = f"User #{u_idx}: {u_comment} ({mask(u_pwd)})"
+            else:
+                name = f"User #{u_idx} ({mask(u_pwd)})"
+        else:
+            name = f"Client {k[:16]}"
+        clients[k] = {"name": name, "rows": [], "up": 0, "down": 0, "total": 0}
+    clients[k]["rows"].append(r)
+    clients[k]["up"] += r["up_int"]
+    clients[k]["down"] += r["down_int"]
+    clients[k]["total"] += r["total_int"]
 
-if sort_by == "total":
-    rows.sort(key=lambda r: r["total_int"], reverse=True)
-elif sort_by == "up":
-    rows.sort(key=lambda r: r["up_int"], reverse=True)
-elif sort_by == "down":
-    rows.sort(key=lambda r: r["down_int"], reverse=True)
-elif sort_by == "target":
-    rows.sort(key=lambda r: r.get("target", "").lower())
-elif sort_by == "client":
-    rows.sort(key=lambda r: (r["client"].lower(), -r["total_int"]))
+if not clients:
+    print("No traffic recorded yet.")
+    sys.exit(0)
 
-total_up = sum(r["up_int"] for r in rows)
-total_down = sum(r["down_int"] for r in rows)
-total_count = len(rows)
+sorted_clients = sorted(clients.values(), key=lambda c: c["total"], reverse=True)
+grand_up = sum(c["up"] for c in sorted_clients)
+grand_down = sum(c["down"] for c in sorted_clients)
+grand_total = grand_up + grand_down
+grand_targets = sum(len(c["rows"]) for c in sorted_clients)
 
-if limit > 0:
-    rows = rows[:limit]
-
-print(f"{'CLIENT':18} {'TARGET':42} {'UP':>12} {'DOWN':>12} {'TOTAL':>12}")
-for row in rows:
-    print(f"{row['client']:18} {row.get('target', '')[:42]:42} {size(row['up_int']):>12} {size(row['down_int']):>12} {size(row['total_int']):>12}")
-
-if total_count > 0:
-    print("-" * 102)
-    summary_label = f"TOTAL ({total_count} targets):"
-    print(f"{summary_label:61} {size(total_up):>12} {size(total_down):>12} {size(total_up + total_down):>12}")
+if flat_mode:
+    all_rows = []
+    for c in sorted_clients:
+        for r in c["rows"]:
+            r["client_name"] = c["name"]
+            all_rows.append(r)
+    if sort_by == "total":
+        all_rows.sort(key=lambda r: r["total_int"], reverse=True)
+    elif sort_by == "up":
+        all_rows.sort(key=lambda r: r["up_int"], reverse=True)
+    elif sort_by == "down":
+        all_rows.sort(key=lambda r: r["down_int"], reverse=True)
+    elif sort_by == "target":
+        all_rows.sort(key=lambda r: r.get("target", "").lower())
+    elif sort_by == "ip":
+        all_rows.sort(key=lambda r: r["ip_str"])
+    elif sort_by == "client":
+        all_rows.sort(key=lambda r: (r["client_name"].lower(), -r["total_int"]))
+    if limit > 0:
+        all_rows = all_rows[:limit]
+    print(f"{'USER / CLIENT':24} {'CLIENT IP':18} {'TARGET':38} {'UP':>11} {'DOWN':>11} {'TOTAL':>11}")
+    for r in all_rows:
+        print(f"{r['client_name'][:24]:24} {r['ip_str'][:18]:18} {r.get('target', '')[:38]:38} {size(r['up_int']):>11} {size(r['down_int']):>11} {size(r['total_int']):>11}")
+    print("-" * 118)
+    summary = f"TOTAL ({len(sorted_clients)} clients, {grand_targets} targets):"
+    print(f"{summary:83} {size(grand_up):>11} {size(grand_down):>11} {size(grand_total):>11}")
+else:
+    for c in sorted_clients:
+        if sort_by == "total":
+            c["rows"].sort(key=lambda r: r["total_int"], reverse=True)
+        elif sort_by == "up":
+            c["rows"].sort(key=lambda r: r["up_int"], reverse=True)
+        elif sort_by == "down":
+            c["rows"].sort(key=lambda r: r["down_int"], reverse=True)
+        elif sort_by == "target":
+            c["rows"].sort(key=lambda r: r.get("target", "").lower())
+        elif sort_by == "ip":
+            c["rows"].sort(key=lambda r: r["ip_str"])
+        
+        target_rows = c["rows"]
+        if limit > 0:
+            target_rows = target_rows[:limit]
+        
+        t_count = len(c["rows"])
+        header_title = f"[{c['name']}]  Total: {size(c['total'])}  (Up: {size(c['up'])}, Down: {size(c['down'])}, {t_count} {'target' if t_count == 1 else 'targets'})"
+        print("=" * 110)
+        print(header_title)
+        print("-" * 110)
+        print(f"  {'CLIENT IP':22} {'TARGET':44} {'UP':>13} {'DOWN':>13} {'TOTAL':>13}")
+        for r in target_rows:
+            print(f"  {r['ip_str'][:22]:22} {r.get('target', '')[:44]:44} {size(r['up_int']):>13} {size(r['down_int']):>13} {size(r['total_int']):>13}")
+        print()
+    print("=" * 110)
+    grand_summary = f"GRAND TOTAL ({len(sorted_clients)} clients, {grand_targets} targets):"
+    print(f"{grand_summary:69} {size(grand_up):>13} {size(grand_down):>13} {size(grand_total):>13}")
 PY
 )
 

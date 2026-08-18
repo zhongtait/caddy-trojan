@@ -181,6 +181,13 @@ build_users_directive() {
     local line q args=""
     if [ -f "$PASSWD_FILE" ]; then
         while IFS= read -r line || [ -n "$line" ]; do
+            line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            [ -n "$line" ] || continue
+            case "$line" in
+                \#*) continue ;;
+            esac
+            line="${line%%#*}"
+            line=$(echo "$line" | sed 's/[[:space:]]*$//')
             [ -n "$line" ] || continue
             q=$(caddyfile_quote "$line")
             args="${args} ${q}"

@@ -234,7 +234,7 @@ index d1844bb..6d72b81 100644
  	NoProxy
  }
 diff --git a/app/upstream.go b/app/upstream.go
-index 732c54a..9f5b7d7 100644
+index 732c54a..9fab732 100644
 --- a/app/upstream.go
 +++ b/app/upstream.go
 @@ -2,8 +2,11 @@ package app
@@ -249,25 +249,41 @@ index 732c54a..9f5b7d7 100644
  	"strings"
  	"sync"
  
-@@ -25,6 +28,17 @@ type Traffic struct {
+@@ -25,6 +28,33 @@ type Traffic struct {
  	Down int64 `json:"down"`
  }
  
 +type TargetTraffic struct {
 +	Key    string `json:"key"`
++	IP     string `json:"ip,omitempty"`
 +	Target string `json:"target"`
 +	Traffic
 +}
 +
 +type TargetUpstream interface {
-+	ConsumeTarget(string, string, int64, int64) error
-+	RangeTargets(func(string, string, int64, int64))
++	ConsumeTarget(string, string, string, int64, int64) error
++	RangeTargets(func(string, string, string, int64, int64))
++}
++
++func targetKeyString(ip, target string) string {
++	if ip != "" {
++		return ip + "/" + target
++	}
++	return target
++}
++
++func splitTargetKey(raw string) (ip, target string) {
++	if strings.Contains(raw, "/") {
++		parts := strings.SplitN(raw, "/", 2)
++		return parts[0], parts[1]
++	}
++	return "", raw
 +}
 +
  type Upstream interface {
  	Add(string) error
  	Delete(string) error
-@@ -39,15 +53,22 @@ const (
+@@ -39,15 +69,23 @@ const (
  	TaskAdd TaskType = iota
  	TaskDelete
  	TaskConsume
@@ -284,13 +300,14 @@ index 732c54a..9f5b7d7 100644
  		Password string
  		Key      string
  		Traffic
++		IP     string
 +		Target string
  	}
 +	Done chan error
  }
  
  type MemoryUpstream struct {
-@@ -56,8 +77,13 @@ type MemoryUpstream struct {
+@@ -56,8 +94,13 @@ type MemoryUpstream struct {
  	ch chan Task
  	up Upstream
  
@@ -306,7 +323,7 @@ index 732c54a..9f5b7d7 100644
  }
  
  func (*MemoryUpstream) CaddyModule() caddy.ModuleInfo {
-@@ -69,9 +95,10 @@ func (*MemoryUpstream) CaddyModule() caddy.ModuleInfo {
+@@ -69,9 +112,10 @@ func (*MemoryUpstream) CaddyModule() caddy.ModuleInfo {
  
  func (u *MemoryUpstream) Provision(ctx caddy.Context) error {
  	u.mm = make(map[string]Traffic)
@@ -318,14 +335,14 @@ index 732c54a..9f5b7d7 100644
  		return nil
  	}
  
-@@ -85,36 +112,88 @@ func (u *MemoryUpstream) Provision(ctx caddy.Context) error {
+@@ -85,36 +129,88 @@ func (u *MemoryUpstream) Provision(ctx caddy.Context) error {
  		u.AddKey(k)
  		u.Consume(k, nr, nw)
  	})
 +	if targets, ok := up.(TargetUpstream); ok {
-+		targets.RangeTargets(func(k, target string, nr, nw int64) {
-+			u.AddTargetKey(k, target)
-+			u.consumeTargetMemory(k, target, nr, nw)
++		targets.RangeTargets(func(k, ip, target string, nr, nw int64) {
++			u.AddTargetKey(k, ip, target)
++			u.consumeTargetMemory(k, ip, target, nr, nw)
 +		})
 +	}
  
@@ -360,7 +377,7 @@ index 732c54a..9f5b7d7 100644
 +				err = up.Consume(t.Value.Key, t.Value.Up, t.Value.Down)
 +			case TaskConsumeTarget:
 +				if targets, ok := up.(TargetUpstream); ok {
-+					err = targets.ConsumeTarget(t.Value.Key, t.Value.Target, t.Value.Up, t.Value.Down)
++					err = targets.ConsumeTarget(t.Value.Key, t.Value.IP, t.Value.Target, t.Value.Up, t.Value.Down)
 +				}
  			default:
  			}
@@ -373,7 +390,7 @@ index 732c54a..9f5b7d7 100644
  		}
  	}(u.up, u.ch)
 +}
-+
+ 
 +func (u *MemoryUpstream) Cleanup() error {
 +	u.persistMu.Lock()
 +	if !u.closed {
@@ -384,9 +401,12 @@ index 732c54a..9f5b7d7 100644
 +	}
 +	u.persistMu.Unlock()
 +	u.worker.Wait()
-+	return nil
-+}
+ 	return nil
+ }
  
+-func (u *MemoryUpstream) Cleanup() error {
+-	if u.ch == nil {
+-		return nil
 +func (u *MemoryUpstream) persistAndApply(task Task, apply func()) error {
 +	u.persistMu.RLock()
 +	defer u.persistMu.RUnlock()
@@ -401,12 +421,9 @@ index 732c54a..9f5b7d7 100644
 +		}
 +	}
 +	apply()
- 	return nil
- }
- 
--func (u *MemoryUpstream) Cleanup() error {
--	if u.ch == nil {
--		return nil
++	return nil
++}
++
 +func (u *MemoryUpstream) applyAndQueue(task Task, apply func()) error {
 +	u.persistMu.RLock()
 +	defer u.persistMu.RUnlock()
@@ -421,7 +438,7 @@ index 732c54a..9f5b7d7 100644
  	return nil
  }
  
-@@ -122,23 +201,17 @@ func (u *MemoryUpstream) Add(s string) error {
+@@ -122,23 +218,17 @@ func (u *MemoryUpstream) Add(s string) error {
  	b := [trojan.HeaderLen]byte{}
  	trojan.GenKey(s, b[:])
  
@@ -450,7 +467,7 @@ index 732c54a..9f5b7d7 100644
  	}
  	u.mu.Unlock()
  }
-@@ -147,18 +220,58 @@ func (u *MemoryUpstream) Delete(s string) error {
+@@ -147,18 +237,62 @@ func (u *MemoryUpstream) Delete(s string) error {
  	b := [trojan.HeaderLen]byte{}
  	trojan.GenKey(s, b[:])
  	key := x.ByteSliceToString(b[:])
@@ -464,59 +481,63 @@ index 732c54a..9f5b7d7 100644
 +	})
 +}
 +
-+func (u *MemoryUpstream) AddTargetKey(key, target string) {
++func (u *MemoryUpstream) AddTargetKey(key, ip, target string) {
  	u.mu.Lock()
 -	delete(u.mm, key)
 +	if _, ok := u.tm[key]; !ok {
 +		u.tm[key] = make(map[string]Traffic)
 +	}
-+	if _, ok := u.tm[key][target]; !ok {
-+		u.tm[key][target] = Traffic{}
++	raw := targetKeyString(ip, target)
++	if _, ok := u.tm[key][raw]; !ok {
++		u.tm[key][raw] = Traffic{}
 +	}
  	u.mu.Unlock()
 +}
  
 -	if u.up == nil {
 -		return nil
-+func (u *MemoryUpstream) consumeTargetMemory(key, target string, nr, nw int64) {
++func (u *MemoryUpstream) consumeTargetMemory(key, ip, target string, nr, nw int64) {
 +	if _, ok := u.tm[key]; !ok {
 +		u.tm[key] = make(map[string]Traffic)
  	}
-+	traffic := u.tm[key][target]
++	raw := targetKeyString(ip, target)
++	traffic := u.tm[key][raw]
 +	traffic.Up += nr
 +	traffic.Down += nw
-+	u.tm[key][target] = traffic
++	u.tm[key][raw] = traffic
 +}
  
 -	t := Task{Type: TaskDelete}
 -	t.Value.Password = s
 -	u.ch <- t
 -	return nil
-+func (u *MemoryUpstream) RangeTargets(fn func(string, string, int64, int64)) {
++func (u *MemoryUpstream) RangeTargets(fn func(string, string, string, int64, int64)) {
 +	u.mu.RLock()
 +	defer u.mu.RUnlock()
 +	for key, targets := range u.tm {
-+		for target, traffic := range targets {
-+			fn(key, target, traffic.Up, traffic.Down)
++		for raw, traffic := range targets {
++			ip, target := splitTargetKey(raw)
++			fn(key, ip, target, traffic.Up, traffic.Down)
 +		}
 +	}
 +}
 +
-+func (u *MemoryUpstream) ConsumeTarget(key, target string, nr, nw int64) error {
++func (u *MemoryUpstream) ConsumeTarget(key, ip, target string, nr, nw int64) error {
 +	t := Task{Type: TaskConsumeTarget}
 +	t.Value.Key = key
++	t.Value.IP = ip
 +	t.Value.Target = target
 +	t.Value.Up = nr
 +	t.Value.Down = nw
 +	return u.applyAndQueue(t, func() {
 +		u.mu.Lock()
-+		u.consumeTargetMemory(key, target, nr, nw)
++		u.consumeTargetMemory(key, ip, target, nr, nw)
 +		u.mu.Unlock()
 +	})
  }
  
  func (u *MemoryUpstream) Range(fn func(string, int64, int64)) {
-@@ -177,23 +290,18 @@ func (u *MemoryUpstream) Validate(k string) bool {
+@@ -177,23 +311,18 @@ func (u *MemoryUpstream) Validate(k string) bool {
  }
  
  func (u *MemoryUpstream) Consume(k string, nr, nw int64) error {
@@ -548,7 +569,7 @@ index 732c54a..9f5b7d7 100644
  }
  
  type CaddyUpstream struct {
-@@ -202,6 +310,8 @@ type CaddyUpstream struct {
+@@ -202,6 +331,8 @@ type CaddyUpstream struct {
  	logger  *zap.Logger
  }
  
@@ -557,7 +578,7 @@ index 732c54a..9f5b7d7 100644
  func (CaddyUpstream) CaddyModule() caddy.ModuleInfo {
  	return caddy.ModuleInfo{
  		ID:  "trojan.upstream.caddy",
-@@ -220,8 +330,17 @@ func (u *CaddyUpstream) Add(s string) error {
+@@ -220,8 +351,17 @@ func (u *CaddyUpstream) Add(s string) error {
  	b := [trojan.HeaderLen]byte{}
  	trojan.GenKey(s, b[:])
  	key := u.prefix + string(b[:])
@@ -577,7 +598,7 @@ index 732c54a..9f5b7d7 100644
  	}
  	traffic := Traffic{
  		Up:   0,
-@@ -238,10 +357,52 @@ func (u *CaddyUpstream) Delete(s string) error {
+@@ -238,10 +378,53 @@ func (u *CaddyUpstream) Delete(s string) error {
  	b := [trojan.HeaderLen]byte{}
  	trojan.GenKey(s, b[:])
  	key := u.prefix + x.ByteSliceToString(b[:])
@@ -602,7 +623,7 @@ index 732c54a..9f5b7d7 100644
 +	return nil
 +}
 +
-+func (u *CaddyUpstream) RangeTargets(fn func(string, string, int64, int64)) {
++func (u *CaddyUpstream) RangeTargets(fn func(string, string, string, int64, int64)) {
 +	prefix := u.prefix + targetPrefix
 +	keys, err := u.storage.List(context.Background(), prefix, true)
 +	if err != nil {
@@ -618,6 +639,7 @@ index 732c54a..9f5b7d7 100644
 +		if err != nil {
 +			continue
 +		}
++		ip, target := splitTargetKey(string(targetBytes))
 +		b, err := u.storage.Load(context.Background(), key)
 +		if err != nil {
 +			continue
@@ -626,13 +648,13 @@ index 732c54a..9f5b7d7 100644
 +		if json.Unmarshal(b, &traffic) != nil {
 +			continue
 +		}
-+		fn(parts[0], string(targetBytes), traffic.Up, traffic.Down)
++		fn(parts[0], ip, target, traffic.Up, traffic.Down)
  	}
 -	return u.storage.Delete(context.Background(), key)
  }
  
  func (u *CaddyUpstream) Range(fn func(k string, up, down int64)) {
-@@ -250,24 +411,41 @@ func (u *CaddyUpstream) Range(fn func(k string, up, down int64)) {
+@@ -250,24 +433,41 @@ func (u *CaddyUpstream) Range(fn func(k string, up, down int64)) {
  		return
  	}
  
@@ -654,17 +676,17 @@ index 732c54a..9f5b7d7 100644
  		}
 -		fn(strings.TrimPrefix(k, u.prefix), traffic.Up, traffic.Down)
 +		fn(userKey, traffic.Up, traffic.Down)
- 	}
- }
- 
++	}
++}
++
 +func isTrojanStorageKey(key string) bool {
 +	if len(key) != trojan.HeaderLen {
 +		return false
-+	}
+ 	}
 +	_, err := hex.DecodeString(key)
 +	return err == nil
-+}
-+
+ }
+ 
  func (u *CaddyUpstream) Validate(k string) bool {
  	key := u.prefix + k
 -	return u.storage.Exists(context.Background(), key)
@@ -677,12 +699,13 @@ index 732c54a..9f5b7d7 100644
  }
  
  func (u *CaddyUpstream) Consume(k string, nr, nw int64) error {
-@@ -297,9 +475,35 @@ func (u *CaddyUpstream) Consume(k string, nr, nw int64) error {
+@@ -297,9 +497,36 @@ func (u *CaddyUpstream) Consume(k string, nr, nw int64) error {
  	return u.storage.Store(context.Background(), key, b)
  }
  
-+func (u *CaddyUpstream) ConsumeTarget(k, target string, nr, nw int64) error {
-+	key := u.prefix + targetPrefix + k + "/" + hex.EncodeToString([]byte(target))
++func (u *CaddyUpstream) ConsumeTarget(k, ip, target string, nr, nw int64) error {
++	raw := targetKeyString(ip, target)
++	key := u.prefix + targetPrefix + k + "/" + hex.EncodeToString([]byte(raw))
 +	u.storage.Lock(context.Background(), key)
 +	defer u.storage.Unlock(context.Background(), key)
 +	b, err := u.storage.Load(context.Background(), key)
@@ -714,7 +737,7 @@ index 732c54a..9f5b7d7 100644
  	_ caddy.Provisioner  = (*MemoryUpstream)(nil)
  )
 diff --git a/modules/admin/admin.go b/modules/admin/admin.go
-index 7a988a8..8557adb 100644
+index 7a988a8..0406e28 100644
 --- a/modules/admin/admin.go
 +++ b/modules/admin/admin.go
 @@ -5,6 +5,7 @@ import (
@@ -725,7 +748,7 @@ index 7a988a8..8557adb 100644
  
  	"github.com/caddyserver/caddy/v2"
  
-@@ -58,9 +59,40 @@ func (al *Admin) Routes() []caddy.AdminRoute {
+@@ -58,9 +59,50 @@ func (al *Admin) Routes() []caddy.AdminRoute {
  			Pattern: "/trojan/users/delete",
  			Handler: caddy.AdminHandlerFunc(al.DeleteUser),
  		},
@@ -745,19 +768,29 @@ index 7a988a8..8557adb 100644
 +		return errors.New("trojan target traffic is unavailable")
 +	}
 +	filterKey := r.URL.Query().Get("key")
++	filterIP := r.URL.Query().Get("ip")
 +	filterTarget := r.URL.Query().Get("target")
 +	rows := make([]app.TargetTraffic, 0)
-+	targets.RangeTargets(func(key, target string, up, down int64) {
-+		if filterKey != "" && filterKey != key || filterTarget != "" && filterTarget != target {
++	targets.RangeTargets(func(key, ip, target string, up, down int64) {
++		if filterKey != "" && filterKey != key {
 +			return
 +		}
-+		rows = append(rows, app.TargetTraffic{Key: key, Target: target, Traffic: app.Traffic{Up: up, Down: down}})
++		if filterIP != "" && filterIP != ip {
++			return
++		}
++		if filterTarget != "" && filterTarget != target {
++			return
++		}
++		rows = append(rows, app.TargetTraffic{Key: key, IP: ip, Target: target, Traffic: app.Traffic{Up: up, Down: down}})
 +	})
 +	sort.Slice(rows, func(i, j int) bool {
-+		if rows[i].Key == rows[j].Key {
-+			return rows[i].Target < rows[j].Target
++		if rows[i].Key != rows[j].Key {
++			return rows[i].Key < rows[j].Key
 +		}
-+		return rows[i].Key < rows[j].Key
++		if rows[i].IP != rows[j].IP {
++			return rows[i].IP < rows[j].IP
++		}
++		return rows[i].Target < rows[j].Target
 +	})
 +	w.WriteHeader(http.StatusOK)
 +	return json.NewEncoder(w).Encode(rows)
@@ -766,7 +799,7 @@ index 7a988a8..8557adb 100644
  func (al *Admin) GetUsers(w http.ResponseWriter, r *http.Request) error {
  	if al.upstream == nil {
  		return nil
-@@ -108,7 +140,9 @@ func (al *Admin) AddUser(w http.ResponseWriter, r *http.Request) error {
+@@ -108,7 +150,9 @@ func (al *Admin) AddUser(w http.ResponseWriter, r *http.Request) error {
  		return err
  	}
  	if user.Password != "" {
@@ -777,7 +810,7 @@ index 7a988a8..8557adb 100644
  	}
  
  	w.WriteHeader(http.StatusOK)
-@@ -137,7 +171,9 @@ func (al *Admin) DeleteUser(w http.ResponseWriter, r *http.Request) error {
+@@ -137,7 +181,9 @@ func (al *Admin) DeleteUser(w http.ResponseWriter, r *http.Request) error {
  		return err
  	}
  	if user.Password != "" {
@@ -789,10 +822,18 @@ index 7a988a8..8557adb 100644
  
  	w.WriteHeader(http.StatusOK)
 diff --git a/modules/handler/handler.go b/modules/handler/handler.go
-index 3e7b7a1..bcb4e55 100644
+index 3e7b7a1..dbbf744 100644
 --- a/modules/handler/handler.go
 +++ b/modules/handler/handler.go
-@@ -95,11 +95,12 @@ func (m *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
+@@ -5,6 +5,7 @@ import (
+ 
+ 	"fmt"
+ 	"io"
++	"net"
+ 	"net/http"
+ 	"strings"
+ 
+@@ -95,11 +96,12 @@ func (m *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
  			m.logger.Info(fmt.Sprintf("handle trojan http%d from %v", r.ProtoMajor, r.RemoteAddr))
  		}
  
@@ -802,11 +843,11 @@ index 3e7b7a1..bcb4e55 100644
  			m.logger.Error(fmt.Sprintf("handle http%d error: %v", r.ProtoMajor, err))
  		}
  		m.upstream.Consume(auth, nr, nw)
-+		m.consumeTargets(auth, targets)
++		m.consumeTargets(auth, clientIPFromRequest(r), targets)
  		return nil
  	}
  
-@@ -125,17 +126,33 @@ func (m *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
+@@ -125,17 +127,43 @@ func (m *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
  			m.logger.Info(fmt.Sprintf("handle trojan websocket.Conn from %v", r.RemoteAddr))
  		}
  
@@ -816,14 +857,24 @@ index 3e7b7a1..bcb4e55 100644
  			m.logger.Error(fmt.Sprintf("handle websocket error: %v", err))
  		}
  		m.upstream.Consume(x.ByteSliceToString(b[:trojan.HeaderLen]), nr, nw)
-+		m.consumeTargets(x.ByteSliceToString(b[:trojan.HeaderLen]), targets)
++		m.consumeTargets(x.ByteSliceToString(b[:trojan.HeaderLen]), clientIPFromRequest(r), targets)
  		return nil
  	}
  
  	return next.ServeHTTP(w, r)
  }
  
-+func (m *Handler) consumeTargets(key string, targets []trojan.TargetTraffic) {
++func clientIPFromRequest(r *http.Request) string {
++	if r == nil {
++		return ""
++	}
++	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
++		return host
++	}
++	return r.RemoteAddr
++}
++
++func (m *Handler) consumeTargets(key, ip string, targets []trojan.TargetTraffic) {
 +	upstream, ok := m.upstream.(app.TargetUpstream)
 +	if !ok {
 +		return
@@ -832,7 +883,7 @@ index 3e7b7a1..bcb4e55 100644
 +		if target.Target == "" || (target.Up == 0 && target.Down == 0) {
 +			continue
 +		}
-+		if err := upstream.ConsumeTarget(key, target.Target, target.Up, target.Down); err != nil {
++		if err := upstream.ConsumeTarget(key, ip, target.Target, target.Up, target.Down); err != nil {
 +			m.logger.Error(fmt.Sprintf("record target traffic error: %v", err))
 +		}
 +	}
@@ -842,10 +893,10 @@ index 3e7b7a1..bcb4e55 100644
  func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
  	if !d.Next() {
 diff --git a/modules/listener/listener.go b/modules/listener/listener.go
-index 171b58b..7d4c2f1 100644
+index 171b58b..ee399fc 100644
 --- a/modules/listener/listener.go
 +++ b/modules/listener/listener.go
-@@ -206,11 +206,21 @@ func (l *Listener) loop() {
+@@ -206,11 +206,29 @@ func (l *Listener) loop() {
  				lg.Info(fmt.Sprintf("handle trojan net.Conn from %v", c.RemoteAddr()))
  			}
  
@@ -854,13 +905,21 @@ index 171b58b..7d4c2f1 100644
  			if err != nil {
  				lg.Error(fmt.Sprintf("handle net.Conn error: %v", err))
  			}
++			clientIP := ""
++			if c.RemoteAddr() != nil {
++				if host, _, err := net.SplitHostPort(c.RemoteAddr().String()); err == nil {
++					clientIP = host
++				} else {
++					clientIP = c.RemoteAddr().String()
++				}
++			}
  			up.Consume(x.ByteSliceToString(b[:trojan.HeaderLen]), nr, nw)
 +			if targetUpstream, ok := up.(app.TargetUpstream); ok {
 +				for _, target := range targets {
 +					if target.Target == "" || (target.Up == 0 && target.Down == 0) {
 +						continue
 +					}
-+					if err := targetUpstream.ConsumeTarget(x.ByteSliceToString(b[:trojan.HeaderLen]), target.Target, target.Up, target.Down); err != nil {
++					if err := targetUpstream.ConsumeTarget(x.ByteSliceToString(b[:trojan.HeaderLen]), clientIP, target.Target, target.Up, target.Down); err != nil {
 +						lg.Error(fmt.Sprintf("record target traffic error: %v", err))
 +					}
 +				}
@@ -1029,400 +1088,3 @@ index 69d4de2..42fcb20 100644
 +	targetsMu.Unlock()
 +	return result, nr, nw, err
  }
-diff --git a/app/proxy_outbound_test.go b/app/proxy_outbound_test.go
-new file mode 100644
-index 0000000..12a6ee2
---- /dev/null
-+++ b/app/proxy_outbound_test.go
-@@ -0,0 +1,66 @@
-+package app
-+
-+import (
-+	"context"
-+	"errors"
-+	"net"
-+	"testing"
-+	"time"
-+)
-+
-+func TestNoProxyDialTimeout(t *testing.T) {
-+	if noProxyDialTimeout != 10*time.Second {
-+		t.Fatalf("noProxyDialTimeout = %v, want 10s", noProxyDialTimeout)
-+	}
-+}
-+
-+func TestNoProxyDialContextCanceledDNS(t *testing.T) {
-+	ctx, cancel := context.WithCancel(context.Background())
-+	cancel()
-+
-+	conn, err := (&NoProxy{Network: "ipv4"}).dialContext(ctx, "tcp", "timeout.invalid:443")
-+	if conn != nil {
-+		_ = conn.Close()
-+		t.Fatal("dialContext returned a connection for a canceled DNS lookup")
-+	}
-+	if !errors.Is(err, context.Canceled) {
-+		t.Fatalf("dialContext error = %v, want context.Canceled", err)
-+	}
-+}
-+
-+func TestNoProxyDialContextCanceledIPLiteral(t *testing.T) {
-+	ctx, cancel := context.WithCancel(context.Background())
-+	cancel()
-+
-+	conn, err := (&NoProxy{Network: "ipv4"}).dialContext(ctx, "tcp", "192.0.2.1:443")
-+	if conn != nil {
-+		_ = conn.Close()
-+		t.Fatal("dialContext returned a connection for a canceled IP-literal dial")
-+	}
-+	if !errors.Is(err, context.Canceled) {
-+		t.Fatalf("dialContext error = %v, want context.Canceled", err)
-+	}
-+}
-+
-+func TestDialTCPPreferredCanceled(t *testing.T) {
-+	ctx, cancel := context.WithCancel(context.Background())
-+	cancel()
-+
-+	conn, err := dialTCPPreferred(ctx, "tcp", "443", []net.IP{net.ParseIP("127.0.0.1")}, nil)
-+	if conn != nil {
-+		_ = conn.Close()
-+		t.Fatal("dialTCPPreferred returned a connection for a canceled context")
-+	}
-+	if !errors.Is(err, context.Canceled) {
-+		t.Fatalf("dialTCPPreferred error = %v, want context.Canceled", err)
-+	}
-+}
-+
-+func TestIsIPLiteralWithIPv6Zone(t *testing.T) {
-+	if !isIPLiteral("fe80::1%eth0") {
-+		t.Fatal("isIPLiteral rejected an IPv6 literal with a zone")
-+	}
-+	if isIPLiteral("example.com") {
-+		t.Fatal("isIPLiteral accepted a domain name")
-+	}
-+}
-diff --git a/app/upstream_memory_test.go b/app/upstream_memory_test.go
-new file mode 100644
-index 0000000..d7bf32e
---- /dev/null
-+++ b/app/upstream_memory_test.go
-@@ -0,0 +1,241 @@
-+package app
-+
-+import (
-+	"errors"
-+	"sync"
-+	"testing"
-+	"time"
-+
-+	"github.com/imgk/caddy-trojan/pkgs/trojan"
-+)
-+
-+type recordedTask struct {
-+	typ  TaskType
-+	key  string
-+	up   int64
-+	down int64
-+}
-+
-+type recordingUpstream struct {
-+	mu         sync.Mutex
-+	tasks      []recordedTask
-+	addErr     error
-+	deleteErr  error
-+	consumeErr error
-+}
-+
-+func (u *recordingUpstream) Add(password string) error {
-+	u.record(TaskAdd, password, 0, 0)
-+	return u.addErr
-+}
-+
-+func (u *recordingUpstream) Delete(password string) error {
-+	u.record(TaskDelete, password, 0, 0)
-+	return u.deleteErr
-+}
-+
-+func (u *recordingUpstream) Consume(key string, up, down int64) error {
-+	u.record(TaskConsume, key, up, down)
-+	return u.consumeErr
-+}
-+
-+func (*recordingUpstream) Range(func(string, int64, int64)) {}
-+
-+func (*recordingUpstream) Validate(string) bool { return false }
-+
-+func (u *recordingUpstream) record(typ TaskType, key string, up, down int64) {
-+	u.mu.Lock()
-+	u.tasks = append(u.tasks, recordedTask{typ: typ, key: key, up: up, down: down})
-+	u.mu.Unlock()
-+}
-+
-+type targetRecordingUpstream struct {
-+	recordingUpstream
-+	targetTasks []recordedTask
-+}
-+
-+func (u *targetRecordingUpstream) ConsumeTarget(key, target string, up, down int64) error {
-+	u.mu.Lock()
-+	u.targetTasks = append(u.targetTasks, recordedTask{typ: TaskConsumeTarget, key: key, up: up, down: down})
-+	u.mu.Unlock()
-+	return nil
-+}
-+
-+func (u *targetRecordingUpstream) RangeTargets(func(string, string, int64, int64)) {}
-+
-+type blockingUpstream struct {
-+	recordingUpstream
-+	consumeStarted chan struct{}
-+	releaseConsume chan struct{}
-+}
-+
-+func (u *blockingUpstream) Consume(key string, up, down int64) error {
-+	close(u.consumeStarted)
-+	<-u.releaseConsume
-+	return u.recordingUpstream.Consume(key, up, down)
-+}
-+
-+func TestMemoryUpstreamCleanupFlushesPersistenceQueue(t *testing.T) {
-+	persist := new(recordingUpstream)
-+	u := &MemoryUpstream{mm: make(map[string]Traffic)}
-+	u.startPersistenceWorker(persist)
-+
-+	if err := u.Add("password"); err != nil {
-+		t.Fatal(err)
-+	}
-+	if err := u.Consume("key", 12, 34); err != nil {
-+		t.Fatal(err)
-+	}
-+	if err := u.Delete("password"); err != nil {
-+		t.Fatal(err)
-+	}
-+	if err := u.Cleanup(); err != nil {
-+		t.Fatal(err)
-+	}
-+	if err := u.Cleanup(); err != nil {
-+		t.Fatalf("second Cleanup returned an error: %v", err)
-+	}
-+
-+	persist.mu.Lock()
-+	defer persist.mu.Unlock()
-+	if len(persist.tasks) != 3 {
-+		t.Fatalf("persisted %d tasks, want 3", len(persist.tasks))
-+	}
-+	if persist.tasks[0].typ != TaskAdd || persist.tasks[0].key != "password" {
-+		t.Fatalf("first task = %#v, want add", persist.tasks[0])
-+	}
-+	if persist.tasks[1] != (recordedTask{typ: TaskConsume, key: "key", up: 12, down: 34}) {
-+		t.Fatalf("second task = %#v, want consume", persist.tasks[1])
-+	}
-+	if persist.tasks[2].typ != TaskDelete || persist.tasks[2].key != "password" {
-+		t.Fatalf("third task = %#v, want delete", persist.tasks[2])
-+	}
-+}
-+
-+func TestMemoryUpstreamTargetTraffic(t *testing.T) {
-+	persist := new(targetRecordingUpstream)
-+	u := &MemoryUpstream{mm: make(map[string]Traffic), tm: make(map[string]map[string]Traffic)}
-+	u.startPersistenceWorker(persist)
-+	defer u.Cleanup()
-+
-+	if err := u.ConsumeTarget("client1", "example.com:443", 100, 200); err != nil {
-+		t.Fatal(err)
-+	}
-+
-+	var found bool
-+	u.RangeTargets(func(key, target string, up, down int64) {
-+		if key == "client1" && target == "example.com:443" && up == 100 && down == 200 {
-+			found = true
-+		}
-+	})
-+	if !found {
-+		t.Fatal("RangeTargets did not return recorded target traffic")
-+	}
-+
-+	if err := u.Cleanup(); err != nil {
-+		t.Fatal(err)
-+	}
-+
-+	persist.mu.Lock()
-+	defer persist.mu.Unlock()
-+	if len(persist.targetTasks) != 1 || persist.targetTasks[0].key != "client1" || persist.targetTasks[0].up != 100 || persist.targetTasks[0].down != 200 {
-+		t.Fatalf("persisted target tasks = %#v", persist.targetTasks)
-+	}
-+}
-+
-+func TestMemoryUpstreamRejectsChangesAfterCleanup(t *testing.T) {
-+	persist := new(recordingUpstream)
-+	u := &MemoryUpstream{mm: make(map[string]Traffic)}
-+	u.startPersistenceWorker(persist)
-+	if err := u.Cleanup(); err != nil {
-+		t.Fatal(err)
-+	}
-+
-+	if err := u.Add("late"); !errors.Is(err, errMemoryUpstreamClosed) {
-+		t.Fatalf("Add error = %v, want errMemoryUpstreamClosed", err)
-+	}
-+	if err := u.Delete("late"); !errors.Is(err, errMemoryUpstreamClosed) {
-+		t.Fatalf("Delete error = %v, want errMemoryUpstreamClosed", err)
-+	}
-+	if err := u.Consume("late", 1, 2); !errors.Is(err, errMemoryUpstreamClosed) {
-+		t.Fatalf("Consume error = %v, want errMemoryUpstreamClosed", err)
-+	}
-+	if u.Validate("late") {
-+		t.Fatal("closed upstream accepted a late in-memory mutation")
-+	}
-+}
-+
-+func TestMemoryUpstreamCleanupWaitsForAsyncPersistence(t *testing.T) {
-+	persist := &blockingUpstream{
-+		consumeStarted: make(chan struct{}),
-+		releaseConsume: make(chan struct{}),
-+	}
-+	u := &MemoryUpstream{mm: make(map[string]Traffic)}
-+	u.startPersistenceWorker(persist)
-+
-+	if err := u.Consume("key", 1, 2); err != nil {
-+		t.Fatal(err)
-+	}
-+	<-persist.consumeStarted
-+	cleanupDone := make(chan error, 1)
-+	go func() { cleanupDone <- u.Cleanup() }()
-+
-+	select {
-+	case err := <-cleanupDone:
-+		t.Fatalf("Cleanup returned before persistence completed: %v", err)
-+	case <-time.After(20 * time.Millisecond):
-+	}
-+	close(persist.releaseConsume)
-+	if err := <-cleanupDone; err != nil {
-+		t.Fatal(err)
-+	}
-+}
-+
-+func TestMemoryUpstreamPersistenceFailureDoesNotMutateUsers(t *testing.T) {
-+	persistErr := errors.New("storage unavailable")
-+	persist := &recordingUpstream{addErr: persistErr, deleteErr: persistErr}
-+	u := &MemoryUpstream{mm: make(map[string]Traffic)}
-+	u.startPersistenceWorker(persist)
-+	defer u.Cleanup()
-+
-+	password := "password"
-+	keyBytes := [trojan.HeaderLen]byte{}
-+	trojan.GenKey(password, keyBytes[:])
-+	key := string(keyBytes[:])
-+	if err := u.Add(password); !errors.Is(err, persistErr) {
-+		t.Fatalf("Add error = %v, want persistence error", err)
-+	}
-+	if u.Validate(key) {
-+		t.Fatal("failed persistent add still mutated the memory upstream")
-+	}
-+
-+	u.AddKey(key)
-+	if err := u.Delete(password); !errors.Is(err, persistErr) {
-+		t.Fatalf("Delete error = %v, want persistence error", err)
-+	}
-+	if !u.Validate(key) {
-+		t.Fatal("failed persistent delete removed the in-memory user")
-+	}
-+}
-+
-+func TestMemoryUpstreamAddKeyPreservesTraffic(t *testing.T) {
-+	u := &MemoryUpstream{mm: map[string]Traffic{"key": {Up: 12, Down: 34}}}
-+	u.AddKey("key")
-+	var got Traffic
-+	u.Range(func(_ string, up, down int64) { got = Traffic{Up: up, Down: down} })
-+	if got != (Traffic{Up: 12, Down: 34}) {
-+		t.Fatalf("traffic = %#v, want existing counters preserved", got)
-+	}
-+}
-+
-+func TestTrojanStorageKeyValidation(t *testing.T) {
-+	valid := "e440ce027e5051c38cdf3e47a3d469734e2de6e50d21ed2f0f460ba4"
-+	if !isTrojanStorageKey(valid) {
-+		t.Fatal("valid Trojan storage key was rejected")
-+	}
-+	for _, invalid := range []string{"1213882035", valid[:55], valid[:55] + "z"} {
-+		if isTrojanStorageKey(invalid) {
-+			t.Fatalf("invalid Trojan storage key was accepted: %q", invalid)
-+		}
-+	}
-+}
-diff --git a/modules/admin/admin_test.go b/modules/admin/admin_test.go
-new file mode 100644
-index 0000000..12086fb
---- /dev/null
-+++ b/modules/admin/admin_test.go
-@@ -0,0 +1,72 @@
-+package admin
-+
-+import (
-+	"bytes"
-+	"errors"
-+	"net/http"
-+	"net/http/httptest"
-+	"testing"
-+
-+	"github.com/imgk/caddy-trojan/app"
-+)
-+
-+type errorUpstream struct {
-+	addErr    error
-+	deleteErr error
-+}
-+
-+func (u *errorUpstream) Add(string) error                 { return u.addErr }
-+func (u *errorUpstream) Delete(string) error              { return u.deleteErr }
-+func (*errorUpstream) Range(func(string, int64, int64))   {}
-+func (*errorUpstream) Validate(string) bool               { return false }
-+func (*errorUpstream) Consume(string, int64, int64) error { return nil }
-+
-+type targetTrafficUpstream struct {
-+	errorUpstream
-+	targets []app.TargetTraffic
-+}
-+
-+func (u *targetTrafficUpstream) ConsumeTarget(string, string, int64, int64) error { return nil }
-+func (u *targetTrafficUpstream) RangeTargets(fn func(string, string, int64, int64)) {
-+	for _, item := range u.targets {
-+		fn(item.Key, item.Target, item.Up, item.Down)
-+	}
-+}
-+
-+func TestAddUserReturnsPersistenceError(t *testing.T) {
-+	want := errors.New("add failed")
-+	handler := &Admin{upstream: &errorUpstream{addErr: want}}
-+	req := httptest.NewRequest(http.MethodPost, "/trojan/users/add", bytes.NewBufferString(`{"password":"secret"}`))
-+	err := handler.AddUser(httptest.NewRecorder(), req)
-+	if !errors.Is(err, want) {
-+		t.Fatalf("AddUser error = %v, want %v", err, want)
-+	}
-+}
-+
-+func TestDeleteUserReturnsPersistenceError(t *testing.T) {
-+	want := errors.New("delete failed")
-+	handler := &Admin{upstream: &errorUpstream{deleteErr: want}}
-+	req := httptest.NewRequest(http.MethodDelete, "/trojan/users/delete", bytes.NewBufferString(`{"password":"secret"}`))
-+	err := handler.DeleteUser(httptest.NewRecorder(), req)
-+	if !errors.Is(err, want) {
-+		t.Fatalf("DeleteUser error = %v, want %v", err, want)
-+	}
-+}
-+
-+func TestGetTrafficEndpoint(t *testing.T) {
-+	upstream := &targetTrafficUpstream{
-+		targets: []app.TargetTraffic{
-+			{Key: "key2", Target: "b.com:443", Traffic: app.Traffic{Up: 10, Down: 20}},
-+			{Key: "key1", Target: "a.com:443", Traffic: app.Traffic{Up: 30, Down: 40}},
-+		},
-+	}
-+	handler := &Admin{upstream: upstream}
-+	req := httptest.NewRequest(http.MethodGet, "/trojan/traffic", nil)
-+	rec := httptest.NewRecorder()
-+	if err := handler.GetTraffic(rec, req); err != nil {
-+		t.Fatal(err)
-+	}
-+	if rec.Code != http.StatusOK {
-+		t.Fatalf("status code = %d, want %d", rec.Code, http.StatusOK)
-+	}
-+}
