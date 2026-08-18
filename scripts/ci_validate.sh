@@ -303,6 +303,31 @@ done
   || fail "shared account-tools dependency should only be installed once"
 pass "install preflight covers required Debian/RHEL package mappings"
 
+# ---------- Caddy runtime storage ownership repair ----------
+info "Caddy runtime storage ownership repair"
+storage_test_root=$(mktemp -d)
+if ! bash -c '
+  set -euo pipefail
+  test_root=$1
+  CADDY_DIR="${test_root}/etc/caddy"
+  TROJAN_DIR="${CADDY_DIR}/trojan"
+  CADDY_DATA_DIR="${test_root}/var/lib/caddy"
+  CADDY_DATA_MARKER="${CADDY_DATA_DIR}/.easytrojan-managed"
+  ownership_log="${test_root}/chown.log"
+  mkdir -p "$TROJAN_DIR" "${CADDY_DATA_DIR}/trojan"
+  printf "root-owned-user-record\n" > "${CADDY_DATA_DIR}/trojan/user-hash"
+  chown() { printf "%s\n" "$*" >> "$ownership_log"; }
+  . lib/system.sh
+  ensure_cert_storage
+  grep -qxF -- "-R caddy:caddy ${CADDY_DATA_DIR}" "$ownership_log"
+  [ "$(tail -n 1 "$ownership_log")" = "root:caddy ${CADDY_DATA_MARKER}" ]
+' _ "$storage_test_root"; then
+  rm -rf "$storage_test_root"
+  fail "Caddy runtime storage ownership was not repaired recursively"
+fi
+rm -rf "$storage_test_root"
+pass "Caddy runtime storage is re-owned recursively before startup"
+
 # ---------- camouflage cleanup must be isolated from the caller ----------
 info "camouflage temporary-directory cleanup"
 camo_test_root=$(mktemp -d)
