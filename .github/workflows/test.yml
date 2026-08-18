@@ -61,7 +61,9 @@ jobs:
     needs: check
     if: needs.check.outputs.updated == 'true'
     permissions:
-      contents: read
+      # release.yml is validated as a whole, including its publish job, even
+      # when gate_only skips publication at runtime.
+      contents: write
       # release.yml declares an OIDC signing job even when gate_only skips it;
       # the caller must grant this permission for workflow validation to pass.
       id-token: write
