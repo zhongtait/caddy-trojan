@@ -14,6 +14,7 @@
 - 支持 Caddy ACME 自动证书和 Cloudflare Origin 证书
 - 默认部署 [IT-Tools](https://github.com/CorentinTh/it-tools) 伪装站，下载失败时回退到内置页面
 - 支持多用户、分享链接、Cloudflare 优选 IP 和非 443 HTTPS 端口
+- 按 Trojan 客户端和目标域名/IP 统计上下行流量，数据持久化到 Caddy storage
 - 可选多节点 Hub，输出 base64 格式的 `trojan://` 订阅
 - Release 资源先通过 Sigstore/cosign 身份校验，再通过 `SHA256SUMS` 校验
 - Caddy Admin API 仅监听 `127.0.0.1:2019`
@@ -168,6 +169,8 @@ Release 模块包，不会执行可变的 `main` 分支归档。从完整仓库�
 | `easytrojan status --show-link` | 查看状态并打印分享链接 |
 | `easytrojan doctor` | 只读检查 Caddy、TLS、Hub 和管理状态 |
 | `easytrojan doctor --network` | 只读检查 qdisc、TCP/softnet 计数器和 Caddy FD 使用率 |
+| `easytrojan traffic` | 查看客户端到目标网站/IP 的上下行流量 |
+| `easytrojan traffic --json` | 输出原始 JSON，便于接入监控 |
 | `easytrojan link` | 生成分享链接 |
 | `easytrojan update [--version VER]` | 更新脚本模块与 Caddy 二进制 |
 | `easytrojan renew [--force]` | 执行 ACME 维护；`--force` 会删除证书并重新申请 |
@@ -200,6 +203,31 @@ sudo easytrojan user del --password 'password-to-remove'
 `users` 配置。鉴权与流量计数使用 `memory caddy` 混合后端：连接热路径在内存中
 完成，变更与计数异步持久化到 Caddy storage。删除用户时，脚本会同时清理
 storage 中对应的键并 reload。
+
+### 流量统计与分流排查
+
+统计记录按客户端密钥和目标 `域名/IP:端口` 聚合，包含 `up`（客户端上传到目标）
+和 `down`（目标返回客户端）字节数。默认命令按总流量降序排列，并把本机 `passwd.txt` 中匹配的客户端显示为脱敏密码（可用于快速排查客户端是否误走了国内大流量网站、P2P 下载或未命中规则分流）。Admin API 只返回 SHA-224 客户端密钥，不返回明文密码。
+
+```bash
+# 表格查看（默认按总流量从大到小排序，并在底部汇总）
+sudo easytrojan traffic
+
+# 查看消耗流量最多的 Top 20 目标
+sudo easytrojan traffic --top 20
+
+# 按特定客户端或目标过滤
+sudo easytrojan traffic --password 'your_password'
+sudo easytrojan traffic --target example.com:443
+
+# 按不同维度排序（total|up|down|target|client）或导出 JSON
+sudo easytrojan traffic --sort down
+sudo easytrojan traffic --json > traffic.json
+```
+
+也可以从本机直接读取 `http://127.0.0.1:2019/trojan/traffic`。该接口只绑定本地
+Admin API，不应通过 Caddy 反代到公网。旧版二进制没有该接口时，先执行
+`sudo easytrojan update` 并重启 Caddy。
 
 ### TLS 管理
 
