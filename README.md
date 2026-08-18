@@ -206,26 +206,38 @@ storage 中对应的键并 reload。
 
 ### 流量统计与分流排查
 
-统计记录按客户端密钥和目标 `域名/IP:端口` 聚合，包含 `up`（客户端上传到目标）
-和 `down`（目标返回客户端）字节数。默认命令按总流量降序排列，并把本机 `passwd.txt` 中匹配的客户端显示为脱敏密码（可用于快速排查客户端是否误走了国内大流量网站、P2P 下载或未命中规则分流）。Admin API 只返回 SHA-224 客户端密钥，不返回明文密码。
+统计记录按客户端密钥、客户端来源 IP 与目标 `域名/IP:端口` 聚合，包含 `up`（客户端上传到目标）
+和 `down`（目标返回客户端）字节数。默认命令按用户/客户端分组展示，并在各组内按总流量降序排列，清晰区分各个设备（如手机 5G 来源 IP 与电脑 WiFi 来源 IP）所访问的网站，帮助快速排查分流配置异常或流量跑飞问题。
+
+> [!TIP]
+> 可以在 `/etc/caddy/trojan/passwd.txt` 中直接为不同用户添加设备备注（例如 `password123 # Clash-Mac`），`easytrojan traffic` 会自动解析并展示备注名称。
 
 ```bash
-# 表格查看（默认按总流量从大到小排序，并在底部汇总）
+# 查看流量统计（默认按用户/客户端分组，并在各组内降序展示各来源 IP 与目标）
 sudo easytrojan traffic
 
 # 查看消耗流量最多的 Top 20 目标
 sudo easytrojan traffic --top 20
 
-# 按特定客户端或目标过滤
+# 按特定客户端来源 IP 过滤
+sudo easytrojan traffic --ip 220.181.38.10
+
+# 按特定密码（客户端）或目标过滤
 sudo easytrojan traffic --password 'your_password'
 sudo easytrojan traffic --target example.com:443
 
-# 按不同维度排序（total|up|down|target|client）或导出 JSON
+# 显示完整明文密码（不进行 *** 脱敏）
+sudo easytrojan traffic --show-password
+
+# 平铺表格模式展示（不折叠区块）
+sudo easytrojan traffic --flat
+
+# 按不同维度排序（total|up|down|target|client|ip）或导出 JSON
 sudo easytrojan traffic --sort down
 sudo easytrojan traffic --json > traffic.json
 ```
 
-也可以从本机直接读取 `http://127.0.0.1:2019/trojan/traffic`。该接口只绑定本地
+也可以从本机直接读取 `http://127.0.0.1:2019/trojan/traffic`（支持 `?ip=`、`?target=`、`?key=` 过滤）。该接口只绑定本地
 Admin API，不应通过 Caddy 反代到公网。旧版二进制没有该接口时，先执行
 `sudo easytrojan update` 并重启 Caddy。
 

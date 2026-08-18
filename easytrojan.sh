@@ -11,7 +11,7 @@
 #   bash easytrojan.sh renew [--force]
 #   bash easytrojan.sh status [--show-link] [--server ADDR] [--port PORT] [--name NAME]
 #   bash easytrojan.sh doctor [--network]
-#   bash easytrojan.sh traffic [--key HASH] [--password PASS] [--target HOST:PORT] [--top N] [--sort total|up|down|target|client] [--json]
+#   bash easytrojan.sh traffic [--key HASH] [--password PASS] [--ip CLIENT_IP] [--target HOST:PORT] [--top N] [--sort total|up|down|target|client|ip] [--show-password] [--flat] [--json]
 #   bash easytrojan.sh link [--server ADDR] [--port PORT] [--password PASS] [--name NAME]
 #   bash easytrojan.sh cert {auto|origin|status} ...
 #   bash easytrojan.sh user {add|list|del} ...
