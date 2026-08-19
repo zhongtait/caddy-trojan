@@ -14,7 +14,7 @@
 #   bash easytrojan.sh traffic [--key HASH] [--password PASS] [--ip CLIENT_IP] [--target HOST:PORT] [--top N] [--sort total|up|down|target|client|ip] [--show-password] [--flat] [--json]
 #   bash easytrojan.sh link [--server ADDR] [--port PORT] [--password PASS] [--name NAME]
 #   bash easytrojan.sh cert {auto|origin|status} ...
-#   bash easytrojan.sh user {add|list|del} ...
+#   bash easytrojan.sh user {add|list|remark|del} ...
 #   bash easytrojan.sh hub enable|disable|status|url|token|list|remove|join|leave ...
 #   bash easytrojan.sh <password> <domain>   # legacy
 #
@@ -42,6 +42,7 @@ CADDY_DATA_DIR="${CADDY_XDG_DATA_HOME}/caddy"
 CADDY_DATA_MARKER="${CADDY_DATA_DIR}/.easytrojan-managed"
 TROJAN_DIR="${CADDY_DIR}/trojan"
 PASSWD_FILE="${TROJAN_DIR}/passwd.txt"
+REMARKS_DIR="${TROJAN_DIR}/remarks"
 CONFIG_LOCK_FILE="${TROJAN_DIR}/.config.lock"
 DOMAIN_FILE="${TROJAN_DIR}/domain.txt"
 OUTBOUND_IP_PRIORITY_FILE="${TROJAN_DIR}/outbound-ip-priority.txt"

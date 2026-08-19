@@ -195,6 +195,8 @@ sudo caddy validate --config /etc/caddy/Caddyfile
 
 ```bash
 sudo easytrojan user add
+sudo easytrojan user add --password 'device-password' --remark 'Clash-Mac'
+sudo easytrojan user remark --password 'device-password' --name 'Clash-Mac'
 sudo easytrojan user list
 sudo easytrojan user del --password 'password-to-remove'
 ```
@@ -210,14 +212,15 @@ storage 中对应的键并 reload。
 和 `down`（目标返回客户端）字节数。默认命令按用户/客户端分组展示，并在各组内按总流量降序排列，清晰区分各个设备（如手机 5G 来源 IP 与电脑 WiFi 来源 IP）所访问的网站，帮助快速排查分流配置异常或流量跑飞问题。
 
 > [!TIP]
-> 可以在 `/etc/caddy/trojan/passwd.txt` 中直接为不同用户添加设备备注（例如 `password123 # Clash-Mac`），`easytrojan traffic` 会自动解析并展示备注名称。
+> `passwd.txt` 只保存原始密码，备注独立保存在 `/etc/caddy/trojan/remarks/<sha224>`。不要再使用 `password # remark` 格式，因为 `#` 是合法密码字符。
 
 ```bash
 # 查看流量统计（默认按用户/客户端分组，并在各组内降序展示各来源 IP 与目标）
 sudo easytrojan traffic
 
-# 查看消耗流量最多的 Top 20 目标
+# 查看流量最多的 Top 20 客户端；使用 --flat 时 Top 20 是目标明细
 sudo easytrojan traffic --top 20
+sudo easytrojan traffic --flat --top 20
 
 # 按特定客户端来源 IP 过滤
 sudo easytrojan traffic --ip 220.181.38.10
@@ -235,11 +238,19 @@ sudo easytrojan traffic --flat
 # 按不同维度排序（total|up|down|target|client|ip）或导出 JSON
 sudo easytrojan traffic --sort down
 sudo easytrojan traffic --json > traffic.json
+
+# 清空全部统计，或只清空一个客户端的统计
+sudo easytrojan traffic reset --yes
+sudo easytrojan traffic reset --yes --key SHA224
 ```
 
 也可以从本机直接读取 `http://127.0.0.1:2019/trojan/traffic`（支持 `?ip=`、`?target=`、`?key=` 过滤）。该接口只绑定本地
 Admin API，不应通过 Caddy 反代到公网。旧版二进制没有该接口时，先执行
 `sudo easytrojan update` 并重启 Caddy。
+
+使用 Cloudflare 橙云时，Caddy 仅信任 Cloudflare 官方网段，并通过
+`CF-Connecting-IP` 生成来源 IP；直连时使用对端地址。来源 IP 是排障辅助信息，
+区分设备应为每台设备分配独立密码；相同密码经过同一 NAT 时无法可靠区分设备。
 
 ### TLS 管理
 
