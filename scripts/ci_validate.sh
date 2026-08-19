@@ -276,11 +276,14 @@ if ! bash -c '
   set -euo pipefail
   test_root=$1
   PASSWD_FILE="${test_root}/passwd.txt"
+  REMARKS_DIR="${test_root}/remarks"
   ADMIN_API="http://127.0.0.1:2019"
   require_root() { :; }
   error() { echo -e "[ERROR] $*" >&2; return 1; }
   check_cmd() { command -v "$1" >/dev/null 2>&1; }
-  printf "%s\n" "secret_password_123 # Clash-Mac" > "$PASSWD_FILE"
+  mkdir -p "$REMARKS_DIR"
+  printf "%s\n" "secret_password_123#device" > "$PASSWD_FILE"
+  printf "%s\n" "Clash-Mac" > "$REMARKS_DIR/74d2e688ae1f873f70155fd54846adc5bfb156ea429c44f44b5fb785"
   # Mock curl to write sample traffic json to -o target
   curl() {
     local out=""
@@ -293,7 +296,7 @@ if ! bash -c '
       fi
     done
     if [ -n "$out" ]; then
-      printf "%s\n" "[{\"key\":\"edad48b03cfefa312419559881d61447d16417d72e7b65682dd0bd08\",\"ip\":\"220.181.38.10\",\"target\":\"googlevideo.com:443\",\"up\":1048576,\"down\":10485760},{\"key\":\"edad48b03cfefa312419559881d61447d16417d72e7b65682dd0bd08\",\"ip\":\"117.136.28.14\",\"target\":\"example.com:443\",\"up\":1024,\"down\":2048}]" > "$out"
+      printf "%s\n" "[{\"key\":\"74d2e688ae1f873f70155fd54846adc5bfb156ea429c44f44b5fb785\",\"ip\":\"220.181.38.10\",\"target\":\"googlevideo.com:443\",\"up\":1048576,\"down\":10485760},{\"key\":\"74d2e688ae1f873f70155fd54846adc5bfb156ea429c44f44b5fb785\",\"ip\":\"117.136.28.14\",\"target\":\"example.com:443\",\"up\":1024,\"down\":2048}]" > "$out"
     fi
   }
   . lib/manage.sh
@@ -312,10 +315,12 @@ if ! bash -c '
   # verify --json
   json_out=$(do_traffic --json)
   echo "$json_out" | grep -qF "220.181.38.10"
-  # verify --top 1
+  # grouped --top limits clients; flat --top limits target rows
   top_out=$(do_traffic --top 1)
   echo "$top_out" | grep -qF "googlevideo.com"
-  ! echo "$top_out" | grep -qF "example.com:443"
+  flat_top_out=$(do_traffic --flat --top 1)
+  echo "$flat_top_out" | grep -qF "googlevideo.com"
+  ! echo "$flat_top_out" | grep -qF "example.com:443"
 ' _ "$traffic_test_root"; then
   rm -rf "$traffic_test_root"
   fail "traffic CLI formatting, sorting, or filtering failed"

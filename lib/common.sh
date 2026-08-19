@@ -14,11 +14,13 @@ Usage:
   bash easytrojan.sh status [--show-link] [--server ADDR] [--port PORT] [--name NAME]
   bash easytrojan.sh doctor [--network]
   bash easytrojan.sh traffic [--key HASH] [--password PASS] [--ip CLIENT_IP] [--target HOST:PORT] [--top N] [--sort total|up|down|target|client|ip] [--show-password] [--flat] [--json]
+  bash easytrojan.sh traffic reset --yes [--key HASH]
   bash easytrojan.sh link [--server ADDR] [--port PORT] [--password PASSWORD] [--name NAME]
   bash easytrojan.sh cert auto
   bash easytrojan.sh cert origin --cert PATH --key PATH
   bash easytrojan.sh cert status
-  bash easytrojan.sh user add [--password PASSWORD]
+  bash easytrojan.sh user add [--password PASSWORD] [--remark NAME]
+  bash easytrojan.sh user remark --password PASSWORD --name NAME
   bash easytrojan.sh user list
   bash easytrojan.sh user del --password PASSWORD
   bash easytrojan.sh hub enable [--name NAME]
@@ -160,6 +162,66 @@ validate_password_value() {
     if contains_control_chars "$value"; then
         error "Password must not contain control characters (including tabs or newlines)"
     fi
+}
+
+password_key() {
+    local passwd="$1" key=""
+    if check_cmd openssl; then
+        key=$(printf '%s' "$passwd" | openssl dgst -sha224 2>/dev/null | awk '{print $NF}' || true)
+    fi
+    if [ -z "$key" ] && check_cmd python3; then
+        key=$(python3 -c "import hashlib,sys; print(hashlib.sha224(sys.argv[1].encode()).hexdigest())" "$passwd" 2>/dev/null || true)
+    fi
+    [ -n "$key" ] || return 1
+    printf '%s' "$key"
+}
+
+remark_file_for_password() {
+    local key
+    key=$(password_key "$1") || return 1
+    printf '%s/%s' "${REMARKS_DIR}" "$key"
+}
+
+get_user_remark() {
+    local file
+    file=$(remark_file_for_password "$1") || return 0
+    [ -f "$file" ] || return 0
+    IFS= read -r line < "$file" || true
+    printf '%s' "${line:-}"
+}
+
+validate_remark_value() {
+    local value="$1"
+    [ "${#value}" -le 128 ] || error "Remark is too long (maximum: 128 characters)"
+    contains_control_chars "$value" && error "Remark must not contain control characters"
+}
+
+_set_user_remark() {
+    local passwd="$1" remark="$2" file tmp
+    validate_password_value "$passwd"
+    validate_remark_value "$remark"
+    mkdir -p "$REMARKS_DIR"
+    chmod 750 "$REMARKS_DIR"
+    file=$(remark_file_for_password "$passwd") || error "Cannot calculate password key"
+    if [ -z "$remark" ]; then
+        rm -f -- "$file"
+        return 0
+    fi
+    tmp=$(mktemp "${REMARKS_DIR}/.remark.XXXXXX")
+    printf '%s\n' "$remark" > "$tmp"
+    chmod 640 "$tmp"
+    mv -f -- "$tmp" "$file"
+    chown root:caddy "$file" 2>/dev/null || true
+}
+
+set_user_remark() {
+    with_config_lock _set_user_remark "$@"
+}
+
+delete_user_remark() {
+    local file
+    file=$(remark_file_for_password "$1") || return 0
+    rm -f -- "$file"
 }
 
 normalize_outbound_ip_priority() {

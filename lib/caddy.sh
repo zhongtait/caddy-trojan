@@ -181,13 +181,7 @@ build_users_directive() {
     local line q args=""
     if [ -f "$PASSWD_FILE" ]; then
         while IFS= read -r line || [ -n "$line" ]; do
-            line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
             [ -n "$line" ] || continue
-            case "$line" in
-                \#*) continue ;;
-            esac
-            line="${line%%#*}"
-            line=$(echo "$line" | sed 's/[[:space:]]*$//')
             [ -n "$line" ] || continue
             q=$(caddyfile_quote "$line")
             args="${args} ${q}"
@@ -284,6 +278,9 @@ _generate_caddyfile() {
     servers :${https_port} {
         # Browsers may use h2; Trojan WebSocket clients must offer http/1.1 only.
         protocols h2 h1
+        trusted_proxies static 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32
+        trusted_proxies_strict
+        client_ip_headers CF-Connecting-IP X-Forwarded-For
     }
     servers :${http_port} {
         protocols h1
@@ -466,7 +463,7 @@ _persist_password() {
     {
         [ -f "$PASSWD_FILE" ] && cat "$PASSWD_FILE"
         printf '%s\n' "$passwd"
-    } | awk 'NF && !seen[$0]++' > "$tmp"
+    } | awk 'length($0) > 0 && !seen[$0]++' > "$tmp"
     mv -f "$tmp" "$PASSWD_FILE"
     chmod 640 "$PASSWD_FILE"
     chown root:caddy "$PASSWD_FILE" 2>/dev/null || true

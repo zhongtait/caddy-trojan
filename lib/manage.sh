@@ -96,6 +96,30 @@ do_doctor() {
 
 do_traffic() (
     require_root
+    if [ "${1:-}" = "reset" ]; then
+        shift
+        local reset_yes=0 reset_key=""
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --yes) reset_yes=1; shift ;;
+                --key)
+                    [ -n "${2:-}" ] || error "--key requires a value"
+                    reset_key="$2"; shift 2 ;;
+                -h|--help)
+                    echo "Usage: easytrojan traffic reset --yes [--key SHA224]"
+                    exit 0 ;;
+                *) error "Unknown traffic reset argument: $1" ;;
+            esac
+        done
+        [ "$reset_yes" -eq 1 ] || error "Traffic reset is destructive; pass --yes"
+        local reset_url="${ADMIN_API}/trojan/traffic" reset_args=()
+        [ -z "$reset_key" ] || reset_args+=(--data-urlencode "key=${reset_key}")
+        curl -fsS --get -X DELETE --connect-timeout 2 --max-time 10 \
+            ${reset_args[@]+"${reset_args[@]}"} "$reset_url" >/dev/null \
+            || error "Traffic reset API unavailable. Update/restart Caddy, then retry"
+        ok "Traffic statistics reset${reset_key:+ for ${reset_key}}"
+        exit 0
+    fi
     local filter_key="" filter_password="" filter_ip="" filter_target="" json=0 limit=0 sort_by="total"
     local show_password=0 flat_mode=0
     while [ "$#" -gt 0 ]; do
@@ -145,6 +169,7 @@ do_traffic() (
 Usage: easytrojan traffic [--key HASH] [--password PASS] [--ip CLIENT_IP] [--target HOST:PORT]
                           [--top N] [--sort total|up|down|target|client|ip]
                           [--show-password] [--flat] [--json]
+       easytrojan traffic reset --yes [--key SHA224]
 
 Show persisted traffic grouped by User/Client, Source IP, and destination. The Admin API
 remains bound to localhost; this command must be run as root.
@@ -156,12 +181,7 @@ EOF
     done
 
     if [ -n "$filter_password" ] && [ -z "$filter_key" ]; then
-        if check_cmd openssl; then
-            filter_key=$(printf '%s' "$filter_password" | openssl dgst -sha224 2>/dev/null | awk '{print $NF}' || true)
-        fi
-        if [ -z "$filter_key" ] && check_cmd python3; then
-            filter_key=$(python3 -c "import hashlib, sys; print(hashlib.sha224(sys.argv[1].encode()).hexdigest())" "$filter_password" 2>/dev/null || true)
-        fi
+        filter_key=$(password_key "$filter_password" || true)
         [ -n "$filter_key" ] || error "Cannot calculate SHA-224 hash for password"
     fi
 
@@ -179,34 +199,35 @@ EOF
         cat "$tmp"
         return 0
     fi
-    python3 - "$tmp" "$PASSWD_FILE" "$sort_by" "$limit" "$show_password" "$flat_mode" <<'PY'
+    python3 - "$tmp" "$PASSWD_FILE" "$REMARKS_DIR" "$sort_by" "$limit" "$show_password" "$flat_mode" <<'PY'
 import hashlib
 import json
 import sys
 
 rows = json.load(open(sys.argv[1], encoding="utf-8"))
 passwd_file = sys.argv[2]
-sort_by = sys.argv[3] if len(sys.argv) > 3 else "total"
-limit = int(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4].isdigit() else 0
-show_password = (sys.argv[5] == "1") if len(sys.argv) > 5 else False
-flat_mode = (sys.argv[6] == "1") if len(sys.argv) > 6 else False
+remarks_dir = sys.argv[3]
+sort_by = sys.argv[4] if len(sys.argv) > 4 else "total"
+limit = int(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5].isdigit() else 0
+show_password = (sys.argv[6] == "1") if len(sys.argv) > 6 else False
+flat_mode = (sys.argv[7] == "1") if len(sys.argv) > 7 else False
 
 user_map = {}
 try:
     idx = 1
     for line in open(passwd_file, encoding="utf-8"):
-        raw = line.rstrip("\r\n").strip()
-        if not raw or raw.startswith("#"):
+        raw = line.rstrip("\r\n")
+        if not raw:
             continue
-        comment = ""
-        if "#" in raw:
-            pwd, comment = raw.split("#", 1)
-            pwd = pwd.strip()
-            comment = comment.strip()
-        else:
-            pwd = raw
+        pwd = raw
         if pwd:
             h = hashlib.sha224(pwd.encode()).hexdigest()
+            comment = ""
+            try:
+                with open(f"{remarks_dir}/{h}", encoding="utf-8") as remark_file:
+                    comment = remark_file.readline().rstrip("\r\n")
+            except OSError:
+                pass
             user_map[h] = (idx, pwd, comment)
             idx += 1
 except OSError:
@@ -294,7 +315,16 @@ if flat_mode:
     summary = f"TOTAL ({len(sorted_clients)} clients, {grand_targets} targets):"
     print(f"{summary:83} {size(grand_up):>11} {size(grand_down):>11} {size(grand_total):>11}")
 else:
-    for c in sorted_clients:
+    if sort_by == "client":
+        sorted_clients.sort(key=lambda c: c["name"].lower())
+    elif sort_by == "up":
+        sorted_clients.sort(key=lambda c: c["up"], reverse=True)
+    elif sort_by == "down":
+        sorted_clients.sort(key=lambda c: c["down"], reverse=True)
+    elif sort_by == "total":
+        sorted_clients.sort(key=lambda c: c["total"], reverse=True)
+    display_clients = sorted_clients[:limit] if limit > 0 else sorted_clients
+    for c in display_clients:
         if sort_by == "total":
             c["rows"].sort(key=lambda r: r["total_int"], reverse=True)
         elif sort_by == "up":
@@ -307,8 +337,6 @@ else:
             c["rows"].sort(key=lambda r: r["ip_str"])
         
         target_rows = c["rows"]
-        if limit > 0:
-            target_rows = target_rows[:limit]
         
         t_count = len(c["rows"])
         header_title = f"[{c['name']}]  Total: {size(c['total'])}  (Up: {size(c['up'])}, Down: {size(c['down'])}, {t_count} {'target' if t_count == 1 else 'targets'})"
@@ -983,12 +1011,12 @@ EOF
 do_user() {
     require_root
     local sub="${1:-}"
-    [ -n "$sub" ] || error "Usage: easytrojan user {add|list|del} ..."
+    [ -n "$sub" ] || error "Usage: easytrojan user {add|list|remark|del} ..."
     shift || true
 
     case "$sub" in
         add)
-            trojan_passwd=""
+            trojan_passwd="" remark=""
             while [ "$#" -gt 0 ]; do
                 case "$1" in
                     --password)
@@ -996,7 +1024,12 @@ do_user() {
                         trojan_passwd="$2"
                         shift 2
                         ;;
-                    -h|--help) echo "Usage: easytrojan user add [--password PASSWORD]"; exit 0 ;;
+                    --remark|--name)
+                        [ -n "${2:-}" ] || error "$1 requires a value"
+                        remark="$2"
+                        shift 2
+                        ;;
+                    -h|--help) echo "Usage: easytrojan user add [--password PASSWORD] [--remark NAME]"; exit 0 ;;
                     *) error "Unknown argument: $1" ;;
                 esac
             done
@@ -1005,6 +1038,7 @@ do_user() {
             domain=$(read_installed_domain 2>/dev/null || true)
             [ -n "$domain" ] || error "Domain not found. Re-run: easytrojan install --domain example.com"
             persist_password "$trojan_passwd"
+            [ -z "$remark" ] || set_user_remark "$trojan_passwd" "$remark"
             info "Regenerating Caddyfile with static users..."
             generate_caddyfile "$domain"
             if systemctl is-active --quiet caddy 2>/dev/null; then
@@ -1026,7 +1060,13 @@ do_user() {
                 while IFS= read -r line || [ -n "$line" ]; do
                     [ -n "$line" ] || continue
                     i=$((i + 1))
-                    echo -e "    ${i}. $(mask_secret "$line")"
+                    local user_remark
+                    user_remark=$(get_user_remark "$line")
+                    if [ -n "$user_remark" ]; then
+                        echo -e "    ${i}. $(mask_secret "$line")  (${user_remark})"
+                    else
+                        echo -e "    ${i}. $(mask_secret "$line")"
+                    fi
                 done < "$PASSWD_FILE"
             fi
             if [ "$i" -eq 0 ]; then
@@ -1073,6 +1113,7 @@ do_user() {
                 warn "Password not found in local passwd.txt; still clearing storage + Caddyfile"
             fi
             remove_password_from_file "$trojan_passwd"
+            delete_user_remark "$trojan_passwd"
             generate_caddyfile "$domain"
             # With `memory caddy`, delete the persisted key as well as the
             # in-memory entry or it can return after a process restart.
@@ -1092,10 +1133,34 @@ do_user() {
             fi
             ok "User deleted ($(mask_secret "$trojan_passwd"))"
             ;;
+        remark|rename)
+            trojan_passwd="" remark=""
+            while [ "$#" -gt 0 ]; do
+                case "$1" in
+                    --password)
+                        [ -n "${2:-}" ] || error "--password requires a value"
+                        trojan_passwd="$2"; shift 2 ;;
+                    --name|--remark)
+                        [ -n "${2:-}" ] || error "$1 requires a value"
+                        remark="$2"; shift 2 ;;
+                    -h|--help)
+                        echo "Usage: easytrojan user remark --password PASSWORD --name NAME"
+                        exit 0 ;;
+                    *) error "Unknown argument: $1" ;;
+                esac
+            done
+            [ -n "$trojan_passwd" ] || error "Password required: --password PASSWORD"
+            [ -n "$remark" ] || error "Name required: --name NAME"
+            [ -f "$PASSWD_FILE" ] && grep -Fxq -- "$trojan_passwd" "$PASSWD_FILE" \
+                || error "Password not found in local passwd.txt"
+            set_user_remark "$trojan_passwd" "$remark"
+            ok "User remark updated ($(mask_secret "$trojan_passwd"))"
+            ;;
         -h|--help|help)
             cat <<'EOF'
 Usage:
-  easytrojan user add [--password PASSWORD]
+  easytrojan user add [--password PASSWORD] [--remark NAME]
+  easytrojan user remark --password PASSWORD --name NAME
   easytrojan user list
   easytrojan user del --password PASSWORD
 

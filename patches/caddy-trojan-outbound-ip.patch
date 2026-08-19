@@ -234,7 +234,7 @@ index d1844bb..6d72b81 100644
  	NoProxy
  }
 diff --git a/app/upstream.go b/app/upstream.go
-index 732c54a..9fab732 100644
+index 732c54a..6de1c97 100644
 --- a/app/upstream.go
 +++ b/app/upstream.go
 @@ -2,8 +2,11 @@ package app
@@ -249,7 +249,7 @@ index 732c54a..9fab732 100644
  	"strings"
  	"sync"
  
-@@ -25,6 +28,33 @@ type Traffic struct {
+@@ -25,6 +28,37 @@ type Traffic struct {
  	Down int64 `json:"down"`
  }
  
@@ -263,6 +263,10 @@ index 732c54a..9fab732 100644
 +type TargetUpstream interface {
 +	ConsumeTarget(string, string, string, int64, int64) error
 +	RangeTargets(func(string, string, string, int64, int64))
++}
++
++type TrafficResetter interface {
++	ResetTraffic(string) error
 +}
 +
 +func targetKeyString(ip, target string) string {
@@ -283,11 +287,12 @@ index 732c54a..9fab732 100644
  type Upstream interface {
  	Add(string) error
  	Delete(string) error
-@@ -39,15 +69,23 @@ const (
+@@ -39,15 +73,24 @@ const (
  	TaskAdd TaskType = iota
  	TaskDelete
  	TaskConsume
 +	TaskConsumeTarget
++	TaskResetTraffic
  )
  
 +const memoryUpstreamQueueSize = 256
@@ -307,7 +312,7 @@ index 732c54a..9fab732 100644
  }
  
  type MemoryUpstream struct {
-@@ -56,8 +94,13 @@ type MemoryUpstream struct {
+@@ -56,8 +99,13 @@ type MemoryUpstream struct {
  	ch chan Task
  	up Upstream
  
@@ -323,7 +328,7 @@ index 732c54a..9fab732 100644
  }
  
  func (*MemoryUpstream) CaddyModule() caddy.ModuleInfo {
-@@ -69,9 +112,10 @@ func (*MemoryUpstream) CaddyModule() caddy.ModuleInfo {
+@@ -69,9 +117,10 @@ func (*MemoryUpstream) CaddyModule() caddy.ModuleInfo {
  
  func (u *MemoryUpstream) Provision(ctx caddy.Context) error {
  	u.mm = make(map[string]Traffic)
@@ -335,7 +340,7 @@ index 732c54a..9fab732 100644
  		return nil
  	}
  
-@@ -85,36 +129,88 @@ func (u *MemoryUpstream) Provision(ctx caddy.Context) error {
+@@ -85,36 +134,109 @@ func (u *MemoryUpstream) Provision(ctx caddy.Context) error {
  		u.AddKey(k)
  		u.Consume(k, nr, nw)
  	})
@@ -378,6 +383,10 @@ index 732c54a..9fab732 100644
 +			case TaskConsumeTarget:
 +				if targets, ok := up.(TargetUpstream); ok {
 +					err = targets.ConsumeTarget(t.Value.Key, t.Value.IP, t.Value.Target, t.Value.Up, t.Value.Down)
++				}
++			case TaskResetTraffic:
++				if resetter, ok := up.(TrafficResetter); ok {
++					err = resetter.ResetTraffic(t.Value.Key)
 +				}
  			default:
  			}
@@ -424,6 +433,23 @@ index 732c54a..9fab732 100644
 +	return nil
 +}
 +
++func (u *MemoryUpstream) persistAndApplyExclusive(task Task, apply func()) error {
++	u.persistMu.Lock()
++	defer u.persistMu.Unlock()
++	if u.closed {
++		return errMemoryUpstreamClosed
++	}
++	if u.up != nil {
++		task.Done = make(chan error, 1)
++		u.ch <- task
++		if err := <-task.Done; err != nil {
++			return err
++		}
++	}
++	apply()
++	return nil
++}
++
 +func (u *MemoryUpstream) applyAndQueue(task Task, apply func()) error {
 +	u.persistMu.RLock()
 +	defer u.persistMu.RUnlock()
@@ -438,7 +464,7 @@ index 732c54a..9fab732 100644
  	return nil
  }
  
-@@ -122,23 +218,17 @@ func (u *MemoryUpstream) Add(s string) error {
+@@ -122,23 +244,17 @@ func (u *MemoryUpstream) Add(s string) error {
  	b := [trojan.HeaderLen]byte{}
  	trojan.GenKey(s, b[:])
  
@@ -467,7 +493,7 @@ index 732c54a..9fab732 100644
  	}
  	u.mu.Unlock()
  }
-@@ -147,18 +237,62 @@ func (u *MemoryUpstream) Delete(s string) error {
+@@ -147,18 +263,62 @@ func (u *MemoryUpstream) Delete(s string) error {
  	b := [trojan.HeaderLen]byte{}
  	trojan.GenKey(s, b[:])
  	key := x.ByteSliceToString(b[:])
@@ -537,7 +563,7 @@ index 732c54a..9fab732 100644
  }
  
  func (u *MemoryUpstream) Range(fn func(string, int64, int64)) {
-@@ -177,23 +311,18 @@ func (u *MemoryUpstream) Validate(k string) bool {
+@@ -177,23 +337,38 @@ func (u *MemoryUpstream) Validate(k string) bool {
  }
  
  func (u *MemoryUpstream) Consume(k string, nr, nw int64) error {
@@ -566,10 +592,30 @@ index 732c54a..9fab732 100644
 +		u.mm[k] = traffic
 +		u.mu.Unlock()
 +	})
++}
++
++func (u *MemoryUpstream) ResetTraffic(key string) error {
++	t := Task{Type: TaskResetTraffic}
++	t.Value.Key = key
++	return u.persistAndApplyExclusive(t, func() {
++		u.mu.Lock()
++		if key == "" {
++			for k := range u.mm {
++				u.mm[k] = Traffic{}
++			}
++			u.tm = make(map[string]map[string]Traffic)
++		} else {
++			if _, ok := u.mm[key]; ok {
++				u.mm[key] = Traffic{}
++			}
++			delete(u.tm, key)
++		}
++		u.mu.Unlock()
++	})
  }
  
  type CaddyUpstream struct {
-@@ -202,6 +331,8 @@ type CaddyUpstream struct {
+@@ -202,6 +377,8 @@ type CaddyUpstream struct {
  	logger  *zap.Logger
  }
  
@@ -578,7 +624,7 @@ index 732c54a..9fab732 100644
  func (CaddyUpstream) CaddyModule() caddy.ModuleInfo {
  	return caddy.ModuleInfo{
  		ID:  "trojan.upstream.caddy",
-@@ -220,8 +351,17 @@ func (u *CaddyUpstream) Add(s string) error {
+@@ -220,8 +397,17 @@ func (u *CaddyUpstream) Add(s string) error {
  	b := [trojan.HeaderLen]byte{}
  	trojan.GenKey(s, b[:])
  	key := u.prefix + string(b[:])
@@ -598,7 +644,7 @@ index 732c54a..9fab732 100644
  	}
  	traffic := Traffic{
  		Up:   0,
-@@ -238,10 +378,53 @@ func (u *CaddyUpstream) Delete(s string) error {
+@@ -238,10 +424,53 @@ func (u *CaddyUpstream) Delete(s string) error {
  	b := [trojan.HeaderLen]byte{}
  	trojan.GenKey(s, b[:])
  	key := u.prefix + x.ByteSliceToString(b[:])
@@ -654,7 +700,7 @@ index 732c54a..9fab732 100644
  }
  
  func (u *CaddyUpstream) Range(fn func(k string, up, down int64)) {
-@@ -250,24 +433,41 @@ func (u *CaddyUpstream) Range(fn func(k string, up, down int64)) {
+@@ -250,24 +479,41 @@ func (u *CaddyUpstream) Range(fn func(k string, up, down int64)) {
  		return
  	}
  
@@ -676,17 +722,17 @@ index 732c54a..9fab732 100644
  		}
 -		fn(strings.TrimPrefix(k, u.prefix), traffic.Up, traffic.Down)
 +		fn(userKey, traffic.Up, traffic.Down)
-+	}
-+}
-+
+ 	}
+ }
+ 
 +func isTrojanStorageKey(key string) bool {
 +	if len(key) != trojan.HeaderLen {
 +		return false
- 	}
++	}
 +	_, err := hex.DecodeString(key)
 +	return err == nil
- }
- 
++}
++
  func (u *CaddyUpstream) Validate(k string) bool {
  	key := u.prefix + k
 -	return u.storage.Exists(context.Background(), key)
@@ -699,7 +745,7 @@ index 732c54a..9fab732 100644
  }
  
  func (u *CaddyUpstream) Consume(k string, nr, nw int64) error {
-@@ -297,9 +497,36 @@ func (u *CaddyUpstream) Consume(k string, nr, nw int64) error {
+@@ -297,9 +543,95 @@ func (u *CaddyUpstream) Consume(k string, nr, nw int64) error {
  	return u.storage.Store(context.Background(), key, b)
  }
  
@@ -728,16 +774,124 @@ index 732c54a..9fab732 100644
 +	return u.storage.Store(context.Background(), key, b)
 +}
 +
++func (u *CaddyUpstream) ResetTraffic(key string) error {
++	if key != "" {
++		if !isTrojanStorageKey(key) {
++			return errors.New("invalid Trojan traffic key")
++		}
++		if _, err := u.storage.Load(context.Background(), u.prefix+key); errors.Is(err, fs.ErrNotExist) {
++			return nil
++		} else if err != nil {
++			return err
++		}
++		storageKey := u.prefix + key
++		u.storage.Lock(context.Background(), storageKey)
++		err := u.storage.Store(context.Background(), storageKey, []byte(`{"up":0,"down":0}`))
++		u.storage.Unlock(context.Background(), storageKey)
++		if err != nil {
++			return err
++		}
++	}
++	prefix := u.prefix + targetPrefix
++	keys, err := u.storage.List(context.Background(), prefix, true)
++	if err != nil && !errors.Is(err, fs.ErrNotExist) {
++		return err
++	}
++	for _, targetKey := range keys {
++		rel := strings.TrimPrefix(targetKey, prefix)
++		parts := strings.SplitN(rel, "/", 2)
++		if len(parts) != 2 || (key != "" && parts[0] != key) {
++			continue
++		}
++		u.storage.Lock(context.Background(), targetKey)
++		err = u.storage.Delete(context.Background(), targetKey)
++		u.storage.Unlock(context.Background(), targetKey)
++		if err != nil && !errors.Is(err, fs.ErrNotExist) {
++			return err
++		}
++	}
++	if key == "" {
++		users, err := u.storage.List(context.Background(), u.prefix, false)
++		if err != nil && !errors.Is(err, fs.ErrNotExist) {
++			return err
++		}
++		for _, userKey := range users {
++			userKey = strings.TrimPrefix(userKey, u.prefix)
++			if isTrojanStorageKey(userKey) {
++				storageKey := u.prefix + userKey
++				u.storage.Lock(context.Background(), storageKey)
++				err := u.storage.Store(context.Background(), storageKey, []byte(`{"up":0,"down":0}`))
++				u.storage.Unlock(context.Background(), storageKey)
++				if err != nil {
++					return err
++				}
++			}
++		}
++	}
++	return nil
++}
++
  var (
  	_ Upstream           = (*CaddyUpstream)(nil)
  	_ Upstream           = (*MemoryUpstream)(nil)
 +	_ TargetUpstream     = (*MemoryUpstream)(nil)
 +	_ TargetUpstream     = (*CaddyUpstream)(nil)
++	_ TrafficResetter    = (*MemoryUpstream)(nil)
++	_ TrafficResetter    = (*CaddyUpstream)(nil)
  	_ caddy.CleanerUpper = (*MemoryUpstream)(nil)
  	_ caddy.Provisioner  = (*MemoryUpstream)(nil)
  )
+diff --git a/app/upstream_test.go b/app/upstream_test.go
+new file mode 100644
+index 0000000..3a8e473
+--- /dev/null
++++ b/app/upstream_test.go
+@@ -0,0 +1,43 @@
++package app
++
++import (
++	"testing"
++
++	"github.com/imgk/caddy-trojan/pkgs/trojan"
++	"github.com/imgk/caddy-trojan/pkgs/x"
++)
++
++func TestMemoryUpstreamResetTraffic(t *testing.T) {
++	u := &MemoryUpstream{
++		mm: make(map[string]Traffic),
++		tm: make(map[string]map[string]Traffic),
++	}
++	password := "client#with-space"
++	keyBytes := [trojan.HeaderLen]byte{}
++	trojan.GenKey(password, keyBytes[:])
++	key := x.ByteSliceToString(keyBytes[:])
++	u.AddKey(key)
++	if err := u.Consume(key, 10, 20); err != nil {
++		t.Fatal(err)
++	}
++	if err := u.ConsumeTarget(key, "203.0.113.10", "example.com:443", 10, 20); err != nil {
++		t.Fatal(err)
++	}
++	if err := u.ResetTraffic(key); err != nil {
++		t.Fatal(err)
++	}
++	var got Traffic
++	u.Range(func(k string, up, down int64) {
++		if k == key {
++			got = Traffic{Up: up, Down: down}
++		}
++	})
++	if got != (Traffic{}) {
++		t.Fatalf("user traffic was not reset: %+v", got)
++	}
++	count := 0
++	u.RangeTargets(func(k, ip, target string, up, down int64) { count++ })
++	if count != 0 {
++		t.Fatalf("target traffic was not reset: %d rows remain", count)
++	}
++}
 diff --git a/modules/admin/admin.go b/modules/admin/admin.go
-index 7a988a8..0406e28 100644
+index 7a988a8..8592e4d 100644
 --- a/modules/admin/admin.go
 +++ b/modules/admin/admin.go
 @@ -5,6 +5,7 @@ import (
@@ -748,20 +902,31 @@ index 7a988a8..0406e28 100644
  
  	"github.com/caddyserver/caddy/v2"
  
-@@ -58,9 +59,50 @@ func (al *Admin) Routes() []caddy.AdminRoute {
+@@ -58,9 +59,61 @@ func (al *Admin) Routes() []caddy.AdminRoute {
  			Pattern: "/trojan/users/delete",
  			Handler: caddy.AdminHandlerFunc(al.DeleteUser),
  		},
 +		{
 +			Pattern: "/trojan/traffic",
-+			Handler: caddy.AdminHandlerFunc(al.GetTraffic),
++			Handler: caddy.AdminHandlerFunc(al.Traffic),
 +		},
  	}
  }
  
-+func (al *Admin) GetTraffic(w http.ResponseWriter, r *http.Request) error {
++func (al *Admin) Traffic(w http.ResponseWriter, r *http.Request) error {
++	if r.Method == http.MethodDelete {
++		resetter, ok := al.upstream.(app.TrafficResetter)
++		if !ok {
++			return errors.New("trojan traffic reset is unavailable")
++		}
++		if err := resetter.ResetTraffic(r.URL.Query().Get("key")); err != nil {
++			return err
++		}
++		w.WriteHeader(http.StatusNoContent)
++		return nil
++	}
 +	if r.Method != http.MethodGet {
-+		return errors.New("get trojan traffic method error")
++		return errors.New("trojan traffic method error")
 +	}
 +	targets, ok := al.upstream.(app.TargetUpstream)
 +	if !ok {
@@ -799,7 +964,7 @@ index 7a988a8..0406e28 100644
  func (al *Admin) GetUsers(w http.ResponseWriter, r *http.Request) error {
  	if al.upstream == nil {
  		return nil
-@@ -108,7 +150,9 @@ func (al *Admin) AddUser(w http.ResponseWriter, r *http.Request) error {
+@@ -108,7 +161,9 @@ func (al *Admin) AddUser(w http.ResponseWriter, r *http.Request) error {
  		return err
  	}
  	if user.Password != "" {
@@ -810,7 +975,7 @@ index 7a988a8..0406e28 100644
  	}
  
  	w.WriteHeader(http.StatusOK)
-@@ -137,7 +181,9 @@ func (al *Admin) DeleteUser(w http.ResponseWriter, r *http.Request) error {
+@@ -137,7 +192,9 @@ func (al *Admin) DeleteUser(w http.ResponseWriter, r *http.Request) error {
  		return err
  	}
  	if user.Password != "" {
@@ -822,7 +987,7 @@ index 7a988a8..0406e28 100644
  
  	w.WriteHeader(http.StatusOK)
 diff --git a/modules/handler/handler.go b/modules/handler/handler.go
-index 3e7b7a1..dbbf744 100644
+index 3e7b7a1..e255deb 100644
 --- a/modules/handler/handler.go
 +++ b/modules/handler/handler.go
 @@ -5,6 +5,7 @@ import (
@@ -847,7 +1012,7 @@ index 3e7b7a1..dbbf744 100644
  		return nil
  	}
  
-@@ -125,17 +127,43 @@ func (m *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
+@@ -125,17 +127,46 @@ func (m *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
  			m.logger.Info(fmt.Sprintf("handle trojan websocket.Conn from %v", r.RemoteAddr))
  		}
  
@@ -867,6 +1032,9 @@ index 3e7b7a1..dbbf744 100644
 +func clientIPFromRequest(r *http.Request) string {
 +	if r == nil {
 +		return ""
++	}
++	if value, ok := caddyhttp.GetVar(r.Context(), caddyhttp.ClientIPVarKey).(string); ok && value != "" {
++		return value
 +	}
 +	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
 +		return host
@@ -892,6 +1060,45 @@ index 3e7b7a1..dbbf744 100644
  // UnmarshalCaddyfile unmarshals Caddyfile tokens into h.
  func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
  	if !d.Next() {
+diff --git a/modules/handler/handler_test.go b/modules/handler/handler_test.go
+new file mode 100644
+index 0000000..f5feb04
+--- /dev/null
++++ b/modules/handler/handler_test.go
+@@ -0,0 +1,33 @@
++package handler
++
++import (
++	"context"
++	"net/http"
++	"testing"
++
++	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
++)
++
++func TestClientIPFromRequestUsesValidatedClientIP(t *testing.T) {
++	requestContext := context.WithValue(context.Background(), caddyhttp.VarsCtxKey, map[string]any{})
++	r, err := http.NewRequestWithContext(requestContext, http.MethodGet, "http://example.com", nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	r.RemoteAddr = "173.245.48.1:443"
++	caddyhttp.SetVar(r.Context(), caddyhttp.ClientIPVarKey, "198.51.100.20")
++	if got := clientIPFromRequest(r); got != "198.51.100.20" {
++		t.Fatalf("client IP = %q, want validated client IP", got)
++	}
++}
++
++func TestClientIPFromRequestFallsBackToPeer(t *testing.T) {
++	r, err := http.NewRequest(http.MethodGet, "http://example.com", nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	r.RemoteAddr = "192.0.2.10:443"
++	if got := clientIPFromRequest(r); got != "192.0.2.10" {
++		t.Fatalf("client IP = %q, want peer IP", got)
++	}
++}
 diff --git a/modules/listener/listener.go b/modules/listener/listener.go
 index 171b58b..ee399fc 100644
 --- a/modules/listener/listener.go
