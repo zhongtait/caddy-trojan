@@ -70,8 +70,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.source_ref || github.sha }}
           persist-credentials: false
+          fetch-depth: 0
+
+      - name: Checkout requested source ref
+        if: inputs.source_ref != ''
+        env:
+          REQUESTED_SOURCE: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          resolved_source=$(git rev-parse --verify --end-of-options "$REQUESTED_SOURCE^{commit}")
+          git checkout --detach "$resolved_source"
 
       - name: Download caller Caddy artifact
         if: inputs.caddy_artifact != ''

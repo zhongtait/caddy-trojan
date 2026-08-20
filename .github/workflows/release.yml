@@ -39,7 +39,49 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  resolve:
+    name: Resolve and validate release parameters
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
+      upstream_sha: ${{ steps.resolve.outputs.upstream_sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve canonical commits
+        id: resolve
+        env:
+          REQUESTED_SOURCE: ${{ inputs.source_ref || github.sha }}
+          REQUESTED_UPSTREAM: ${{ inputs.upstream_sha || '' }}
+          GATE_ONLY: ${{ inputs.gate_only || false }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          if ! SOURCE_SHA=$(git rev-parse --verify --end-of-options "${REQUESTED_SOURCE}^{commit}" 2>/dev/null); then
+            echo "::error::Cannot resolve source_ref '${REQUESTED_SOURCE}' to a valid commit" >&2
+            exit 1
+          fi
+          if [ "$GATE_ONLY" != "true" ]; then
+            git merge-base --is-ancestor "$SOURCE_SHA" origin/main || {
+              echo "::error::Refusing to release a commit that is not on main: ${SOURCE_SHA}" >&2
+              exit 1
+            }
+          fi
+          UPSTREAM_SHA="${REQUESTED_UPSTREAM:-$(tr -d '[:space:]' < sha)}"
+          if ! printf '%s' "$UPSTREAM_SHA" | grep -Eq '^[0-9a-fA-F]{40}$'; then
+            echo "::error::Invalid upstream SHA: ${UPSTREAM_SHA:-<empty>}" >&2
+            exit 1
+          fi
+          echo "source_sha=${SOURCE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
+
   build-caddy-trojan:
+    needs: resolve
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -57,7 +99,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.source_ref || github.sha }}
+          ref: ${{ needs.resolve.outputs.source_sha }}
           persist-credentials: false
 
       - name: Setup Go
@@ -74,7 +116,7 @@ jobs:
           GOOS: ${{ matrix.os }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: '0'
-          UPSTREAM_SHA: ${{ inputs.upstream_sha || '' }}
+          UPSTREAM_SHA: ${{ needs.resolve.outputs.upstream_sha }}
         run: |
           set -euo pipefail
           mkdir -p output
@@ -102,17 +144,18 @@ jobs:
 
   validate:
     name: Release validation gate
+    needs: resolve
     uses: ./.github/workflows/ci.yml
     with:
-      source_ref: ${{ inputs.source_ref || github.sha }}
+      source_ref: ${{ needs.resolve.outputs.source_sha }}
 
   integration:
     name: Real Linux integration gate
-    needs: build-caddy-trojan
+    needs: [resolve, build-caddy-trojan]
     uses: ./.github/workflows/integration.yml
     with:
-      source_ref: ${{ inputs.source_ref || github.sha }}
-      upstream_sha: ${{ inputs.upstream_sha || '' }}
+      source_ref: ${{ needs.resolve.outputs.source_sha }}
+      upstream_sha: ${{ needs.resolve.outputs.upstream_sha }}
       caddy_artifact: caddy_trojan_linux_amd64
 
   version:
@@ -155,7 +198,7 @@ jobs:
 
   metadata:
     name: Prepare immutable release assets
-    needs: [build-caddy-trojan, version]
+    needs: [resolve, build-caddy-trojan, version]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -167,7 +210,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.source_ref || github.sha }}
+          ref: ${{ needs.resolve.outputs.source_sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -180,8 +223,8 @@ jobs:
       - name: Validate artifacts and prepare release metadata
         id: meta
         env:
-          REQUESTED_SOURCE: ${{ inputs.source_ref || github.sha }}
-          UPSTREAM_SHA: ${{ inputs.upstream_sha || '' }}
+          REQUESTED_SOURCE: ${{ needs.resolve.outputs.source_sha }}
+          UPSTREAM_SHA: ${{ needs.resolve.outputs.upstream_sha }}
           GATE_ONLY: ${{ inputs.gate_only || false }}
           CADDY_VERSION: ${{ needs.version.outputs.version }}
         run: |
@@ -196,10 +239,12 @@ jobs:
             exit 1
           fi
           git fetch --no-tags origin main
-          git merge-base --is-ancestor "$SOURCE_SHA" origin/main || {
-            echo "Refusing to release a commit that is not on main: ${SOURCE_SHA}" >&2
-            exit 1
-          }
+          if [ "$GATE_ONLY" != "true" ]; then
+            git merge-base --is-ancestor "$SOURCE_SHA" origin/main || {
+              echo "Refusing to release a commit that is not on main: ${SOURCE_SHA}" >&2
+              exit 1
+            }
+          fi
 
           UPSTREAM_SHA="${UPSTREAM_SHA:-$(tr -d '[:space:]' < sha)}"
           if ! printf '%s' "$UPSTREAM_SHA" | grep -Eq '^[0-9a-fA-F]{40}$'; then
