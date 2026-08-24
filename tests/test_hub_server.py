@@ -28,6 +28,8 @@ class HubStateTests(unittest.TestCase):
         hub._nodes_cache = None
         hub._sub_cache_key = None
         hub._sub_cache_body = None
+        hub._rate_limit_buckets.clear()
+        hub._last_prune_time = 0.0
 
     def tearDown(self):
         hub.HUB_DIR, hub.CFG_FILE, hub.NODES_FILE = self.original_paths
@@ -35,6 +37,8 @@ class HubStateTests(unittest.TestCase):
         hub._nodes_cache = None
         hub._sub_cache_key = None
         hub._sub_cache_body = None
+        hub._rate_limit_buckets.clear()
+        hub._last_prune_time = 0.0
         self.tempdir.cleanup()
 
     def test_upsert_creates_valid_persistent_node(self):
@@ -555,6 +559,8 @@ class HubHTTPTests(unittest.TestCase):
         hub._nodes_cache = None
         hub._sub_cache_key = None
         hub._sub_cache_body = None
+        hub._rate_limit_buckets.clear()
+        hub._last_prune_time = 0.0
         self.cfg = hub.ensure_config()
         self.server = hub.LimitedThreadingHTTPServer(("127.0.0.1", 0), hub.Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)

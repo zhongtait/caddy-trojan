@@ -1235,6 +1235,32 @@ index 69d4de2..42fcb20 100644
 +	var targetsMu sync.Mutex
 +	targets := make(map[string]TargetTraffic)
 +	resolvedTargets := make(map[string]string)
++	const maxTargets = 256 // per-session UDP target cap; prevents unbounded map growth
++	addTarget := func(m map[string]string, key, val string) bool {
++		if _, ok := m[key]; ok {
++			return true
++		}
++		if len(m) >= maxTargets {
++			return false
++		}
++		m[key] = val
++		return true
++	}
++	targetAllowed := func(target string) bool {
++		if target == "" {
++			return false
++		}
++		targetsMu.Lock()
++		defer targetsMu.Unlock()
++		if _, ok := targets[target]; ok {
++			return true
++		}
++		if len(targets) >= maxTargets {
++			return false
++		}
++		targets[target] = TargetTraffic{Target: target}
++		return true
++	}
 +	addTraffic := func(target string, up, down int64) {
 +		if target == "" {
 +			return
@@ -1255,7 +1281,7 @@ index 69d4de2..42fcb20 100644
  				bb = raddr.AppendTo(bb[:0])
  				tt = addr
 +				targetsMu.Lock()
-+				resolvedTargets[addr.String()] = raddr.String()
++				_ = addTarget(resolvedTargets, addr.String(), raddr.String())
 +				targetsMu.Unlock()
  			}
  
@@ -1264,7 +1290,9 @@ index 69d4de2..42fcb20 100644
  
  			l += (int(b[l])<<8 | int(b[l+1]))
  			nr += int64(l) + 4
-+			addTraffic(raddr.String(), int64(l)+4, 0)
++			if targetAllowed(raddr.String()) {
++				addTraffic(raddr.String(), int64(l)+4, 0)
++			}
  
  			buf := b[raddr.Len():l]
  			if _, er := io.ReadFull(r, buf); er != nil {
@@ -1278,7 +1306,9 @@ index 69d4de2..42fcb20 100644
 +				target = original
 +			}
 +			targetsMu.Unlock()
-+			addTraffic(target, 0, 4+int64(n)+l)
++			if targetAllowed(target) {
++				addTraffic(target, 0, 4+int64(n)+l)
++			}
  
  			if _, ew := w.Write(b[socks.MaxAddrLen-l : socks.MaxAddrLen+4+n]); ew != nil {
  				err = ew

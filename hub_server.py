@@ -61,6 +61,43 @@ MAX_BODY_BYTES = 64 * 1024
 MAX_SYNC_COMPRESSED_BYTES = 8 * 1024 * 1024
 MAX_SYNC_BODY_BYTES = 16 * 1024 * 1024
 SYNC_REQUEST_SLOTS = threading.BoundedSemaphore(4)
+
+# Per-client token-bucket rate limiting (burst 30, refill 5 req/s).
+RATE_LIMIT_CAPACITY = 30
+RATE_LIMIT_REFILL_PER_SEC = 5.0
+_RATE_LIMIT_LOCK = threading.Lock()
+_rate_limit_buckets: dict[str, tuple[float, float]] = {}  # ip -> (tokens, last_refill)
+_RATE_LIMIT_PRUNE_INTERVAL = 300.0
+_last_prune_time = 0.0
+
+
+def _client_ip(handler: BaseHTTPRequestHandler) -> str:
+    addr = getattr(handler, "client_address", None)
+    if isinstance(addr, tuple) and len(addr) >= 1:
+        return str(addr[0])
+    return 'unknown'
+
+
+def _rate_limit_check(client_ip: str) -> bool:
+    """Token-bucket limiter; returns False when the client is over quota."""
+    global _last_prune_time
+    now = time.monotonic()
+    with _RATE_LIMIT_LOCK:
+        if now - _last_prune_time > _RATE_LIMIT_PRUNE_INTERVAL:
+            stale = [ip for ip, (_, ts) in _rate_limit_buckets.items() if now - ts > _RATE_LIMIT_PRUNE_INTERVAL]
+            for ip in stale:
+                del _rate_limit_buckets[ip]
+            _last_prune_time = now
+        tokens, last = _rate_limit_buckets.get(client_ip, (float(RATE_LIMIT_CAPACITY), now))
+        elapsed = now - last
+        tokens = min(float(RATE_LIMIT_CAPACITY), tokens + elapsed * RATE_LIMIT_REFILL_PER_SEC)
+        if tokens < 1.0:
+            _rate_limit_buckets[client_ip] = (tokens, now)
+            return False
+        tokens -= 1.0
+        _rate_limit_buckets[client_ip] = (tokens, now)
+        return True
+
 MAX_NODES = 10_000
 MAX_NAME_LENGTH = 128
 MAX_PASSWORD_LENGTH = 512
@@ -109,19 +146,22 @@ def _save_json(path: Path, data: Any) -> None:
         if path.is_file():
             try:
                 backup = path.with_suffix(path.suffix + ".bak")
+                # Best-effort backup: no fsync needed since the atomic replace below
                 with path.open("rb") as src, backup.open("wb") as dst:
                     dst.write(src.read())
-                    dst.flush()
-                    os.fsync(dst.fileno())
                 os.chmod(backup, 0o600)
             except OSError:
                 pass
         os.replace(tmp, path)
-        dir_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+        # Directory fsync only works on POSIX; Windows cannot open a directory
+        # as a file descriptor. The file-level fsync above already covers the
+        # common crash window on non-POSIX systems.
+        if os.name == "posix":
+            dir_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
     except OSError as exc:
         # Turn disk/permission failures into a clean 503 instead of an uncaught
         # exception that drops the connection with no HTTP response.
@@ -696,6 +736,10 @@ class Handler(BaseHTTPRequestHandler):
             self._fail_state(exc)
             return
 
+        if not _rate_limit_check(_client_ip(self)):
+            self._json(429, {"error": "rate limited"})
+            return
+
         if path in ("/", "/health"):
             try:
                 node_count = len(load_nodes())
@@ -799,6 +843,9 @@ class Handler(BaseHTTPRequestHandler):
         if path not in routes:
             self._json(404, {"error": "not found"})
             return
+        if not _rate_limit_check(_client_ip(self)):
+            self._json(429, {"error": "rate limited"})
+            return
         if not self._require_register_auth():
             return
         if path == "/api/sync":
@@ -889,6 +936,9 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
+        if not _rate_limit_check(_client_ip(self)):
+            self._json(429, {"error": "rate limited"})
+            return
         if path.startswith("/api/nodes/"):
             if not self._require_register_auth():
                 return
