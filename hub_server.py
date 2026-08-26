@@ -62,9 +62,9 @@ MAX_SYNC_COMPRESSED_BYTES = 8 * 1024 * 1024
 MAX_SYNC_BODY_BYTES = 16 * 1024 * 1024
 SYNC_REQUEST_SLOTS = threading.BoundedSemaphore(4)
 
-# Per-client token-bucket rate limiting (burst 30, refill 5 req/s).
-RATE_LIMIT_CAPACITY = 30
-RATE_LIMIT_REFILL_PER_SEC = 5.0
+# Per-client token-bucket rate limiting (burst 60, refill 10 req/s).
+RATE_LIMIT_CAPACITY = 60
+RATE_LIMIT_REFILL_PER_SEC = 10.0
 _RATE_LIMIT_LOCK = threading.Lock()
 _rate_limit_buckets: dict[str, tuple[float, float]] = {}  # ip -> (tokens, last_refill)
 _RATE_LIMIT_PRUNE_INTERVAL = 300.0

@@ -8,6 +8,7 @@ import runpy
 import socket
 import tempfile
 import threading
+import time
 import unittest
 from email.message import Message
 from pathlib import Path
@@ -178,6 +179,8 @@ class HubStateTests(unittest.TestCase):
 
         with mock.patch.object(Path, "stat", side_effect=OSError):
             self.assertIsNone(hub._nodes_stat_key())
+        with mock.patch.object(hub.os, "name", "nt"):
+            hub.save_nodes([])
 
     def test_subscription_cache_and_link_variants(self):
         hub.ensure_config()
@@ -546,6 +549,27 @@ class HubHandlerTests(unittest.TestCase):
             self.assertIsNone(handler._read_json_object())
             self.assertEqual(400, handler.responses[0][0])
 
+    def test_rate_limiting_and_pruning(self):
+        hub._rate_limit_buckets.clear()
+        hub._last_prune_time = 0.0
+        # Check prune path with stale entry
+        hub._rate_limit_buckets["198.51.100.1"] = (10.0, time.monotonic() - 400.0)
+        self.assertTrue(hub._rate_limit_check("198.51.100.2"))
+        self.assertNotIn("198.51.100.1", hub._rate_limit_buckets)
+
+        # Deplete bucket for a test IP
+        test_ip = "198.51.100.3"
+        hub._rate_limit_buckets[test_ip] = (0.5, time.monotonic())
+        self.assertFalse(hub._rate_limit_check(test_ip))
+
+        # Check _client_ip helper fallback
+        class DummyHandler:
+            client_address = None
+        self.assertEqual("unknown", hub._client_ip(DummyHandler()))
+        class DummyEmptyHandler:
+            client_address = ()
+        self.assertEqual("unknown", hub._client_ip(DummyEmptyHandler()))
+
 
 class HubHTTPTests(unittest.TestCase):
     def setUp(self):
@@ -872,6 +896,22 @@ class HubHTTPTests(unittest.TestCase):
 
         # A plain subscription takes the cacheable no-override branch.
         self.assertEqual(200, self.request("GET", f"/sub/{self.cfg['sub_token']}")[0])
+
+    def test_rate_limiting_http_rejection(self):
+        with mock.patch.object(hub, "_rate_limit_check", return_value=False):
+            status, data, _ = self.request("GET", "/health")
+            self.assertEqual(429, status)
+            self.assertEqual("rate limited", data.get("error"))
+
+            status, data, _ = self.request(
+                "POST", "/api/register", {"domain": "example.com", "password": "pw"}, authenticated=True
+            )
+            self.assertEqual(429, status)
+            self.assertEqual("rate limited", data.get("error"))
+
+            status, data, _ = self.request("DELETE", "/api/nodes/some-id", authenticated=True)
+            self.assertEqual(429, status)
+            self.assertEqual("rate limited", data.get("error"))
 
 
 class HubInfrastructureTests(unittest.TestCase):

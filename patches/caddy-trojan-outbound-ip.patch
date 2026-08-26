@@ -1206,7 +1206,7 @@ index ce4770a..4303419 100644
 +	return nil, 0, 0, errors.New("command error")
  }
 diff --git a/pkgs/trojan/trojan_udp.go b/pkgs/trojan/trojan_udp.go
-index 69d4de2..42fcb20 100644
+index 69d4de2..8888957 100644
 --- a/pkgs/trojan/trojan_udp.go
 +++ b/pkgs/trojan/trojan_udp.go
 @@ -6,6 +6,7 @@ import (
@@ -1217,7 +1217,7 @@ index 69d4de2..42fcb20 100644
  	"time"
  
  	"github.com/imgk/caddy-trojan/pkgs/socks"
-@@ -15,11 +16,31 @@ import (
+@@ -15,11 +16,57 @@ import (
  
  // [AddrType(1 byte)][Addr(max 256 byte)][Port(2 byte)][Len(2 byte)][0x0d, 0x0a][Data(max 65535 byte)]
  func HandleUDP(r io.Reader, w io.Writer, timeout time.Duration, d Dialer) (int64, int64, error) {
@@ -1276,7 +1276,7 @@ index 69d4de2..42fcb20 100644
  
  	type Result struct {
  		Num int64
-@@ -67,6 +88,9 @@ func HandleUDP(r io.Reader, w io.Writer, timeout time.Duration, d Dialer) (int64
+@@ -67,6 +114,9 @@ func HandleUDP(r io.Reader, w io.Writer, timeout time.Duration, d Dialer) (int64
  				}
  				bb = raddr.AppendTo(bb[:0])
  				tt = addr
@@ -1286,7 +1286,7 @@ index 69d4de2..42fcb20 100644
  			}
  
  			if _, er := io.ReadFull(r, b[l:l+4]); er != nil {
-@@ -76,6 +100,7 @@ func HandleUDP(r io.Reader, w io.Writer, timeout time.Duration, d Dialer) (int64
+@@ -76,6 +126,9 @@ func HandleUDP(r io.Reader, w io.Writer, timeout time.Duration, d Dialer) (int64
  
  			l += (int(b[l])<<8 | int(b[l+1]))
  			nr += int64(l) + 4
@@ -1296,7 +1296,7 @@ index 69d4de2..42fcb20 100644
  
  			buf := b[raddr.Len():l]
  			if _, er := io.ReadFull(r, buf); er != nil {
-@@ -128,6 +153,13 @@ func HandleUDP(r io.Reader, w io.Writer, timeout time.Duration, d Dialer) (int64
+@@ -128,6 +181,15 @@ func HandleUDP(r io.Reader, w io.Writer, timeout time.Duration, d Dialer) (int64
  				}
  			}(b[:socks.MaxAddrLen], addr.(*net.UDPAddr))
  			nw += 4 + int64(n) + l
@@ -1312,7 +1312,7 @@ index 69d4de2..42fcb20 100644
  
  			if _, ew := w.Write(b[socks.MaxAddrLen-l : socks.MaxAddrLen+4+n]); ew != nil {
  				err = ew
-@@ -144,5 +176,11 @@ func HandleUDP(r io.Reader, w io.Writer, timeout time.Duration, d Dialer) (int64
+@@ -144,5 +206,11 @@ func HandleUDP(r io.Reader, w io.Writer, timeout time.Duration, d Dialer) (int64
  		return r.Num, nw, err
  	}(rc, w, errCh, timeout)
  
