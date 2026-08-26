@@ -182,7 +182,6 @@ build_users_directive() {
     if [ -f "$PASSWD_FILE" ]; then
         while IFS= read -r line || [ -n "$line" ]; do
             [ -n "$line" ] || continue
-            [ -n "$line" ] || continue
             q=$(caddyfile_quote "$line")
             args="${args} ${q}"
         done < "$PASSWD_FILE"

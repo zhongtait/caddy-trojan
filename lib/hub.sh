@@ -1023,19 +1023,16 @@ EOF
     fi
     hub_url="${hub_url%/}"
 
-    local i=0 reg_name payload resp
+    local count=0
     while IFS= read -r passwd || [ -n "$passwd" ]; do
-        [ -n "$passwd" ] || continue
-        i=$((i + 1))
-        reg_name=$(hub_indexed_name "$name" "$i")
-        payload=$(hub_register_payload "$reg_name" "$domain" "$passwd" "$server" "$port" "$transport")
-        resp=$(http_send_json POST "${hub_url}/api/register" "$token" "$payload" -sS 2>&1) \
-            || error "Register failed: ${resp}"
-        echo "$resp" | grep -q '"ok"' || error "Register rejected: ${resp}"
-        count=$((count + 1))
-        ok "Registered ${reg_name} -> ${hub_url}"
+        [ -n "$passwd" ] && count=$((count + 1))
     done < "$PASSWD_FILE"
     [ "$count" -gt 0 ] || error "No passwords to register"
+    if hub_sync_domain "$hub_url" "$token" "$name" "$domain" "$server" "$port" "$transport"; then
+        ok "Synced ${count} passwords -> ${hub_url}"
+    else
+        error "Hub sync failed (check URL/token and hub reachability)"
+    fi
     hub_save_client_membership "$hub_url" "$token" "$name" "$server" "$port"
     ok "Saved remote hub membership -> $(hub_client_file)"
     echo -e "  Tip: on hub host run ${CYAN}easytrojan hub list${NC} / client subscribe ${CYAN}$(printf '%s' "$hub_url" | sed 's|/*$//')/sub/<sub_token>${NC}"

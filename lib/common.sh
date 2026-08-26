@@ -316,6 +316,10 @@ validate_port() {
 }
 
 urlencode() {
+    # Prefer python3 for O(n) performance; fall back to the pure-bash loop.
+    if check_cmd python3; then
+        python3 -c 'import sys,urllib.parse; sys.stdout.write(urllib.parse.quote(sys.argv[1], safe=""))' "$1" 2>/dev/null && return 0
+    fi
     local s="$1" out="" i c hex
     local LC_ALL=C
     for (( i = 0; i < ${#s}; i++ )); do
@@ -501,14 +505,34 @@ parse_common_args() {
 }
 
 detect_public_ip() {
-    local ip service
-    for service in "https://ipv4.ip.sb" "https://api.ipify.org" "https://ifconfig.me" "https://icanhazip.com"; do
-        ip=$(curl -fsS --connect-timeout 5 --max-time 10 "$service" 2>/dev/null | tr -d '[:space:]' || true)
+    # Probe all services in parallel; first valid IPv4 wins.
+    local pids=() tmpdir
+    tmpdir=$(mktemp -d) || return 1
+    local services=("https://ipv4.ip.sb" "https://api.ipify.org" "https://ifconfig.me" "https://icanhazip.com")
+    local i svc
+    for i in "${!services[@]}"; do
+        svc="${services[$i]}"
+        ( curl -fsS --connect-timeout 3 --max-time 6 "$svc" 2>/dev/null | tr -d '[:space:]' >"$tmpdir/$i" ) &
+        pids+=($!)
+    done
+    local ip found=""
+    for i in "${!services[@]}"; do
+        wait "${pids[$i]}" 2>/dev/null || true
+        ip=$(cat "$tmpdir/$i" 2>/dev/null || true)
         if is_ipv4 "$ip"; then
-            printf '%s' "$ip"
-            return 0
+            found="$ip"
+            break
         fi
     done
+    # Reap every probe before removing its output directory or returning.
+    for i in "${!pids[@]}"; do
+        wait "${pids[$i]}" 2>/dev/null || true
+    done
+    rm -rf -- "$tmpdir"
+    if [ -n "$found" ]; then
+        printf '%s' "$found"
+        return 0
+    fi
     return 1
 }
 
