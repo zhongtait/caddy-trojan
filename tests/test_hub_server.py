@@ -551,7 +551,7 @@ class HubHandlerTests(unittest.TestCase):
 
     def test_rate_limiting_and_pruning(self):
         hub._rate_limit_buckets.clear()
-        hub._last_prune_time = 0.0
+        hub._last_prune_time = time.monotonic() - 400.0
         # Check prune path with stale entry
         hub._rate_limit_buckets["198.51.100.1"] = (10.0, time.monotonic() - 400.0)
         self.assertTrue(hub._rate_limit_check("198.51.100.2"))
