@@ -2,6 +2,50 @@
 # EasyTrojan module: system.sh
 # shellcheck shell=bash
 
+_easytrojan_detect_ram_kib() {
+    local mem_kb="${1:-}"
+    if [ -z "$mem_kb" ]; then
+        mem_kb=$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null || true)
+    fi
+    mem_kb=${mem_kb//[^0-9]/}
+    if [ -n "$mem_kb" ] && [ "$mem_kb" -gt 0 ] 2>/dev/null; then
+        printf '%s' "$mem_kb"
+    fi
+}
+
+_easytrojan_calc_tcp_mem() {
+    local mem_kb="${1:-0}"
+    awk -v m="$mem_kb" 'BEGIN{
+        pg = int(m / 4);
+        low = int(pg / 16);
+        pres = int(pg / 8);
+        high = int(pg / 4);
+        if (low < 4096) low = 4096;
+        if (pres < 8192) pres = 8192;
+        if (high < 16384) high = 16384;
+        printf "%d %d %d", low, pres, high
+    }'
+}
+
+_easytrojan_calc_buf_max() {
+    local mem_kb="${1:-0}"
+    # Baseline: 1000 Mbps @ 150ms RTT cross-border proxy BDP = ~18.75 MB
+    # Target buffer = 2 * BDP + 2 MiB = 39,597,152 bytes (~37.76 MiB)
+    # Cap = RAM / 32 (in bytes) = mem_kb * 1024 / 32 = mem_kb * 32
+    # Floor: 4 MiB (4194304 bytes), Ceiling: 256 MiB (268435456 bytes)
+    awk -v m="$mem_kb" 'BEGIN{
+        target = 39597152;
+        if (m > 0) {
+            cap = int(m * 32);
+            if (cap > 268435456) cap = 268435456;
+            if (target > cap) target = cap;
+        }
+        if (target < 4194304) target = 4194304;
+        if (target > 268435456) target = 268435456;
+        printf "%d", target
+    }'
+}
+
 _easytrojan_sysctl_bbr_specs() {
     printf '%s\n' \
         'net.core.default_qdisc|fq' \
@@ -9,15 +53,34 @@ _easytrojan_sysctl_bbr_specs() {
 }
 
 _easytrojan_sysctl_tuning_specs() {
+    local mem_kb buf_max tcp_mem_target
     local key current target min default max extra baseline
+    local c_low c_pres c_high t_low t_pres t_high f_low f_pres f_high
+    local c_min_port c_max_port t_min_port t_max_port
     local -a keys=(
         net.core.somaxconn
+        net.core.netdev_max_backlog
         net.core.rmem_max
         net.core.wmem_max
         net.ipv4.tcp_rmem
         net.ipv4.tcp_wmem
+        net.ipv4.tcp_mem
         net.ipv4.tcp_max_syn_backlog
+        net.ipv4.tcp_slow_start_after_idle
+        net.ipv4.tcp_mtu_probing
+        net.ipv4.tcp_tw_reuse
+        net.ipv4.tcp_fin_timeout
+        net.ipv4.ip_local_port_range
     )
+
+    mem_kb=$(_easytrojan_detect_ram_kib "${1:-}")
+    if [ -n "$mem_kb" ]; then
+        buf_max=$(_easytrojan_calc_buf_max "$mem_kb")
+        tcp_mem_target=$(_easytrojan_calc_tcp_mem "$mem_kb")
+    else
+        buf_max=16777216
+        tcp_mem_target=$(_easytrojan_calc_tcp_mem 0)
+    fi
 
     for key in "${keys[@]}"; do
         current=$(sysctl -n "$key" 2>/dev/null) || return 1
@@ -30,25 +93,79 @@ _easytrojan_sysctl_tuning_specs() {
                     || ! [[ "$min" =~ ^[0-9]+$ && "$default" =~ ^[0-9]+$ && "$max" =~ ^[0-9]+$ ]]; then
                     return 1
                 fi
-                if [ "$max" -lt 16777216 ]; then
-                    max=16777216
+                if [ "$max" -lt "$buf_max" ]; then
+                    max=$buf_max
                 fi
                 target="${min} ${default} ${max}"
                 ;;
-            net.core.somaxconn|net.core.rmem_max|net.core.wmem_max|net.ipv4.tcp_max_syn_backlog)
+            net.ipv4.tcp_mem)
+                read -r c_low c_pres c_high extra <<< "$current"
+                if [ -z "${c_low:-}" ] || [ -z "${c_pres:-}" ] || [ -z "${c_high:-}" ] \
+                    || [ -n "${extra:-}" ] \
+                    || ! [[ "$c_low" =~ ^[0-9]+$ && "$c_pres" =~ ^[0-9]+$ && "$c_high" =~ ^[0-9]+$ ]]; then
+                    return 1
+                fi
+                if [ -n "$tcp_mem_target" ]; then
+                    read -r t_low t_pres t_high <<< "$tcp_mem_target"
+                    f_low=$(( c_low > t_low ? c_low : t_low ))
+                    f_pres=$(( c_pres > t_pres ? c_pres : t_pres ))
+                    f_high=$(( c_high > t_high ? c_high : t_high ))
+                    target="${f_low} ${f_pres} ${f_high}"
+                else
+                    target="${c_low} ${c_pres} ${c_high}"
+                fi
+                ;;
+            net.core.rmem_max|net.core.wmem_max)
                 if ! [[ "$current" =~ ^[0-9]+$ ]]; then
                     return 1
                 fi
-                case "$key" in
-                    net.core.somaxconn) baseline=32768 ;;
-                    net.core.rmem_max|net.core.wmem_max) baseline=16777216 ;;
-                    net.ipv4.tcp_max_syn_backlog) baseline=8192 ;;
-                esac
-                if [ "$current" -lt "$baseline" ]; then
-                    target=$baseline
+                if [ "$current" -lt "$buf_max" ]; then
+                    target=$buf_max
                 else
                     target=$current
                 fi
+                ;;
+            net.core.somaxconn)
+                if ! [[ "$current" =~ ^[0-9]+$ ]]; then return 1; fi
+                baseline=32768
+                target=$(( current > baseline ? current : baseline ))
+                ;;
+            net.core.netdev_max_backlog)
+                if ! [[ "$current" =~ ^[0-9]+$ ]]; then return 1; fi
+                baseline=16384
+                target=$(( current > baseline ? current : baseline ))
+                ;;
+            net.ipv4.tcp_max_syn_backlog)
+                if ! [[ "$current" =~ ^[0-9]+$ ]]; then return 1; fi
+                baseline=8192
+                target=$(( current > baseline ? current : baseline ))
+                ;;
+            net.ipv4.tcp_slow_start_after_idle)
+                if ! [[ "$current" =~ ^[0-9]+$ ]]; then return 1; fi
+                target=0
+                ;;
+            net.ipv4.tcp_mtu_probing)
+                if ! [[ "$current" =~ ^[0-9]+$ ]]; then return 1; fi
+                target=$(( current > 1 ? current : 1 ))
+                ;;
+            net.ipv4.tcp_tw_reuse)
+                if ! [[ "$current" =~ ^[0-9]+$ ]]; then return 1; fi
+                target=$(( current > 1 ? current : 1 ))
+                ;;
+            net.ipv4.tcp_fin_timeout)
+                if ! [[ "$current" =~ ^[0-9]+$ ]]; then return 1; fi
+                target=$(( current < 15 ? current : 15 ))
+                ;;
+            net.ipv4.ip_local_port_range)
+                read -r c_min_port c_max_port extra <<< "$current"
+                if [ -z "${c_min_port:-}" ] || [ -z "${c_max_port:-}" ] \
+                    || [ -n "${extra:-}" ] \
+                    || ! [[ "$c_min_port" =~ ^[0-9]+$ && "$c_max_port" =~ ^[0-9]+$ ]]; then
+                    return 1
+                fi
+                t_min_port=$(( c_min_port < 1024 ? c_min_port : 1024 ))
+                t_max_port=$(( c_max_port > 65535 ? c_max_port : 65535 ))
+                target="${t_min_port} ${t_max_port}"
                 ;;
             *) return 1 ;;
         esac
@@ -305,16 +422,26 @@ EOF
 doctor_network() {
     local key value line cc available qdisc_summary ss_summary nstat_output
     local pid fd_count nofile_limit softnet_drop=0 softnet_squeeze=0 drops squeeze
+    local mem_kb buf_max
 
     info "Network diagnostics (read-only)"
+
+    mem_kb=$(_easytrojan_detect_ram_kib)
+    if [ -n "$mem_kb" ]; then
+        buf_max=$(_easytrojan_calc_buf_max "$mem_kb")
+        info "Host memory: $(( mem_kb / 1024 )) MiB (dynamic socket buffer target: $(( buf_max / 1048576 )) MiB)"
+    fi
 
     if check_cmd sysctl; then
         cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
         available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
         [ -n "$cc" ] && info "TCP congestion control: ${cc}"
         [ -n "$available" ] && info "TCP algorithms available: ${available}"
-        for key in net.core.default_qdisc net.core.somaxconn net.core.rmem_max \
-            net.core.wmem_max net.ipv4.tcp_max_syn_backlog; do
+        for key in net.core.default_qdisc net.core.somaxconn net.core.netdev_max_backlog \
+            net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem \
+            net.ipv4.tcp_mem net.ipv4.tcp_max_syn_backlog net.ipv4.tcp_slow_start_after_idle \
+            net.ipv4.tcp_mtu_probing net.ipv4.tcp_tw_reuse net.ipv4.tcp_fin_timeout \
+            net.ipv4.ip_local_port_range; do
             value=$(sysctl -n "$key" 2>/dev/null || true)
             [ -n "$value" ] && info "${key}=${value}"
         done
@@ -382,12 +509,9 @@ doctor_network() {
 # undetectable or tiny (<170MB total). Optional arg overrides MemTotal (kB) for tests.
 # shellcheck disable=SC2120  # optional arg is exercised by tests, not this module
 derive_gomemlimit_mib() {
-    local mem_kb="${1:-}"
-    if [ -z "$mem_kb" ]; then
-        mem_kb=$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null || true)
-    fi
-    mem_kb=${mem_kb//[^0-9]/}
-    [ -n "$mem_kb" ] && [ "$mem_kb" -gt 0 ] || return 0
+    local mem_kb
+    mem_kb=$(_easytrojan_detect_ram_kib "${1:-}")
+    [ -n "$mem_kb" ] || return 0
     local limit_mib=$(( mem_kb * 3 / 4 / 1024 ))
     [ "$limit_mib" -ge 128 ] || return 0
     printf '%s' "$limit_mib"

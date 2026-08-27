@@ -600,6 +600,19 @@ fi
 rm -rf "$sysctl_target_root"
 pass "sysctl backup advances only while the previous managed target is still active"
 
+info "dynamic TCP buffer and tcp_mem derivation"
+tcp_mem_512m=$(bash -c '. lib/system.sh; _easytrojan_calc_tcp_mem 524288')
+[ "$tcp_mem_512m" = "8192 16384 32768" ] || fail "tcp_mem for 512MB RAM expected '8192 16384 32768', got '$tcp_mem_512m'"
+buf_512m=$(bash -c '. lib/system.sh; _easytrojan_calc_buf_max 524288')
+[ "$buf_512m" = "16777216" ] || fail "buf_max for 512MB RAM expected 16777216 (16MB cap), got '$buf_512m'"
+tcp_mem_1g=$(bash -c '. lib/system.sh; _easytrojan_calc_tcp_mem 1048576')
+[ "$tcp_mem_1g" = "16384 32768 65536" ] || fail "tcp_mem for 1GB RAM expected '16384 32768 65536', got '$tcp_mem_1g'"
+buf_1g=$(bash -c '. lib/system.sh; _easytrojan_calc_buf_max 1048576')
+[ "$buf_1g" = "33554432" ] || fail "buf_max for 1GB RAM expected 33554432 (32MB cap), got '$buf_1g'"
+buf_4g=$(bash -c '. lib/system.sh; _easytrojan_calc_buf_max 4194304')
+[ "$buf_4g" = "39597152" ] || fail "buf_max for 4GB RAM expected 39597152 (BDP target), got '$buf_4g'"
+pass "dynamic TCP buffer and tcp_mem calculations"
+
 info "optional sysctl tuning is loaded and verified"
 tune_sysctl_root=$(mktemp -d)
 tune_sysctl_file="${tune_sysctl_root}/99-caddy-trojan.conf"
@@ -611,13 +624,22 @@ if ! CADDY_SYSCTL_FILE="$tune_sysctl_file" \
     case "${1:-}:${2:-}" in
       -p:*) : > "$SYSCTL_APPLIED_FILE" ;;
       -n:net.core.somaxconn) [ -f "$SYSCTL_APPLIED_FILE" ] && echo 32768 || echo 4096 ;;
+      -n:net.core.netdev_max_backlog) [ -f "$SYSCTL_APPLIED_FILE" ] && echo 16384 || echo 1000 ;;
       -n:net.core.rmem_max) [ -f "$SYSCTL_APPLIED_FILE" ] && echo 16777216 || echo 4194304 ;;
       -n:net.core.wmem_max) [ -f "$SYSCTL_APPLIED_FILE" ] && echo 16777216 || echo 4194304 ;;
       -n:net.ipv4.tcp_rmem) [ -f "$SYSCTL_APPLIED_FILE" ] \
         && echo "4096 131072 16777216" || echo "4096 131072 6291456" ;;
       -n:net.ipv4.tcp_wmem) [ -f "$SYSCTL_APPLIED_FILE" ] \
         && echo "4096 16384 16777216" || echo "4096 16384 4194304" ;;
+      -n:net.ipv4.tcp_mem) [ -f "$SYSCTL_APPLIED_FILE" ] \
+        && echo "4096 8192 16384" || echo "2048 4096 8192" ;;
       -n:net.ipv4.tcp_max_syn_backlog) [ -f "$SYSCTL_APPLIED_FILE" ] && echo 8192 || echo 4096 ;;
+      -n:net.ipv4.tcp_slow_start_after_idle) [ -f "$SYSCTL_APPLIED_FILE" ] && echo 0 || echo 1 ;;
+      -n:net.ipv4.tcp_mtu_probing) [ -f "$SYSCTL_APPLIED_FILE" ] && echo 1 || echo 0 ;;
+      -n:net.ipv4.tcp_tw_reuse) [ -f "$SYSCTL_APPLIED_FILE" ] && echo 1 || echo 0 ;;
+      -n:net.ipv4.tcp_fin_timeout) [ -f "$SYSCTL_APPLIED_FILE" ] && echo 15 || echo 60 ;;
+      -n:net.ipv4.ip_local_port_range) [ -f "$SYSCTL_APPLIED_FILE" ] \
+        && echo "1024 65535" || echo "32768 60999" ;;
       *) return 1 ;;
     esac
   }
@@ -628,13 +650,21 @@ if ! CADDY_SYSCTL_FILE="$tune_sysctl_file" \
   apply_sysctl_limits
   apply_sysctl_limits
   grep -q "net.core.somaxconn = 32768" "$CADDY_SYSCTL_FILE"
+  grep -q "net.core.netdev_max_backlog = 16384" "$CADDY_SYSCTL_FILE"
   grep -q "net.ipv4.tcp_rmem = 4096 131072 16777216" "$CADDY_SYSCTL_FILE"
   grep -q "net.ipv4.tcp_wmem = 4096 16384 16777216" "$CADDY_SYSCTL_FILE"
-  ! grep -q "tcp_notsent_lowat\|tcp_tw_reuse\|tcp_fin_timeout\|ip_local_port_range" "$CADDY_SYSCTL_FILE"
+  grep -q "net.ipv4.tcp_slow_start_after_idle = 0" "$CADDY_SYSCTL_FILE"
+  grep -q "net.ipv4.tcp_mtu_probing = 1" "$CADDY_SYSCTL_FILE"
+  grep -q "net.ipv4.tcp_tw_reuse = 1" "$CADDY_SYSCTL_FILE"
+  grep -q "net.ipv4.tcp_fin_timeout = 15" "$CADDY_SYSCTL_FILE"
+  grep -q "net.ipv4.ip_local_port_range = 1024 65535" "$CADDY_SYSCTL_FILE"
+  ! grep -q "tcp_notsent_lowat" "$CADDY_SYSCTL_FILE"
   grep -Fq $'"'"'net.core.somaxconn\t4096\t32768'"'"' "$CADDY_SYSCTL_BACKUP_FILE"
   grep -Fq $'"'"'net.ipv4.tcp_rmem\t4096 131072 6291456\t4096 131072 16777216'"'"' \
     "$CADDY_SYSCTL_BACKUP_FILE"
-  [ "$(wc -l < "$CADDY_SYSCTL_BACKUP_FILE" | tr -d "[:space:]")" = 8 ]
+  grep -Fq $'"'"'net.ipv4.tcp_slow_start_after_idle\t1\t0'"'"' "$CADDY_SYSCTL_BACKUP_FILE"
+  grep -Fq $'"'"'net.ipv4.ip_local_port_range\t32768 60999\t1024 65535'"'"' "$CADDY_SYSCTL_BACKUP_FILE"
+  [ "$(wc -l < "$CADDY_SYSCTL_BACKUP_FILE" | tr -d "[:space:]")" = 15 ]
 '; then
   rm -rf "$tune_sysctl_root"
   fail "optional sysctl tuning did not load and verify successfully"
@@ -648,11 +678,18 @@ if ! CADDY_SYSCTL_FILE="$high_sysctl_root/99-caddy-trojan.conf" \
     case "${1:-}:${2:-}" in
       -p:*) return 0 ;;
       -n:net.core.somaxconn) echo 65536 ;;
+      -n:net.core.netdev_max_backlog) echo 32768 ;;
       -n:net.core.rmem_max) echo 33554432 ;;
       -n:net.core.wmem_max) echo 33554432 ;;
       -n:net.ipv4.tcp_rmem) echo "8192 262144 33554432" ;;
       -n:net.ipv4.tcp_wmem) echo "8192 32768 33554432" ;;
+      -n:net.ipv4.tcp_mem) echo "32768 65536 131072" ;;
       -n:net.ipv4.tcp_max_syn_backlog) echo 16384 ;;
+      -n:net.ipv4.tcp_slow_start_after_idle) echo 0 ;;
+      -n:net.ipv4.tcp_mtu_probing) echo 2 ;;
+      -n:net.ipv4.tcp_tw_reuse) echo 2 ;;
+      -n:net.ipv4.tcp_fin_timeout) echo 10 ;;
+      -n:net.ipv4.ip_local_port_range) echo "1000 65535" ;;
       *) return 1 ;;
     esac
   }
@@ -662,10 +699,17 @@ if ! CADDY_SYSCTL_FILE="$high_sysctl_root/99-caddy-trojan.conf" \
   . lib/system.sh
   apply_sysctl_limits
   grep -q "net.core.somaxconn = 65536" "$CADDY_SYSCTL_FILE"
+  grep -q "net.core.netdev_max_backlog = 32768" "$CADDY_SYSCTL_FILE"
   grep -q "net.core.rmem_max = 33554432" "$CADDY_SYSCTL_FILE"
   grep -q "net.ipv4.tcp_rmem = 8192 262144 33554432" "$CADDY_SYSCTL_FILE"
   grep -q "net.ipv4.tcp_wmem = 8192 32768 33554432" "$CADDY_SYSCTL_FILE"
+  grep -q "net.ipv4.tcp_mem = 32768 65536 131072" "$CADDY_SYSCTL_FILE"
   grep -q "net.ipv4.tcp_max_syn_backlog = 16384" "$CADDY_SYSCTL_FILE"
+  grep -q "net.ipv4.tcp_slow_start_after_idle = 0" "$CADDY_SYSCTL_FILE"
+  grep -q "net.ipv4.tcp_mtu_probing = 2" "$CADDY_SYSCTL_FILE"
+  grep -q "net.ipv4.tcp_tw_reuse = 2" "$CADDY_SYSCTL_FILE"
+  grep -q "net.ipv4.tcp_fin_timeout = 10" "$CADDY_SYSCTL_FILE"
+  grep -q "net.ipv4.ip_local_port_range = 1000 65535" "$CADDY_SYSCTL_FILE"
 '; then
   rm -rf "$tune_sysctl_root" "$high_sysctl_root"
   fail "optional sysctl tuning lowered an existing high host value"
@@ -678,11 +722,18 @@ if CADDY_SYSCTL_FILE="$tune_sysctl_root/failed.conf" \
     case "${1:-}:${2:-}" in
       -p:*) return 1 ;;
       -n:net.core.somaxconn) echo 4096 ;;
+      -n:net.core.netdev_max_backlog) echo 1000 ;;
       -n:net.core.rmem_max) echo 4194304 ;;
       -n:net.core.wmem_max) echo 4194304 ;;
       -n:net.ipv4.tcp_rmem) echo "4096 131072 6291456" ;;
       -n:net.ipv4.tcp_wmem) echo "4096 16384 4194304" ;;
+      -n:net.ipv4.tcp_mem) echo "4096 8192 16384" ;;
       -n:net.ipv4.tcp_max_syn_backlog) echo 4096 ;;
+      -n:net.ipv4.tcp_slow_start_after_idle) echo 1 ;;
+      -n:net.ipv4.tcp_mtu_probing) echo 0 ;;
+      -n:net.ipv4.tcp_tw_reuse) echo 0 ;;
+      -n:net.ipv4.tcp_fin_timeout) echo 60 ;;
+      -n:net.ipv4.ip_local_port_range) echo "32768 60999" ;;
       *) return 1 ;;
     esac
   }
@@ -783,8 +834,17 @@ network_doctor_output=$(bash -c '
       -n:net.ipv4.tcp_available_congestion_control) echo "reno cubic bbr" ;;
       -n:net.core.default_qdisc) echo fq ;;
       -n:net.core.somaxconn) echo 32768 ;;
+      -n:net.core.netdev_max_backlog) echo 16384 ;;
       -n:net.core.rmem_max|-n:net.core.wmem_max) echo 16777216 ;;
+      -n:net.ipv4.tcp_rmem) echo "4096 131072 16777216" ;;
+      -n:net.ipv4.tcp_wmem) echo "4096 16384 16777216" ;;
+      -n:net.ipv4.tcp_mem) echo "8192 16384 32768" ;;
       -n:net.ipv4.tcp_max_syn_backlog) echo 8192 ;;
+      -n:net.ipv4.tcp_slow_start_after_idle) echo 0 ;;
+      -n:net.ipv4.tcp_mtu_probing) echo 1 ;;
+      -n:net.ipv4.tcp_tw_reuse) echo 1 ;;
+      -n:net.ipv4.tcp_fin_timeout) echo 15 ;;
+      -n:net.ipv4.ip_local_port_range) echo "1024 65535" ;;
       *) return 1 ;;
     esac
   }
@@ -797,6 +857,8 @@ network_doctor_output=$(bash -c '
 ') || fail "doctor_network mock execution failed"
 echo "$network_doctor_output" | grep -q 'TCP congestion control: bbr' \
   || fail "doctor_network omitted congestion-control output"
+echo "$network_doctor_output" | grep -q 'net.ipv4.tcp_mem=8192 16384 32768' \
+  || fail "doctor_network omitted tcp_mem output"
 echo "$network_doctor_output" | grep -q 'nstat TcpRetransSegs=2' \
   || fail "doctor_network omitted nstat output"
 pass "network doctor is read-only and reports kernel/socket counters"

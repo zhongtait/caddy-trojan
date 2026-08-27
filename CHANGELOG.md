@@ -9,7 +9,8 @@
 - 网络：安装时可选择 Trojan 出站 IPv4 或 IPv6 优先级，默认 IPv4；另一地址族保持自动回退，选择会持久化并显示在 status 中。
 - 网络：出站 TCP/UDP DNS、IP literal 和双栈竞速统一受 10 秒总拨号预算约束，取消时清理未获胜连接；补充可取消拨号单测。
 - 系统：默认网络配置收敛为 `fq` + BBR，不再全局设置依赖具体负载的 `tcp_slow_start_after_idle` 与 `tcp_notsent_lowat`。
-- 系统：`--tune-system` 在 Caddy 创建 listener 前应用并逐项回读验证；新增 `doctor --network` 只读诊断。
+- 系统：`--tune-system` 升级为按主机物理内存（RAM）和跨境代理 BDP 动态推导缓冲区，设置 `RAM/32` 单 socket 封顶与 `tcp_mem` 严格预算硬顶，并补齐 `tcp_slow_start_after_idle`、`tcp_mtu_probing`、`tcp_tw_reuse`、`tcp_fin_timeout` 等代理向协议栈参数；在 Caddy 创建 listener 前应用并逐项回读验证。
+- 系统：`doctor --network` 只读诊断增强，支持展示系统物理内存、自适应缓冲目标及 `tcp_mem` 等网络状态。
 - 系统：为 Caddy 服务设置软内存上限 `GOMEMLIMIT`（约 75% 内存），作为小内存 VPS 的 OOM 兜底；内存无法探测或过小时自动跳过。
 - 系统：安装时在内核支持的情况下启用并持久化 `fq` + BBR；更广泛的 sysctl / limits 调优保持可选。
 - Hub：节点聚合 Hub `easytrojan hub enable|disable|status|url|token|list|remove|join`。

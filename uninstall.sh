@@ -36,8 +36,10 @@ restore_easytrojan_sysctls() {
         case "$key" in
             ''|'#'*) continue ;;
             net.core.default_qdisc|net.ipv4.tcp_congestion_control|\
-            net.core.somaxconn|net.core.rmem_max|net.core.wmem_max|\
-            net.ipv4.tcp_rmem|net.ipv4.tcp_wmem|net.ipv4.tcp_max_syn_backlog) ;;
+            net.core.somaxconn|net.core.netdev_max_backlog|net.core.rmem_max|net.core.wmem_max|\
+            net.ipv4.tcp_rmem|net.ipv4.tcp_wmem|net.ipv4.tcp_mem|net.ipv4.tcp_max_syn_backlog|\
+            net.ipv4.tcp_slow_start_after_idle|net.ipv4.tcp_mtu_probing|net.ipv4.tcp_tw_reuse|\
+            net.ipv4.tcp_fin_timeout|net.ipv4.ip_local_port_range) ;;
             *)
                 warn "Ignoring invalid sysctl backup key: ${key}"
                 malformed=1
