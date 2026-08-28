@@ -3,7 +3,7 @@
 # shellcheck shell=bash
 
 _easytrojan_detect_ram_kib() {
-    local mem_kb="${1:-}"
+    local mem_kb="${1:-${EASYTROJAN_MEM_TOTAL_KB:-}}"
     if [ -z "$mem_kb" ]; then
         mem_kb=$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null || true)
     fi

@@ -618,7 +618,8 @@ tune_sysctl_root=$(mktemp -d)
 tune_sysctl_file="${tune_sysctl_root}/99-caddy-trojan.conf"
 if ! CADDY_SYSCTL_FILE="$tune_sysctl_file" \
   CADDY_SYSCTL_BACKUP_FILE="$tune_sysctl_root/backup" \
-  SYSCTL_APPLIED_FILE="$tune_sysctl_root/applied" bash -c '
+  SYSCTL_APPLIED_FILE="$tune_sysctl_root/applied" \
+  EASYTROJAN_MEM_TOTAL_KB="524288" bash -c '
   set -euo pipefail
   sysctl() {
     case "${1:-}:${2:-}" in
@@ -632,7 +633,7 @@ if ! CADDY_SYSCTL_FILE="$tune_sysctl_file" \
       -n:net.ipv4.tcp_wmem) [ -f "$SYSCTL_APPLIED_FILE" ] \
         && echo "4096 16384 16777216" || echo "4096 16384 4194304" ;;
       -n:net.ipv4.tcp_mem) [ -f "$SYSCTL_APPLIED_FILE" ] \
-        && echo "4096 8192 16384" || echo "2048 4096 8192" ;;
+        && echo "8192 16384 32768" || echo "4096 8192 16384" ;;
       -n:net.ipv4.tcp_max_syn_backlog) [ -f "$SYSCTL_APPLIED_FILE" ] && echo 8192 || echo 4096 ;;
       -n:net.ipv4.tcp_slow_start_after_idle) [ -f "$SYSCTL_APPLIED_FILE" ] && echo 0 || echo 1 ;;
       -n:net.ipv4.tcp_mtu_probing) [ -f "$SYSCTL_APPLIED_FILE" ] && echo 1 || echo 0 ;;
@@ -672,6 +673,7 @@ fi
 high_sysctl_root=$(mktemp -d)
 if ! CADDY_SYSCTL_FILE="$high_sysctl_root/99-caddy-trojan.conf" \
   CADDY_SYSCTL_BACKUP_FILE="$high_sysctl_root/backup" \
+  EASYTROJAN_MEM_TOTAL_KB="524288" \
   bash -c '
   set -euo pipefail
   sysctl() {
@@ -716,7 +718,8 @@ if ! CADDY_SYSCTL_FILE="$high_sysctl_root/99-caddy-trojan.conf" \
 fi
 rm -rf "$high_sysctl_root"
 if CADDY_SYSCTL_FILE="$tune_sysctl_root/failed.conf" \
-  CADDY_SYSCTL_BACKUP_FILE="$tune_sysctl_root/failed-backup" bash -c '
+  CADDY_SYSCTL_BACKUP_FILE="$tune_sysctl_root/failed-backup" \
+  EASYTROJAN_MEM_TOTAL_KB="524288" bash -c '
   set -euo pipefail
   sysctl() {
     case "${1:-}:${2:-}" in
