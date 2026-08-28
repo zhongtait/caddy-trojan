@@ -396,9 +396,11 @@ Hub 相关数据：
   持久化队列刷完，用户增删会等待 storage 确认，启动时会忽略临时 key 并修复损坏的
   用户记录。Caddyfile 校验使用一次性隔离 storage，不会以 root 身份改写运行目录。真实
   systemd 集成测试会并发添加用户，并验证它们在 Caddy 进程重启后仍能恢复。
-- **更激进的吞吐调优（可选）**：`--tune-system` 额外启用较大的 socket 缓冲和连接队列，
-  适合确认存在高 BDP 或建连突发的机器，但会增加内存占用。参数会在 Caddy 启动前
-  应用并逐项回读校验，写入 `/etc/sysctl.d/99-caddy-trojan.conf`。
+- **自适应吞吐与协议栈调优（可选）**：`--tune-system` 根据机器物理内存（RAM）和
+  跨境代理 BDP 动态推导最优缓冲区（单 socket 缓冲上限自动按 `RAM/32` 封顶，全局 `tcp_mem`
+  严格按内存预算约束），彻底杜绝小内存 VPS 在高并发下因内核 TCP 缓冲过大导致的 OOM，
+  同时优化 `tcp_slow_start_after_idle`、`tcp_mtu_probing`、`tcp_tw_reuse` 等代理链路参数。
+  参数会在 Caddy 启动前应用并逐项回读校验，写入 `/etc/sysctl.d/99-caddy-trojan.conf`。
 - **只读网络诊断**：`sudo easytrojan doctor --network` 输出实际 qdisc、拥塞算法、TCP
   重传/超时计数、softnet 丢包和 Caddy 文件描述符使用情况，不会重置计数器或修改内核参数。
 
