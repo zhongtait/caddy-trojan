@@ -2,6 +2,7 @@
 # EasyTrojan module: system.sh
 # shellcheck shell=bash
 
+# shellcheck disable=SC2120  # optional arg is exercised by tests, not this module
 _easytrojan_detect_ram_kib() {
     local mem_kb="${1:-${EASYTROJAN_MEM_TOTAL_KB:-}}"
     if [ -z "$mem_kb" ]; then
@@ -73,7 +74,7 @@ _easytrojan_sysctl_tuning_specs() {
         net.ipv4.ip_local_port_range
     )
 
-    mem_kb=$(_easytrojan_detect_ram_kib "${1:-}")
+    mem_kb=$(_easytrojan_detect_ram_kib)
     if [ -n "$mem_kb" ]; then
         buf_max=$(_easytrojan_calc_buf_max "$mem_kb")
         tcp_mem_target=$(_easytrojan_calc_tcp_mem "$mem_kb")
