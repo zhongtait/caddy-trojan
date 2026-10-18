@@ -58,7 +58,7 @@ jobs:
 
       - uses: actions/setup-go@v6
         with:
-          go-version: '1.25.x'
+          go-version: '1.26.x'
           cache: false
 
       - name: Run actionlint v1.7.12
