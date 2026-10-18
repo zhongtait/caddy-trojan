@@ -100,7 +100,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.25.x'
+          go-version: '1.26.x'
           cache: false
 
       - name: Test patched Trojan plugin
@@ -122,9 +122,11 @@ jobs:
 
       - name: Build Caddy-Trojan for integration
         if: inputs.caddy_artifact == ''
+        env:
+          GOTOOLCHAIN: auto
         run: |
           set -euo pipefail
-          go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.5
+          go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.7
           plugin_dir="${RUNNER_TEMP}/caddy-trojan-plugin"
           xcaddy build --output "$CADDY_UNDER_TEST" \
             --with "github.com/imgk/caddy-trojan=${plugin_dir}"

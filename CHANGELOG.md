@@ -94,7 +94,7 @@
 - 更新：`update` 先更新脚本再 re-exec，确保后续逻辑使用新版本。
 - 更新：暂存脚本更新，回滚不健康的 Caddy 升级，并在安装 / 卸载时保护无关的 Caddy 安装。
 - 发布：保持 `sha` 作为上游变更标记，同时将 release 构建固定到该 commit。
-- CI：GitHub Actions 构建 Go 版本从 1.23.x 升到 1.25.x（Caddy v2.11.4 要求 go >= 1.25.1）。
+- CI：GitHub Actions 构建 Go 版本从 1.25.x 升到 1.26.x 并启用 GOTOOLCHAIN=auto，升级 xcaddy 至 v0.4.7（适配 Caddy v2.11.7+ 要求 go >= 1.26.0）。
 - CI：Check Upstream 在检测到更新后通过 workflow_call 直接触发 Build，规避 GITHUB_TOKEN push 不触发其他 workflow 的限制。
 - 文档：修正实现计划中“删除 API 不存在 / 重启必丢用户”等不准确表述对应的实现路径。
 - （已取代）用户改为 Caddyfile 静态 `users`，不再依赖 API 重注入。
