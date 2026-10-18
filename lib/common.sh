@@ -512,24 +512,41 @@ detect_public_ip() {
     local i svc
     for i in "${!services[@]}"; do
         svc="${services[$i]}"
-        ( curl -fsS --connect-timeout 3 --max-time 6 "$svc" 2>/dev/null | tr -d '[:space:]' >"$tmpdir/$i" ) &
+        (
+            local ip
+            ip=$(curl -fsS --connect-timeout 3 --max-time 6 "$svc" 2>/dev/null | tr -d '[:space:]')
+            if is_ipv4 "$ip"; then
+                printf '%s\n' "$ip" > "$tmpdir/found.$$"
+                mv -n "$tmpdir/found.$$" "$tmpdir/found" 2>/dev/null || true
+            fi
+        ) &
         pids+=($!)
     done
-    local ip found=""
-    for i in "${!services[@]}"; do
-        wait "${pids[$i]}" 2>/dev/null || true
-        ip=$(cat "$tmpdir/$i" 2>/dev/null || true)
-        if is_ipv4 "$ip"; then
-            found="$ip"
+    local found="" waited=0
+    # Wait for the first service to report a valid IPv4 address (poll up to 6.5s)
+    while [ "$waited" -lt 65 ]; do
+        if [ -s "$tmpdir/found" ]; then
+            found=$(head -n 1 "$tmpdir/found" 2>/dev/null || true)
             break
         fi
+        local any_alive=0
+        for pid in "${pids[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                any_alive=1
+                break
+            fi
+        done
+        [ "$any_alive" -eq 1 ] || break
+        sleep 0.1
+        waited=$((waited + 1))
     done
-    # Reap every probe before removing its output directory or returning.
+    # Terminate and reap any remaining background probes before returning
+    kill "${pids[@]}" 2>/dev/null || true
     for i in "${!pids[@]}"; do
         wait "${pids[$i]}" 2>/dev/null || true
     done
     rm -rf -- "$tmpdir"
-    if [ -n "$found" ]; then
+    if [ -n "$found" ] && is_ipv4 "$found"; then
         printf '%s' "$found"
         return 0
     fi
@@ -539,25 +556,31 @@ detect_public_ip() {
 resolve_domain_ipv4_list() {
     local domain="$1" ips=""
     if check_cmd dig; then
-        ips=$(dig +short A "$domain" 2>/dev/null | grep -E '^[0-9.]+$' || true)
+        ips=$(dig +short +time=2 +tries=1 A "$domain" 2>/dev/null | grep -E '^[0-9.]+$' || true)
     fi
     if [ -z "$ips" ] && check_cmd getent; then
         ips=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u || true)
     fi
     if [ -z "$ips" ] && check_cmd host; then
-        ips=$(host -t A "$domain" 2>/dev/null | awk '/has address/ {print $4}' || true)
+        ips=$(host -t A -W 2 "$domain" 2>/dev/null | awk '/has address/ {print $4}' || true)
     fi
     if [ -z "$ips" ] && check_cmd python3; then
         ips=$(python3 -c 'import socket,sys
-for a in socket.getaddrinfo(sys.argv[1], None, socket.AF_INET):
-    print(a[4][0])
+try:
+    for a in socket.getaddrinfo(sys.argv[1], None, socket.AF_INET):
+        print(a[4][0])
+except Exception:
+    pass
 ' "$domain" 2>/dev/null | sort -u || true)
     fi
     if [ -z "$ips" ]; then
         ips=$(ping "$domain" -c 1 -W 5 2>/dev/null | sed '1{s/[^(]*(//;s/).*//;q}' || true)
     fi
-    # unique keep order
-    printf '%s\n' "$ips" | tr ' ' '\n' | awk 'NF && !seen[$0]++'
+    # unique keep order and filter valid IPv4 only
+    local ip
+    while IFS= read -r ip; do
+        is_ipv4 "$ip" && printf '%s\n' "$ip"
+    done < <(printf '%s\n' "$ips" | tr ' ' '\n' | awk 'NF && !seen[$0]++')
 }
 
 resolve_domain_ipv4() {

@@ -891,7 +891,7 @@ pass "python unit tests"
 if command -v coverage >/dev/null 2>&1; then
   info "hub_server.py line + branch coverage"
   coverage erase
-  coverage run --branch -m unittest discover -s tests >/dev/null \
+  PYTHONPATH="${ROOT}${PYTHONPATH:+:${PYTHONPATH}}" coverage run --branch -m unittest discover -s tests >/dev/null \
     || fail "coverage test run failed"
   coverage report --include='hub_server.py' --show-missing --fail-under=100 \
     || fail "hub_server.py line/branch coverage is below 100%"

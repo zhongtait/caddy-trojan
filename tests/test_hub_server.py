@@ -6,6 +6,7 @@ import json
 import os
 import runpy
 import socket
+import sys
 import tempfile
 import threading
 import time
@@ -14,6 +15,7 @@ from email.message import Message
 from pathlib import Path
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import hub_server as hub
 
 
@@ -29,6 +31,7 @@ class HubStateTests(unittest.TestCase):
         hub._nodes_cache = None
         hub._sub_cache_key = None
         hub._sub_cache_body = None
+        hub._sub_cache.clear()
         hub._rate_limit_buckets.clear()
         hub._last_prune_time = 0.0
 
@@ -38,6 +41,7 @@ class HubStateTests(unittest.TestCase):
         hub._nodes_cache = None
         hub._sub_cache_key = None
         hub._sub_cache_body = None
+        hub._sub_cache.clear()
         hub._rate_limit_buckets.clear()
         hub._last_prune_time = 0.0
         self.tempdir.cleanup()
@@ -301,6 +305,15 @@ class HubStateTests(unittest.TestCase):
         self.assertIn("@1.2.3.4:2053", decoded_ip)
         self.assertIn("sni=hk.example.com", decoded_ip)
 
+        # Repeated call hits cache
+        cached_ip = hub.subscription_body(server="1.2.3.4", port=2053)
+        self.assertEqual(decoded_ip, base64.b64decode(cached_ip).decode("utf-8"))
+
+        # Test sub cache eviction when max entries reached
+        with mock.patch.object(hub, "MAX_SUB_CACHE_ENTRIES", 1):
+            hub.subscription_body(server="1.2.3.5", port=2053)
+            hub.subscription_body(server="1.2.3.6", port=2053)
+
     def test_sync_domain_nodes_is_atomic_and_preserves_stable_id(self):
         hub.ensure_config()
         first = hub.upsert_node(
@@ -562,6 +575,17 @@ class HubHandlerTests(unittest.TestCase):
         hub._rate_limit_buckets[test_ip] = (0.5, time.monotonic())
         self.assertFalse(hub._rate_limit_check(test_ip))
 
+        # Test max buckets overflow prune
+        hub._rate_limit_buckets.clear()
+        with mock.patch.object(hub, "RATE_LIMIT_MAX_BUCKETS", 2):
+            now = time.monotonic()
+            hub._rate_limit_buckets["198.51.100.10"] = (10.0, now - 50.0)
+            hub._rate_limit_buckets["198.51.100.11"] = (10.0, now - 10.0)
+            # Adding a 3rd triggers forced prune and excess drop
+            hub._rate_limit_check("198.51.100.12")
+            self.assertLessEqual(len(hub._rate_limit_buckets), 2)
+            self.assertNotIn("198.51.100.10", hub._rate_limit_buckets)
+
         # Check _client_ip helper fallback
         class DummyHandler:
             client_address = None
@@ -569,6 +593,48 @@ class HubHandlerTests(unittest.TestCase):
         class DummyEmptyHandler:
             client_address = ()
         self.assertEqual("unknown", hub._client_ip(DummyEmptyHandler()))
+
+        # Non-localhost IP
+        class RemoteHandler:
+            client_address = ("198.51.100.99", 54321)
+            headers = {"CF-Connecting-IP": "203.0.113.1"}
+        self.assertEqual("198.51.100.99", hub._client_ip(RemoteHandler()))
+
+        # Localhost with no headers
+        class LocalHandlerNoHeaders:
+            client_address = ("127.0.0.1", 54321)
+            headers = None
+        self.assertEqual("127.0.0.1", hub._client_ip(LocalHandlerNoHeaders()))
+
+        # Localhost with valid CF-Connecting-IP
+        class LocalHandlerCF:
+            client_address = ("127.0.0.1", 54321)
+            headers = {"CF-Connecting-IP": "203.0.113.10"}
+        self.assertEqual("203.0.113.10", hub._client_ip(LocalHandlerCF()))
+
+        # Localhost with invalid CF-Connecting-IP but valid X-Forwarded-For
+        class LocalHandlerCFInvalidXFF:
+            client_address = ("127.0.0.1", 54321)
+            headers = {"CF-Connecting-IP": "invalid-ip", "X-Forwarded-For": "203.0.113.20, 10.0.0.1"}
+        self.assertEqual("203.0.113.20", hub._client_ip(LocalHandlerCFInvalidXFF()))
+
+        # Localhost with invalid CF-Connecting-IP and invalid X-Forwarded-For
+        class LocalHandlerBothInvalid:
+            client_address = ("127.0.0.1", 54321)
+            headers = {"CF-Connecting-IP": "invalid-ip", "X-Forwarded-For": "invalid-ip"}
+        self.assertEqual("127.0.0.1", hub._client_ip(LocalHandlerBothInvalid()))
+
+        # Localhost with valid X-Forwarded-For only
+        class LocalHandlerXFF:
+            client_address = ("127.0.0.1", 54321)
+            headers = {"X-Forwarded-For": "203.0.113.30"}
+        self.assertEqual("203.0.113.30", hub._client_ip(LocalHandlerXFF()))
+
+        # Localhost with empty headers
+        class LocalHandlerEmptyHeaders:
+            client_address = ("127.0.0.1", 54321)
+            headers = {}
+        self.assertEqual("127.0.0.1", hub._client_ip(LocalHandlerEmptyHeaders()))
 
 
 class HubHTTPTests(unittest.TestCase):
@@ -583,6 +649,7 @@ class HubHTTPTests(unittest.TestCase):
         hub._nodes_cache = None
         hub._sub_cache_key = None
         hub._sub_cache_body = None
+        hub._sub_cache.clear()
         hub._rate_limit_buckets.clear()
         hub._last_prune_time = 0.0
         self.cfg = hub.ensure_config()
@@ -599,6 +666,7 @@ class HubHTTPTests(unittest.TestCase):
         hub._nodes_cache = None
         hub._sub_cache_key = None
         hub._sub_cache_body = None
+        hub._sub_cache.clear()
         self.tempdir.cleanup()
 
     def request(self, method, path, body=None, headers=None, authenticated=False):
@@ -801,6 +869,12 @@ class HubHTTPTests(unittest.TestCase):
         )
         self.assertEqual(before, hub.load_nodes())
 
+        # Ensure previous request has fully released its sync slot
+        for _ in range(100):
+            if getattr(hub.SYNC_REQUEST_SLOTS, "_value", 4) == 4:
+                break
+            time.sleep(0.01)
+
         busy = mock.Mock()
         busy.acquire.return_value = False
         with mock.patch.object(hub, "SYNC_REQUEST_SLOTS", busy):
@@ -995,6 +1069,18 @@ class HubInfrastructureTests(unittest.TestCase):
             # runpy exercises the module guard as well as the --init entrypoint.
             runpy.run_path(str(Path(hub.__file__)), run_name="__main__")
             self.assertTrue((Path(root) / "nodes.json").is_file())
+
+    def test_worker_catches_broken_pipe_gracefully(self):
+        server = hub.LimitedThreadingHTTPServer(("127.0.0.1", 0), hub.Handler)
+        with mock.patch.object(server, "finish_request", side_effect=BrokenPipeError("broken")):
+            with mock.patch.object(server, "handle_error") as mock_handle:
+                left, right = socket.socketpair()
+                try:
+                    server.process_request(left, ("127.0.0.1", 12345))
+                    time.sleep(0.05)
+                    mock_handle.assert_not_called()
+                finally:
+                    right.close()
 
 
 if __name__ == "__main__":
