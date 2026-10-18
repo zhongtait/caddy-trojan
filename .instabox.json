@@ -1,0 +1,5 @@
+{
+  "machine": "dev-builder",
+  "build": "bash scripts/ci_validate.sh",
+  "test": "bash scripts/ci_validate.sh"
+}

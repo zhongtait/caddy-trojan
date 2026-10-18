@@ -1023,7 +1023,7 @@ EOF
     fi
     hub_url="${hub_url%/}"
 
-    local count=0
+    count=0
     while IFS= read -r passwd || [ -n "$passwd" ]; do
         [ -n "$passwd" ] && count=$((count + 1))
     done < "$PASSWD_FILE"
@@ -1035,7 +1035,7 @@ EOF
     fi
     hub_save_client_membership "$hub_url" "$token" "$name" "$server" "$port"
     ok "Saved remote hub membership -> $(hub_client_file)"
-    echo -e "  Tip: on hub host run ${CYAN}easytrojan hub list${NC} / client subscribe ${CYAN}$(printf '%s' "$hub_url" | sed 's|/*$//')/sub/<sub_token>${NC}"
+    echo -e "  Tip: on hub host run ${CYAN}easytrojan hub list${NC} / client subscribe ${CYAN}${hub_url}/sub/<sub_token>${NC}"
     echo -e "  Tip: after ${CYAN}user add/del${NC}, this node re-syncs to remote hub automatically when membership file exists"
     exit 0
 }

@@ -638,7 +638,18 @@ if [ "$mode" = "origin" ]; then
   exit 0
 fi
 
-CERT_FILE=$(find /var/lib/caddy/certificates -name '*.crt' -type f 2>/dev/null | head -1 || true)
+DOMAIN_FILE=/etc/caddy/trojan/domain.txt
+DOMAIN=""
+if [ -f "$DOMAIN_FILE" ]; then
+  DOMAIN=$(head -1 "$DOMAIN_FILE" 2>/dev/null | tr -d '[:space:]')
+fi
+CERT_FILE=""
+if [ -n "$DOMAIN" ]; then
+  CERT_FILE=$(find /var/lib/caddy/certificates -name "${DOMAIN}.crt" -type f 2>/dev/null | head -1 || true)
+fi
+if [ -z "$CERT_FILE" ]; then
+  CERT_FILE=$(find /var/lib/caddy/certificates -name '*.crt' -type f 2>/dev/null | head -1 || true)
+fi
 if [ -n "${CERT_FILE}" ] && command -v openssl >/dev/null 2>&1; then
   if ! openssl x509 -checkend $((30 * 86400)) -noout -in "$CERT_FILE" 2>/dev/null; then
     END_RAW=$(openssl x509 -enddate -noout -in "$CERT_FILE" 2>/dev/null | cut -d= -f2 || true)

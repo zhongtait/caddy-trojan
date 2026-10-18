@@ -163,6 +163,11 @@ if [ -d /usr/local/share/easytrojan ]; then
     ok "Removed /usr/local/share/easytrojan"
 fi
 
+if [ -d /var/cache/easytrojan ]; then
+    rm -rf /var/cache/easytrojan
+    ok "Removed /var/cache/easytrojan"
+fi
+
 if [ -f /etc/systemd/system/easytrojan-hub.service ]; then
     rm -f /etc/systemd/system/easytrojan-hub.service
     ok "Hub unit removed"

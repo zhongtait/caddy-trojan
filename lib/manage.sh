@@ -51,6 +51,22 @@ do_doctor() {
         fi
     fi
 
+    if check_cmd ss; then
+        if ss -Hltn 'sport = :80 or sport = :443' 2>/dev/null | grep -q 'LISTEN'; then
+            doctor_ok "ports 80/443 listening"
+        else
+            doctor_fail "ports 80/443 not listening"
+        fi
+    fi
+
+    if check_cmd curl; then
+        if curl -sf --connect-timeout 2 --max-time 5 "${ADMIN_API}/config/" >/dev/null 2>&1; then
+            doctor_ok "Caddy Admin API responds"
+        else
+            doctor_fail "Caddy Admin API unavailable"
+        fi
+    fi
+
     mode=$(read_tls_mode)
     case "$mode" in
         origin)
@@ -58,6 +74,13 @@ do_doctor() {
             key_file=$(read_tls_key_path)
             if [ -f "$cert_file" ] && [ -f "$key_file" ]; then
                 doctor_ok "origin certificate and key files exist"
+                if check_cmd openssl; then
+                    if ! openssl x509 -checkend $((7 * 86400)) -noout -in "$cert_file" 2>/dev/null; then
+                        doctor_fail "origin certificate expires in less than 7 days"
+                    else
+                        doctor_ok "origin certificate is valid"
+                    fi
+                fi
             else
                 doctor_fail "origin certificate/key missing"
             fi
@@ -65,12 +88,34 @@ do_doctor() {
         auto)
             if [ -d "${CADDY_DATA_DIR}/certificates" ]; then
                 doctor_ok "ACME certificate storage exists"
+                local domain_cert
+                domain_cert=$(find_domain_certificate "${domain:-}" 2>/dev/null || true)
+                if [ -n "$domain_cert" ] && [ -f "$domain_cert" ]; then
+                    doctor_ok "ACME domain certificate found"
+                    if check_cmd openssl; then
+                        if ! openssl x509 -checkend $((7 * 86400)) -noout -in "$domain_cert" 2>/dev/null; then
+                            doctor_fail "domain certificate expires in less than 7 days"
+                        else
+                            doctor_ok "domain certificate is valid"
+                        fi
+                    fi
+                fi
             else
                 doctor_fail "ACME certificate storage missing"
             fi
             ;;
         *) doctor_fail "invalid TLS mode: ${mode:-<empty>}" ;;
     esac
+
+    if check_cmd sysctl; then
+        local cc
+        cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+        if [ "$cc" = "bbr" ]; then
+            doctor_ok "TCP congestion control is BBR"
+        elif [ -n "$cc" ]; then
+            doctor_ok "TCP congestion control: ${cc}"
+        fi
+    fi
 
     if hub_enabled; then
         if check_cmd systemctl && systemctl is-active --quiet "$HUB_UNIT" 2>/dev/null; then
@@ -798,7 +843,10 @@ EOF
     else
         local cert_dir="${CADDY_DATA_DIR}/certificates"
         if [ -d "$cert_dir" ]; then
-            cert_file=$(find "$cert_dir" -name "*.crt" -type f 2>/dev/null | head -1)
+            cert_file=$(find_domain_certificate "${domain:-}" 2>/dev/null || true)
+            if [ -z "$cert_file" ]; then
+                cert_file=$(find "$cert_dir" -name "*.crt" -type f 2>/dev/null | head -1 || true)
+            fi
             if [ -n "$cert_file" ] && check_cmd openssl; then
                 expiry=$(openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | cut -d= -f2)
                 echo -e "  Cert   : ACME, expires $expiry"
@@ -835,7 +883,13 @@ EOF
         fi
         while IFS= read -r passwd || [ -n "$passwd" ]; do
             [ -n "$passwd" ] || continue
-            echo -e "  Link   : ${CYAN}$(build_share_link "$domain" "$passwd" "$transport" "$server_addr" "$server_port" "$link_name")${NC}"
+            local effective_name="$link_name"
+            if [ -z "$effective_name" ]; then
+                local u_rem
+                u_rem=$(get_user_remark "$passwd")
+                [ -z "$u_rem" ] || effective_name="${domain}-${u_rem}"
+            fi
+            echo -e "  Link   : ${CYAN}$(build_share_link "$domain" "$passwd" "$transport" "$server_addr" "$server_port" "$effective_name")${NC}"
         done < "$PASSWD_FILE"
         if [ -n "$server_addr" ]; then
             echo -e "  Tip    : Client address=${server_addr}:${server_port}, SNI/Host=${domain}, ALPN=http/1.1, WS path=/"
@@ -902,7 +956,13 @@ EOF
             continue
         fi
         found=1
-        build_share_link "$domain" "$passwd" "$transport" "$server_addr" "$server_port" "$link_name"
+        local effective_name="$link_name"
+        if [ -z "$effective_name" ]; then
+            local u_rem
+            u_rem=$(get_user_remark "$passwd")
+            [ -z "$u_rem" ] || effective_name="${domain}-${u_rem}"
+        fi
+        build_share_link "$domain" "$passwd" "$transport" "$server_addr" "$server_port" "$effective_name"
         printf '\n'
     done < "$PASSWD_FILE"
     [ "$found" -eq 1 ] || error "No matching password in passwd.txt"
@@ -1016,7 +1076,7 @@ do_user() {
 
     case "$sub" in
         add)
-            trojan_passwd="" remark=""
+            local trojan_passwd="" remark=""
             while [ "$#" -gt 0 ]; do
                 case "$1" in
                     --password)
@@ -1085,7 +1145,7 @@ do_user() {
             exit 0
             ;;
         del|delete|rm|remove)
-            trojan_passwd=""
+            local trojan_passwd=""
             while [ "$#" -gt 0 ]; do
                 case "$1" in
                     --password)
@@ -1134,7 +1194,7 @@ do_user() {
             ok "User deleted ($(mask_secret "$trojan_passwd"))"
             ;;
         remark|rename)
-            trojan_passwd="" remark=""
+            local trojan_passwd="" remark=""
             while [ "$#" -gt 0 ]; do
                 case "$1" in
                     --password)
@@ -1170,7 +1230,7 @@ EOF
             exit 0
             ;;
         *)
-            error "Unknown user subcommand: $sub (add|list|del)"
+            error "Unknown user subcommand: $sub (add|list|remark|del)"
             ;;
     esac
     exit 0

@@ -54,6 +54,8 @@ _nodes_cache_key: tuple | None = None
 _nodes_cache: list[dict] | None = None
 _sub_cache_key: tuple | None = None
 _sub_cache_body: bytes | None = None
+_sub_cache: dict[tuple[str | None, int | None], bytes] = {}
+MAX_SUB_CACHE_ENTRIES = 128
 MAX_BODY_BYTES = 64 * 1024
 # A full sync can legitimately be much larger than the ordinary mutation API.
 # Keep independent wire and expanded limits so gzip raises the practical batch
@@ -65,6 +67,7 @@ SYNC_REQUEST_SLOTS = threading.BoundedSemaphore(4)
 # Per-client token-bucket rate limiting (burst 60, refill 10 req/s).
 RATE_LIMIT_CAPACITY = 60
 RATE_LIMIT_REFILL_PER_SEC = 10.0
+RATE_LIMIT_MAX_BUCKETS = 10_000
 _RATE_LIMIT_LOCK = threading.Lock()
 _rate_limit_buckets: dict[str, tuple[float, float]] = {}  # ip -> (tokens, last_refill)
 _RATE_LIMIT_PRUNE_INTERVAL = 300.0
@@ -73,21 +76,50 @@ _last_prune_time = 0.0
 
 def _client_ip(handler: BaseHTTPRequestHandler) -> str:
     addr = getattr(handler, "client_address", None)
-    if isinstance(addr, tuple) and len(addr) >= 1:
-        return str(addr[0])
-    return 'unknown'
+    if not (isinstance(addr, tuple) and len(addr) >= 1):
+        return 'unknown'
+    raw_ip = str(addr[0])
+    if raw_ip in ("127.0.0.1", "::1", "localhost"):
+        headers = getattr(handler, "headers", None)
+        if headers:
+            cf_ip = headers.get("CF-Connecting-IP")
+            if cf_ip:
+                candidate = cf_ip.strip()
+                try:
+                    ipaddress.ip_address(candidate)
+                    return candidate
+                except ValueError:
+                    pass
+            xff = headers.get("X-Forwarded-For")
+            if xff:
+                candidate = xff.split(",")[0].strip()
+                try:
+                    ipaddress.ip_address(candidate)
+                    return candidate
+                except ValueError:
+                    pass
+    return raw_ip
+
+
+def _prune_rate_limit_buckets_unlocked(now: float, force: bool = False) -> None:
+    global _last_prune_time
+    if force or (now - _last_prune_time > _RATE_LIMIT_PRUNE_INTERVAL):
+        stale = [ip for ip, (_, ts) in _rate_limit_buckets.items() if now - ts > _RATE_LIMIT_PRUNE_INTERVAL]
+        for ip in stale:
+            del _rate_limit_buckets[ip]
+        if len(_rate_limit_buckets) >= RATE_LIMIT_MAX_BUCKETS:
+            excess = len(_rate_limit_buckets) - RATE_LIMIT_MAX_BUCKETS + 1
+            oldest = sorted(_rate_limit_buckets.keys(), key=lambda k: _rate_limit_buckets[k][1])[:excess]
+            for ip in oldest:
+                del _rate_limit_buckets[ip]
+        _last_prune_time = now
 
 
 def _rate_limit_check(client_ip: str) -> bool:
     """Token-bucket limiter; returns False when the client is over quota."""
-    global _last_prune_time
     now = time.monotonic()
     with _RATE_LIMIT_LOCK:
-        if now - _last_prune_time > _RATE_LIMIT_PRUNE_INTERVAL:
-            stale = [ip for ip, (_, ts) in _rate_limit_buckets.items() if now - ts > _RATE_LIMIT_PRUNE_INTERVAL]
-            for ip in stale:
-                del _rate_limit_buckets[ip]
-            _last_prune_time = now
+        _prune_rate_limit_buckets_unlocked(now, force=(len(_rate_limit_buckets) >= RATE_LIMIT_MAX_BUCKETS))
         tokens, last = _rate_limit_buckets.get(client_ip, (float(RATE_LIMIT_CAPACITY), now))
         elapsed = now - last
         tokens = min(float(RATE_LIMIT_CAPACITY), tokens + elapsed * RATE_LIMIT_REFILL_PER_SEC)
@@ -135,7 +167,7 @@ def _load_json(path: Path, default: Any) -> Any:
 
 
 def _save_json(path: Path, data: Any) -> None:
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.{secrets.token_hex(4)}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with tmp.open("w", encoding="utf-8") as f:
@@ -209,7 +241,7 @@ def _load_nodes_unlocked() -> list[dict]:
 
 
 def _save_nodes_unlocked(nodes: list[dict]) -> None:
-    global _nodes_cache_key, _nodes_cache
+    global _nodes_cache_key, _nodes_cache, _sub_cache_key, _sub_cache_body, _sub_cache
     if len(nodes) > MAX_NODES:
         raise DataStoreError(f"too many nodes: {len(nodes)}")
     for index, node in enumerate(nodes):
@@ -222,6 +254,9 @@ def _save_nodes_unlocked(nodes: list[dict]) -> None:
     # so reads after this see a fresh key and the next read is a cache hit).
     _nodes_cache = [dict(n) for n in nodes]
     _nodes_cache_key = _nodes_stat_key()
+    _sub_cache_key = None
+    _sub_cache_body = None
+    _sub_cache.clear()
 
 
 def ensure_config() -> dict:
@@ -590,19 +625,26 @@ def _encode_subscription(nodes: list[dict], server: str | None, port: int | None
 
 
 def subscription_body(server: str | None = None, port: int | None = None) -> bytes:
-    global _sub_cache_key, _sub_cache_body
-    # Only the unmodified (no ?server/?port rewrite) pull is cacheable; that is the
-    # common polling path. Override pulls render fresh.
-    if server is None and port is None:
-        with LOCK:
-            key = _nodes_stat_key()
-            if key is not None and key == _sub_cache_key and _sub_cache_body is not None:
-                return _sub_cache_body
-            body = _encode_subscription(_load_nodes_unlocked(), None, None)
-            _sub_cache_body = body
+    global _sub_cache_key, _sub_cache_body, _sub_cache
+    with LOCK:
+        key = _nodes_stat_key()
+        if key is None or key != _sub_cache_key:
+            _sub_cache.clear()
             _sub_cache_key = key
-            return body
-    return _encode_subscription(load_nodes(), server, port)
+            _sub_cache_body = None
+
+        cache_k = (server, port)
+        cached = _sub_cache.get(cache_k)
+        if cached is not None:
+            return cached
+
+        body = _encode_subscription(_load_nodes_unlocked(), server, port)
+        if len(_sub_cache) >= MAX_SUB_CACHE_ENTRIES:
+            _sub_cache.pop(next(iter(_sub_cache)))
+        _sub_cache[cache_k] = body
+        if server is None and port is None:
+            _sub_cache_body = body
+        return body
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -974,6 +1016,8 @@ class LimitedThreadingHTTPServer(ThreadingHTTPServer):
         def worker() -> None:
             try:
                 self.finish_request(request, client_address)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             except Exception:
                 self.handle_error(request, client_address)
             finally:

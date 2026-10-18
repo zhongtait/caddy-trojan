@@ -16,6 +16,10 @@ do_install() {
         error "Existing Caddy systemd unit detected. Refusing to overwrite it."
     fi
     prompt_password
+    if systemctl is-active --quiet caddy 2>/dev/null; then
+        info "Stopping existing Caddy service for reinstall..."
+        systemctl stop caddy
+    fi
     local check_port=""
     if check_cmd ss; then
         check_port=$(ss -Hlnp 'sport = :80 or sport = :443' 2>/dev/null | grep -v caddy || true)
@@ -23,12 +27,7 @@ do_install() {
         check_port=$(lsof -iTCP:80 -iTCP:443 -sTCP:LISTEN 2>/dev/null | grep -v caddy || true)
     fi
     if [ -n "${check_port}" ]; then
-        if systemctl is-active --quiet caddy 2>/dev/null; then
-            info "Stopping existing Caddy service for reinstall..."
-            systemctl stop caddy
-        else
-            error "Port 80 or 443 is already in use by another process:\n$check_port"
-        fi
+        error "Port 80 or 443 is already in use by another process:\n$check_port"
     fi
 
     prompt_domain
@@ -52,7 +51,7 @@ do_install() {
             [ "$ip" = "$address_ip" ] && { matched=1; break; }
         done <<< "$resolved_ips"
         if [ "$matched" != "1" ]; then
-            error "Domain '$site_domain' does not resolve to this server ($address_ip). Seen: $(printf '%s' "$resolved_ips" | tr '\n' ' ')"
+            error "Domain '$site_domain' does not resolve to this server ($address_ip). Seen: $(printf '%s' "$resolved_ips" | tr '\n' ' ')\n(If using Cloudflare CDN / proxy, pass --skip-domain-check)"
         fi
         info "Domain verified: $site_domain -> $address_ip"
     fi

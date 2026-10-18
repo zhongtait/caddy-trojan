@@ -35,6 +35,18 @@ write_camouflage_site() (
     local version="${IT_TOOLS_VERSION:-latest}" repo="${IT_TOOLS_REPO:-CorentinTh/it-tools}"
     local api_url asset_url="" asset_digest="" asset_meta="" tmp_dir zip_path tag extract_root
     local staged_site old_site expected_digest actual_digest configured_digest download_ok=0 attempt
+
+    # Fast path: skip download if an existing camouflage site matches the target version
+    if [ "${EASYTROJAN_FORCE_CAMOUFLAGE:-0}" != "1" ] \
+        && [ -f "${WWW_DIR}/index.html" ] && [ -f "${WWW_DIR}/.it-tools-source.txt" ]; then
+        local installed_tag
+        installed_tag=$(sed -n 's/^tag=//p' "${WWW_DIR}/.it-tools-source.txt" 2>/dev/null | head -1 || true)
+        if [ -n "$installed_tag" ] && { [ "$installed_tag" = "$version" ] || [ "$version" = "latest" ]; }; then
+            ok "Camouflage site IT-Tools (${installed_tag}) is already installed and up to date"
+            return 0
+        fi
+    fi
+
     tmp_dir=$(mktemp -d)
     trap 'rm -rf -- "${tmp_dir:-}"' EXIT
 
@@ -108,16 +120,24 @@ except Exception:
     fi
 
     zip_path="${tmp_dir}/it-tools.zip"
-    for attempt in 1 2 3; do
-        if curl -fsSL --connect-timeout 15 --max-time 300 -L \
-            -H "User-Agent: easytrojan" \
-            "$asset_url" -o "$zip_path"; then
-            download_ok=1
-            break
-        fi
-        warn "IT-Tools download attempt ${attempt}/3 failed"
-        [ "$attempt" -eq 3 ] || sleep $((attempt * 2))
-    done
+    local cache_dir="${EASYTROJAN_CACHE_DIR:-/var/cache/easytrojan}"
+    local cached_zip="${cache_dir}/it-tools-${tag:-$version}.zip"
+    if [ -f "$cached_zip" ]; then
+        info "Reusing cached IT-Tools archive: $cached_zip"
+        cp -f "$cached_zip" "$zip_path" 2>/dev/null && download_ok=1
+    fi
+    if [ "$download_ok" != "1" ]; then
+        for attempt in 1 2 3; do
+            if curl -fsSL --connect-timeout 15 --max-time 300 -L \
+                -H "User-Agent: easytrojan" \
+                "$asset_url" -o "$zip_path"; then
+                download_ok=1
+                break
+            fi
+            warn "IT-Tools download attempt ${attempt}/3 failed"
+            [ "$attempt" -eq 3 ] || sleep $((attempt * 2))
+        done
+    fi
     if [ "$download_ok" != "1" ]; then
         warn "Failed to download IT-Tools zip; using built-in fallback tools page"
         camouflage_fallback_or_keep
@@ -129,6 +149,7 @@ except Exception:
         actual_digest=$(sha256_file "$zip_path") || error "No SHA256 tool available for IT-Tools verification"
         if [ "$actual_digest" != "$expected_digest" ]; then
             warn "IT-Tools SHA256 mismatch; refusing the downloaded archive"
+            [ -f "$cached_zip" ] && rm -f "$cached_zip" 2>/dev/null || true
             camouflage_fallback_or_keep
             trap - EXIT
             rm -rf "$tmp_dir"
@@ -141,8 +162,13 @@ except Exception:
     if ! unzip -Z1 "$zip_path" > "${tmp_dir}/entries.txt" 2>/dev/null \
         || ! zip_entries_are_safe "${tmp_dir}/entries.txt"; then
         warn "IT-Tools archive contains unsafe paths"
+        [ -f "$cached_zip" ] && rm -f "$cached_zip" 2>/dev/null || true
         camouflage_fallback_or_keep
         return 0  # The subshell EXIT trap removes tmp_dir
+    fi
+
+    if [ -d "$cache_dir" ] || mkdir -p "$cache_dir" 2>/dev/null; then
+        cp -f "$zip_path" "$cached_zip" 2>/dev/null || true
     fi
 
     mkdir -p "${tmp_dir}/extract"
