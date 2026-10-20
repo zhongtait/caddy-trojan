@@ -13,6 +13,7 @@ Usage:
   bash easytrojan.sh renew [--force]
   bash easytrojan.sh status [--show-link] [--server ADDR] [--port PORT] [--name NAME]
   bash easytrojan.sh doctor [--network]
+  bash easytrojan.sh tune-system
   bash easytrojan.sh traffic [--key HASH] [--password PASS] [--ip CLIENT_IP] [--target HOST:PORT] [--top N] [--sort total|up|down|target|client|ip] [--show-password] [--flat] [--json]
   bash easytrojan.sh traffic reset --yes [--key HASH]
   bash easytrojan.sh link [--server ADDR] [--port PORT] [--password PASSWORD] [--name NAME]
@@ -630,10 +631,10 @@ build_share_link() {
     if [ "$transport" = "ws" ]; then
         # Address may be CF anycast IP; SNI + WS Host must remain the real domain.
         # WebSocket Upgrade is HTTP/1.1; h2-first ALPN causes intermittent handshake failures.
-        printf 'trojan://%s@%s:%s?security=tls&sni=%s&alpn=http%%2F1.1&type=ws&host=%s&path=%%2F#%s' \
+        printf 'trojan://%s@%s:%s?security=tls&sni=%s&alpn=http%%2F1.1&type=ws&host=%s&path=%%2F&udp=1&fp=chrome&allowInsecure=0#%s' \
             "$encoded" "$addr" "$port" "$domain" "$domain" "$display_name"
     else
-        printf 'trojan://%s@%s:%s?security=tls&sni=%s&alpn=http%%2F1.1&type=tcp#%s' \
+        printf 'trojan://%s@%s:%s?security=tls&sni=%s&alpn=http%%2F1.1&type=tcp&udp=1&fp=chrome&allowInsecure=0#%s' \
             "$encoded" "$addr" "$port" "$domain" "$display_name"
     fi
 }

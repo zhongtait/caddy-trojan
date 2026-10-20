@@ -11,6 +11,7 @@
 #   bash easytrojan.sh renew [--force]
 #   bash easytrojan.sh status [--show-link] [--server ADDR] [--port PORT] [--name NAME]
 #   bash easytrojan.sh doctor [--network]
+#   bash easytrojan.sh tune-system
 #   bash easytrojan.sh traffic [--key HASH] [--password PASS] [--ip CLIENT_IP] [--target HOST:PORT] [--top N] [--sort total|up|down|target|client|ip] [--show-password] [--flat] [--json]
 #   bash easytrojan.sh link [--server ADDR] [--port PORT] [--password PASS] [--name NAME]
 #   bash easytrojan.sh cert {auto|origin|status} ...
@@ -449,6 +450,10 @@ case "$cmd" in
     doctor)
         shift
         do_doctor "$@"
+        ;;
+    tune-system)
+        shift
+        do_tune_system "$@"
         ;;
     traffic)
         shift

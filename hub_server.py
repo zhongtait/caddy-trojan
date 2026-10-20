@@ -609,9 +609,9 @@ def build_link(node: dict, server: str | None = None, port: int | None = None) -
     if transport == "ws":
         return (
             f"trojan://{user}@{authority_addr}:{p}"
-            f"?security=tls&sni={qe(sni)}&alpn={qe(alpn)}&type=ws&host={qe(host)}&path={qe(path)}#{frag}"
+            f"?security=tls&sni={qe(sni)}&alpn={qe(alpn)}&type=ws&host={qe(host)}&path={qe(path)}&udp=1&fp=chrome&allowInsecure=0#{frag}"
         )
-    return f"trojan://{user}@{authority_addr}:{p}?security=tls&sni={qe(sni)}&alpn={qe(alpn)}&type=tcp#{frag}"
+    return f"trojan://{user}@{authority_addr}:{p}?security=tls&sni={qe(sni)}&alpn={qe(alpn)}&type=tcp&udp=1&fp=chrome&allowInsecure=0#{frag}"
 
 
 def _encode_subscription(nodes: list[dict], server: str | None, port: int | None) -> bytes:

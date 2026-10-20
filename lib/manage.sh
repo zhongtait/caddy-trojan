@@ -159,7 +159,7 @@ do_traffic() (
         [ "$reset_yes" -eq 1 ] || error "Traffic reset is destructive; pass --yes"
         local reset_url="${ADMIN_API}/trojan/traffic" reset_args=()
         [ -z "$reset_key" ] || reset_args+=(--data-urlencode "key=${reset_key}")
-        curl -fsS --get -X DELETE --connect-timeout 2 --max-time 10 \
+        curl -fsS --get -X DELETE --connect-timeout 2 --max-time 60 \
             ${reset_args[@]+"${reset_args[@]}"} "$reset_url" >/dev/null \
             || error "Traffic reset API unavailable. Update/restart Caddy, then retry"
         ok "Traffic statistics reset${reset_key:+ for ${reset_key}}"
@@ -1234,4 +1234,23 @@ EOF
             ;;
     esac
     exit 0
+}
+
+do_tune_system() {
+    require_root
+    info "Applying high-BDP network tuning..."
+    enable_bbr || true
+    if ! apply_sysctl_limits; then
+        warn "Sysctl limits could not be fully applied or verified"
+        return 1
+    fi
+    if check_cmd tc && check_cmd ip; then
+        local default_iface
+        default_iface=$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
+        if [ -n "$default_iface" ]; then
+            tc qdisc replace dev "$default_iface" root fq 2>/dev/null && ok "Active interface (${default_iface}) qdisc updated to fq" || true
+        fi
+    fi
+    ok "System network tuning applied successfully"
+    doctor_network
 }

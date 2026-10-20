@@ -256,6 +256,9 @@ class HubStateTests(unittest.TestCase):
         link = hub.build_link(node)
         self.assertIn("type=tcp", link)
         self.assertNotIn("type=ws", link)
+        self.assertIn("udp=1", link)
+        self.assertIn("fp=chrome", link)
+        self.assertIn("allowInsecure=0", link)
 
         # IPv6 connect address must be bracketed in the authority.
         v6 = hub.build_link(node, server="2606:4700:4700::1111", port=2053)
