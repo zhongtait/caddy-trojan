@@ -99,7 +99,7 @@ cosign verify-blob \
 sha256sum -c SHA256SUMS
 ```
 
-Release tag 同时包含上游插件 SHA 与本仓库已测试源码 SHA，并显式指向该源码提交。
+Release 说明中同时包含上游插件 SHA 与本仓库已测试源码 SHA，且 tag 显式指向该源码提交。
 构建产物在只读权限 job 中执行和打包，OIDC 签名 job 无仓库写权限，发布 job 无
 OIDC 权限且禁止覆盖已有 tag 的资产。
 

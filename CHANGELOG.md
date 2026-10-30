@@ -45,7 +45,7 @@
 - 伪装站：改为部署 [CorentinTh/it-tools](https://github.com/CorentinTh/it-tools) 静态包，下载失败时回退内置 ByteDeck 工具页；Caddyfile 对站点使用 SPA `try_files` 回退 `/index.html`。
 - Caddy：Caddyfile 明确限制 Admin API 监听 `127.0.0.1:2019`。
 - 系统：sysctl / limits 优化范围收敛，便于卸载回滚。
-- 发布：Release tag 简化为纯净版本号（如 v2.11.7），支持覆盖更新同一版本的 Release 资产。
+- 发布：Release tag 简化为纯净版本号（如 v2.11.7），遵循发布资产不可篡改策略（immutable）。
 - 界面：`status` 默认隐藏分享链接，需 `--show-link`。
 - 界面：install / status 显示客户端 ALPN 为 `http/1.1` only（而非 h2）。
 - 界面：将预期内的防火墙与固定资源完整性提示改为信息级消息，warning 仅保留给真正的失败。
