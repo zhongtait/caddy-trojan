@@ -133,7 +133,7 @@ sudo bash easytrojan.sh install \
 # 固定 Caddy-Trojan Release
 sudo bash easytrojan.sh install \
   --domain example.com \
-  --version 'v2.11.3+trojan.932ef9b'
+  --version 'v2.11.7'
 
 # 指定 IT-Tools 版本
 sudo IT_TOOLS_VERSION=v2024.10.22-7ca5933 \
@@ -500,7 +500,7 @@ Origin 模式需要有效且匹配的证书和私钥。可重新运行 `cert ori
 sudo easytrojan update
 
 # 更新到指定 Release
-sudo easytrojan update --version 'v2.11.3+trojan.932ef9b'
+sudo easytrojan update --version 'v2.11.7'
 ```
 
 Release 同时提供 `SHA256SUMS` 与 `SHA256SUMS.sigstore.json`。安装/更新会固定

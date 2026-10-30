@@ -43,7 +43,7 @@ Examples:
   bash easytrojan.sh install --domain example.com --tls-mode origin \
        --origin-cert /root/origin.pem --origin-key /root/origin.key --skip-domain-check
   bash easytrojan.sh cert origin --cert /root/origin.pem --key /root/origin.key
-  bash easytrojan.sh update --version v2.11.3+trojan.932ef9b
+  bash easytrojan.sh update --version v2.11.7
   bash easytrojan.sh status
   bash easytrojan.sh status --show-link
   bash easytrojan.sh status --show-link --server 104.16.1.1

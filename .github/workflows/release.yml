@@ -11,6 +11,10 @@ on:
         description: 'Exact caddy-trojan repository commit to release'
         required: false
         type: string
+      tag_name:
+        description: 'Release tag to publish (default: Caddy version, e.g. v2.11.7)'
+        required: false
+        type: string
       gate_only:
         description: 'Run all build/test gates without signing or publishing'
         required: false
@@ -24,6 +28,10 @@ on:
         type: string
       source_ref:
         description: 'Exact caddy-trojan repository commit to release'
+        required: false
+        type: string
+      tag_name:
+        description: 'Release tag to publish (default: Caddy version, e.g. v2.11.7)'
         required: false
         type: string
       gate_only:
@@ -225,6 +233,7 @@ jobs:
         id: meta
         env:
           REQUESTED_SOURCE: ${{ needs.resolve.outputs.source_sha }}
+          REQUESTED_TAG: ${{ inputs.tag_name || '' }}
           UPSTREAM_SHA: ${{ needs.resolve.outputs.upstream_sha }}
           GATE_ONLY: ${{ inputs.gate_only || false }}
           CADDY_VERSION: ${{ needs.version.outputs.version }}
@@ -273,9 +282,7 @@ jobs:
             exit 1
           fi
 
-          UPSTREAM_SHORT=$(printf '%s' "$UPSTREAM_SHA" | cut -c1-12)
-          SOURCE_SHORT=$(printf '%s' "$SOURCE_SHA" | cut -c1-12)
-          TAG="${VERSION}+trojan.${UPSTREAM_SHORT}.et.${SOURCE_SHORT}"
+          TAG="${REQUESTED_TAG:-$VERSION}"
           if [ "$GATE_ONLY" != "true" ]; then
             [ "$GITHUB_REF" = "refs/heads/main" ] || {
               echo "Release signing/publishing is only allowed from refs/heads/main" >&2
@@ -362,7 +369,7 @@ jobs:
           retention-days: 7
 
   publish:
-    name: Publish immutable GitHub Release
+    name: Publish GitHub Release
     if: ${{ inputs.gate_only != true }}
     needs: [metadata, sign]
     runs-on: ubuntu-latest
@@ -375,7 +382,7 @@ jobs:
           name: signed-release-assets-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts
 
-      - name: Create immutable Release
+      - name: Create or update Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228
         with:
           body: |
