@@ -150,6 +150,7 @@ jobs:
           name: caddy_trojan_${{ matrix.os }}_${{ matrix.arch }}
           path: caddy_trojan_${{ matrix.os }}_${{ matrix.arch }}.tar.gz
           if-no-files-found: error
+          retention-days: 7
 
   validate:
     name: Release validation gate

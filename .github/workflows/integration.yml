@@ -54,6 +54,10 @@ on:
       - 'scripts/integration_linux.sh'
       - '.github/workflows/integration.yml'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.source_ref || '' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -134,8 +138,14 @@ jobs:
       - name: Install integration dependencies
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq curl iproute2 openssl shellcheck
+          missing=()
+          for tool in curl ip openssl shellcheck; do
+            command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq "${missing[@]}"
+          fi
 
       - name: Check integration script
         run: shellcheck --severity=warning scripts/integration_linux.sh

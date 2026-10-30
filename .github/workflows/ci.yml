@@ -34,6 +34,10 @@ on:
         required: false
         type: string
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.source_ref || '' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -56,15 +60,12 @@ jobs:
           resolved_source=$(git rev-parse --verify --end-of-options "$REQUESTED_SOURCE^{commit}")
           git checkout --detach "$resolved_source"
 
-      - uses: actions/setup-go@v6
-        with:
-          go-version: '1.26.x'
-          cache: false
-
-      - name: Run actionlint v1.7.12
+      - name: Install and run actionlint v1.7.12
         run: |
           set -euo pipefail
-          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          curl -sSLO "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz"
+          sudo tar -xzf actionlint_1.7.12_linux_amd64.tar.gz -C /usr/local/bin actionlint
+          rm -f actionlint_1.7.12_linux_amd64.tar.gz
           actionlint
 
   validate:
@@ -97,8 +98,14 @@ jobs:
       - name: Install tools
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq curl ca-certificates shellcheck
+          missing=()
+          for tool in curl shellcheck; do
+            command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq "${missing[@]}"
+          fi
           python -m pip install --disable-pip-version-check --no-input 'coverage==7.4.4'
 
       - name: Run validation

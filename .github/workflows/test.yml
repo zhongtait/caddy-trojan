@@ -100,10 +100,10 @@ jobs:
             exit 1
           }
           printf '%s\n' "$REMOTE_SHA" > sha
-          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
+          git config --local user.email "zhongtaitest@hotmail.com"
+          git config --local user.name "zhongtait"
           git add sha
-          git commit -m "chore: update upstream sha to $(printf '%s' "$REMOTE_SHA" | cut -c1-7)"
+          git commit -m "chore(deps): update upstream sha to $(printf '%s' "$REMOTE_SHA" | cut -c1-7)"
           git push origin HEAD:refs/heads/main
           echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
