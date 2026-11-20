@@ -70,11 +70,17 @@ jobs:
 
   validate:
     name: scripts + hub (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.8', '3.12', '3.13']
+        include:
+          - python-version: '3.8'
+            runner: ubuntu-22.04
+          - python-version: '3.12'
+            runner: ubuntu-latest
+          - python-version: '3.13'
+            runner: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
         with:

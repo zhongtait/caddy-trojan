@@ -55,6 +55,8 @@
 
 ### 修复
 
+- CI：Python 3.8 验证固定到仍提供该版本的 Ubuntu runner，避免 `ubuntu-latest` 升级后导致安装失败。
+- 自动构建：每日同时比较最新 Release 所记录的插件 SHA/Caddy 版本与上游；Caddy 更新用纯版本 tag，插件单独更新用唯一构建后缀，构建或发布失败时基准不前移，定时任务可重试。
 - Hub：新注册节点限制为 Trojan over WebSocket 并固定订阅 ALPN 为 `http/1.1`；历史 TCP 节点继续可管理但不再发布成不可用的 `type=tcp` 链接。
 - 测试：cgroup v1 内存夹具沿用实际的 `memory.limit_in_bytes` 文件名，正确覆盖无限制哨兵判断。
 - 安全：入口引导不再在 GitHub commit API 不可用时执行可变的 `main` 分支归档；仓库与 Release 模块包拒绝符号链接条目。

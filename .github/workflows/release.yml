@@ -7,6 +7,10 @@ on:
         description: 'Upstream imgk/caddy-trojan commit to build'
         required: false
         type: string
+      caddy_version:
+        description: 'Exact Caddy version to build (default: xcaddy latest)'
+        required: false
+        type: string
       source_ref:
         description: 'Exact caddy-trojan repository commit to release'
         required: false
@@ -24,6 +28,10 @@ on:
     inputs:
       upstream_sha:
         description: 'Upstream imgk/caddy-trojan commit to build'
+        required: false
+        type: string
+      caddy_version:
+        description: 'Exact Caddy version to build (default: xcaddy latest)'
         required: false
         type: string
       source_ref:
@@ -55,6 +63,7 @@ jobs:
     outputs:
       source_sha: ${{ steps.resolve.outputs.source_sha }}
       upstream_sha: ${{ steps.resolve.outputs.upstream_sha }}
+      caddy_version: ${{ steps.resolve.outputs.caddy_version }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -66,6 +75,7 @@ jobs:
         env:
           REQUESTED_SOURCE: ${{ inputs.source_ref || github.sha }}
           REQUESTED_UPSTREAM: ${{ inputs.upstream_sha || '' }}
+          REQUESTED_CADDY_VERSION: ${{ inputs.caddy_version || '' }}
           GATE_ONLY: ${{ inputs.gate_only || false }}
         run: |
           set -euo pipefail
@@ -85,8 +95,14 @@ jobs:
             echo "::error::Invalid upstream SHA: ${UPSTREAM_SHA:-<empty>}" >&2
             exit 1
           fi
+          CADDY_VERSION="${REQUESTED_CADDY_VERSION:-}"
+          if [ -n "$CADDY_VERSION" ] && ! printf '%s' "$CADDY_VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::Invalid Caddy version: ${CADDY_VERSION}" >&2
+            exit 1
+          fi
           echo "source_sha=${SOURCE_SHA}" >> "$GITHUB_OUTPUT"
           echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
+          echo "caddy_version=${CADDY_VERSION}" >> "$GITHUB_OUTPUT"
 
   build-caddy-trojan:
     needs: resolve
@@ -126,6 +142,7 @@ jobs:
           CGO_ENABLED: '0'
           GOTOOLCHAIN: 'auto'
           UPSTREAM_SHA: ${{ needs.resolve.outputs.upstream_sha }}
+          CADDY_VERSION: ${{ needs.resolve.outputs.caddy_version }}
         run: |
           set -euo pipefail
           mkdir -p output
@@ -135,12 +152,16 @@ jobs:
             echo "Invalid upstream SHA: ${UPSTREAM_SHA:-<empty>}" >&2
             exit 1
           fi
-          echo "Building imgk/caddy-trojan at ${UPSTREAM_SHA} with outbound IP-family support"
+          echo "Building Caddy ${CADDY_VERSION:-latest} with imgk/caddy-trojan at ${UPSTREAM_SHA} and outbound IP-family support"
           git clone --filter=blob:none https://github.com/imgk/caddy-trojan.git caddy-trojan
           git -C caddy-trojan checkout --detach "${UPSTREAM_SHA}"
           git -C caddy-trojan apply ../../patches/caddy-trojan-outbound-ip.patch
           git -C caddy-trojan diff --check
-          xcaddy build --with "github.com/imgk/caddy-trojan=./caddy-trojan"
+          if [ -n "${CADDY_VERSION:-}" ]; then
+            xcaddy build "$CADDY_VERSION" --with "github.com/imgk/caddy-trojan=./caddy-trojan"
+          else
+            xcaddy build --with "github.com/imgk/caddy-trojan=./caddy-trojan"
+          fi
           FILENAME="caddy_trojan_${{ matrix.os }}_${{ matrix.arch }}.tar.gz"
           tar -czf "../${FILENAME}" caddy
 
@@ -170,7 +191,7 @@ jobs:
 
   version:
     name: Inspect Caddy version in isolation
-    needs: build-caddy-trojan
+    needs: [resolve, build-caddy-trojan]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -185,6 +206,8 @@ jobs:
 
       - name: Validate archive and read version
         id: version
+        env:
+          EXPECTED_CADDY_VERSION: ${{ needs.resolve.outputs.caddy_version }}
         run: |
           set -euo pipefail
           archive=artifact/caddy_trojan_linux_amd64.tar.gz
@@ -202,6 +225,10 @@ jobs:
           VERSION=$("${RUNNER_TEMP}/caddy" version | awk '{print $1}')
           if ! printf '%s' "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
             echo "Unexpected Caddy version: ${VERSION:-<empty>}" >&2
+            exit 1
+          fi
+          if [ -n "${EXPECTED_CADDY_VERSION:-}" ] && [ "$VERSION" != "$EXPECTED_CADDY_VERSION" ]; then
+            echo "Built Caddy ${VERSION}, expected ${EXPECTED_CADDY_VERSION}" >&2
             exit 1
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
@@ -284,6 +311,10 @@ jobs:
           fi
 
           TAG="${REQUESTED_TAG:-$VERSION}"
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "Invalid release tag: ${TAG:-<empty>}" >&2
+            exit 1
+          fi
           if [ "$GATE_ONLY" != "true" ]; then
             [ "$GITHUB_REF" = "refs/heads/main" ] || {
               echo "Release signing/publishing is only allowed from refs/heads/main" >&2

@@ -134,7 +134,25 @@ grep -F 'overwrite_files: false' .github/workflows/release.yml >/dev/null \
 grep -Eq 'uses: softprops/action-gh-release@[0-9a-f]{40}$' .github/workflows/release.yml \
     || fail "High-privilege Release action is not pinned to a commit"
 grep -F 'needs: [check, gate]' .github/workflows/test.yml >/dev/null \
-    || fail "Upstream SHA can be committed before candidate gates pass"
+    || fail "Automatic publish does not wait for candidate gates"
+grep -F 'REMOTE_CADDY_VERSION=$(curl -sf' .github/workflows/test.yml >/dev/null \
+    || fail "Scheduled update does not check Caddy release tags"
+grep -F 'repos/${GITHUB_REPOSITORY}/releases/latest' .github/workflows/test.yml >/dev/null \
+    || fail "Scheduled update does not use published release metadata as its baseline"
+grep -F 'caddy_version: ${{ needs.check.outputs.remote_caddy_version }}' .github/workflows/test.yml >/dev/null \
+    || fail "Scheduled update does not pass the checked Caddy version to the release gate"
+grep -F 'tag_name: ${{ needs.check.outputs.release_tag }}' .github/workflows/test.yml >/dev/null \
+    || fail "Scheduled update does not use its Caddy-aware release tag"
+grep -F 'RELEASE_TAG="${LOCAL_CADDY_VERSION}-build.${REMOTE_SHA:0:12}"' .github/workflows/test.yml >/dev/null \
+    || fail "Plugin-only updates do not receive a unique immutable build tag"
+grep -F "needs.publish.result == 'success'" .github/workflows/test.yml >/dev/null \
+    || fail "Upstream tracking SHA can advance before a successful release"
+grep -F 'EXPECTED_CADDY_VERSION:' .github/workflows/release.yml >/dev/null \
+    || fail "Release build does not verify its Caddy version against the checked version"
+grep -F 'xcaddy build "$CADDY_VERSION"' .github/workflows/release.yml >/dev/null \
+    || fail "Release build does not pin xcaddy to the checked Caddy version"
+grep -F 'runner: ubuntu-22.04' .github/workflows/ci.yml >/dev/null \
+    || fail "Python 3.8 CI is not pinned to a compatible runner image"
 if awk '/^  publish:/{in_publish=1} in_publish {print}' .github/workflows/release.yml \
     | grep -Eq 'id-token:[[:space:]]*write|/caddy.*version'; then
     fail "Publish job has OIDC permission or executes the upstream Caddy binary"
