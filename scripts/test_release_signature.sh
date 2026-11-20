@@ -133,8 +133,12 @@ grep -F 'overwrite_files: false' .github/workflows/release.yml >/dev/null \
     || fail "Release assets are still allowed to overwrite an existing tag"
 grep -Eq 'uses: softprops/action-gh-release@[0-9a-f]{40}$' .github/workflows/release.yml \
     || fail "High-privilege Release action is not pinned to a commit"
-grep -F 'needs: [check, gate]' .github/workflows/test.yml >/dev/null \
-    || fail "Automatic publish does not wait for candidate gates"
+[ "$(grep -Fc 'uses: ./.github/workflows/release.yml' .github/workflows/test.yml)" -eq 1 ] \
+    || fail "Scheduled update must build and publish in a single release workflow call"
+grep -F 'needs: [validate, integration, metadata]' .github/workflows/release.yml >/dev/null \
+    || fail "Signing does not wait for candidate gates"
+grep -F 'needs: [metadata, sign]' .github/workflows/release.yml >/dev/null \
+    || fail "Publishing does not wait for signing"
 grep -F 'REMOTE_CADDY_VERSION=$(curl -sf' .github/workflows/test.yml >/dev/null \
     || fail "Scheduled update does not check Caddy release tags"
 grep -F 'repos/${GITHUB_REPOSITORY}/releases/latest' .github/workflows/test.yml >/dev/null \

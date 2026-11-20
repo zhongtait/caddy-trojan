@@ -33,7 +33,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Check upstream SHA
+      - name: Check upstream plugin and Caddy release
         id: check
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -66,9 +66,8 @@ jobs:
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest")
           LOCAL_RELEASE_TAG=$(printf '%s' "$CURRENT_RELEASE_JSON" | jq -r '.tag_name')
           LOCAL_SHA=$(printf '%s' "$CURRENT_RELEASE_JSON" \
-            | jq -r '.body // ""' \
-            | sed -nE 's/^- Upstream plugin SHA: `([0-9a-fA-F]{40})`$/\1/p' \
-            | head -n 1)
+            | jq -r 'first((.body // "") | split("\n")[]
+                | capture("^- Upstream plugin SHA: \u0060(?<sha>[0-9a-fA-F]{40})\u0060").sha) // ""')
           if ! printf '%s' "$LOCAL_RELEASE_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-build\.[0-9a-fA-F]{12})?$'; then
             echo "Invalid latest release tag: ${LOCAL_RELEASE_TAG:-<empty>}" >&2
             exit 1
@@ -105,30 +104,10 @@ jobs:
             fi
           } >> "$GITHUB_OUTPUT"
 
-  gate:
+  publish:
     needs: check
     if: needs.check.outputs.updated == 'true'
     permissions:
-      # release.yml is validated as a whole, including its publish job, even
-      # when gate_only skips publication at runtime.
-      contents: write
-      # release.yml declares an OIDC signing job even when gate_only skips it;
-      # the caller must grant this permission for workflow validation to pass.
-      id-token: write
-    uses: ./.github/workflows/release.yml
-    with:
-      upstream_sha: ${{ needs.check.outputs.remote_sha }}
-      caddy_version: ${{ needs.check.outputs.remote_caddy_version }}
-      tag_name: ${{ needs.check.outputs.release_tag }}
-      source_ref: ${{ github.sha }}
-      gate_only: true
-
-  publish:
-    needs: [check, gate]
-    if: >-
-      always() && needs.check.outputs.updated == 'true' &&
-      needs.gate.result == 'success'
-    permissions:
       contents: write
       id-token: write
     uses: ./.github/workflows/release.yml
@@ -137,8 +116,6 @@ jobs:
       caddy_version: ${{ needs.check.outputs.remote_caddy_version }}
       tag_name: ${{ needs.check.outputs.release_tag }}
       source_ref: ${{ github.sha }}
-      gate_only: false
-    secrets: inherit
 
   record-state:
     needs: [check, publish]

@@ -100,9 +100,11 @@ jobs:
             echo "::error::Invalid Caddy version: ${CADDY_VERSION}" >&2
             exit 1
           fi
-          echo "source_sha=${SOURCE_SHA}" >> "$GITHUB_OUTPUT"
-          echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
-          echo "caddy_version=${CADDY_VERSION}" >> "$GITHUB_OUTPUT"
+          {
+            echo "source_sha=${SOURCE_SHA}"
+            echo "upstream_sha=${UPSTREAM_SHA}"
+            echo "caddy_version=${CADDY_VERSION}"
+          } >> "$GITHUB_OUTPUT"
 
   build-caddy-trojan:
     needs: resolve

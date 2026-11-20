@@ -140,9 +140,8 @@ normalize_server_address() {
     if contains_control_chars "$addr"; then
         return 1
     fi
-    if [[ "$addr" == \[*\] ]]; then
-        addr=${addr#[}
-        addr=${addr%]}
+    if [ "${addr:0:1}" = "[" ] && [ "${addr:${#addr}-1:1}" = "]" ]; then
+        addr="${addr:1:${#addr}-2}"
     fi
     if is_ipv4 "$addr" || is_ipv6 "$addr"; then
         printf '%s' "$addr"
