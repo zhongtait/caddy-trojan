@@ -19,7 +19,7 @@
 - Release 资源先通过 Sigstore/cosign 身份校验，再通过 `SHA256SUMS` 校验
 - Caddy Admin API 仅监听 `127.0.0.1:2019`
 - 内核支持时默认启用 BBR + fq；高 BDP / 高建连速率的额外 sysctl 调优可用 `--tune-system` 开启
-- 小内存 VPS 自动为 Caddy 设置软内存上限（`GOMEMLIMIT ≈ 75% 内存`）作为 OOM 兜底
+- Caddy 的软内存上限 `GOMEMLIMIT` 按宿主机与 cgroup 内存限制中的较小值推导（约 75%）
 
 ## 开始之前
 
@@ -345,6 +345,10 @@ https://hub.example.com/sub/<sub_token>?server=104.16.1.1&port=443
 但不会修改各节点的 SNI 和 Host。这与 `hub join --server/--port` 的单节点默认值
 不同。
 
+Hub 订阅按本项目的 Trojan over WebSocket 入口生成节点（ALPN 为 `http/1.1`）。
+新注册节点只接受 `transport=ws`；历史数据中的 TCP 节点会保留在 Hub 管理数据中，
+但不会出现在订阅里，避免生成当前 Caddy 配置无法接收的 `type=tcp` 链接。
+
 ### Hub 运维
 
 ```bash
@@ -391,7 +395,8 @@ Hub 相关数据：
   `fq` 队列调度。默认不修改 `tcp_notsent_lowat`、`tcp_slow_start_after_idle` 等
   依赖具体负载的全局参数，避免在高 RTT 或高连接数场景引入额外唤醒和突发流量。
   配置写入 `/etc/sysctl.d/99-easytrojan-bbr.conf`。
-- **软内存上限（小内存 VPS）**：Caddy 服务按约 75% 物理内存设置 `GOMEMLIMIT` 作为
+- **软内存上限**：Caddy 服务按约 75% 的有效内存设置 `GOMEMLIMIT`；有效内存取宿主机
+  物理内存与 cgroup v1/v2 限额中的较小值，避免容器内按宿主机总内存设限。`GOMEMLIMIT` 是
   OOM 兜底。正常单客户负载不会触发；异常或内存泄漏时由 Go GC 更积极回收，避免小内存
   机器被 OOM 杀掉。内存无法探测或过小时自动跳过。
 - **内存鉴权缓存（持久化）**：Trojan 使用 `memory caddy` 混合后端，连接鉴权和流量
@@ -400,8 +405,8 @@ Hub 相关数据：
   用户记录。Caddyfile 校验使用一次性隔离 storage，不会以 root 身份改写运行目录。真实
   systemd 集成测试会并发添加用户，并验证它们在 Caddy 进程重启后仍能恢复。
 - **自适应吞吐与协议栈调优（可选）**：通过 `sudo easytrojan tune-system`（或安装时指定 `--tune-system`）
-  根据机器物理内存（RAM）和跨境代理 BDP 动态推导最优缓冲区（单 socket 缓冲上限自动按 `RAM/32` 封顶，
-  全局 `tcp_mem` 严格按内存预算约束），彻底杜绝小内存 VPS 在高并发下因内核 TCP 缓冲过大导致的 OOM，
+  根据机器物理内存（RAM）和代理链路 BDP 推导目标缓冲区；仅当当前值低于目标时才提高 socket 缓冲上限与 `tcp_mem`，
+  不会降低系统已有的更大值，因此这些目标不是内存硬上限，也不能保证避免 OOM。
   自动将活跃网卡队列更新为 `fq`，并优化 `tcp_slow_start_after_idle`、`tcp_mtu_probing`、`tcp_tw_reuse`
   等代理链路参数。参数会在 Caddy 启动前应用并逐项回读校验，写入 `/etc/sysctl.d/99-caddy-trojan.conf`。
 - **分享链接优化**：生成的 `trojan://` 节点链接默认包含 `&udp=1&fp=chrome&allowInsecure=0`，

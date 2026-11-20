@@ -14,6 +14,70 @@ _easytrojan_detect_ram_kib() {
     fi
 }
 
+_easytrojan_detect_cgroup_limit_kib_hierarchical() {
+    local path current_path file value limit_kb min_kb=""
+    local -a files=()
+
+    if [ -n "${EASYTROJAN_CGROUP_V2_MEMORY_MAX_FILE:-}" ]; then
+        files+=("$EASYTROJAN_CGROUP_V2_MEMORY_MAX_FILE")
+    else
+        path=$(awk -F: '$1 == 0 { print $3; exit }' /proc/self/cgroup 2>/dev/null || true)
+        current_path="$path"
+        while [ -n "$current_path" ]; do
+            files+=("/sys/fs/cgroup$current_path/memory.max")
+            [ "$current_path" != "/" ] || break
+            current_path=$(dirname "$current_path")
+            [ "$current_path" != "." ] || current_path="/"
+        done
+        files+=(/sys/fs/cgroup/memory.max)
+    fi
+    if [ -n "${EASYTROJAN_CGROUP_V1_MEMORY_LIMIT_FILE:-}" ]; then
+        files+=("$EASYTROJAN_CGROUP_V1_MEMORY_LIMIT_FILE")
+    else
+        path=$(awk -F: '$2 ~ /(^|,)memory(,|$)/ { print $3; exit }' /proc/self/cgroup 2>/dev/null || true)
+        current_path="$path"
+        while [ -n "$current_path" ]; do
+            files+=("/sys/fs/cgroup/memory$current_path/memory.limit_in_bytes")
+            [ "$current_path" != "/" ] || break
+            current_path=$(dirname "$current_path")
+            [ "$current_path" != "." ] || current_path="/"
+        done
+        files+=(/sys/fs/cgroup/memory/memory.limit_in_bytes)
+    fi
+    if [ "$#" -gt 0 ]; then
+        files=("$@")
+    fi
+
+    for file in "${files[@]}"; do
+        [ -r "$file" ] || continue
+        value=$(tr -d '[:space:]' < "$file" 2>/dev/null || true)
+        [[ "$value" =~ ^[0-9]+$ ]] || continue # cgroup v2 uses "max" for unlimited.
+        [ "$value" -gt 0 ] 2>/dev/null || continue
+        if [[ "$file" == */memory.limit_in_bytes ]] && [ "$value" -ge 1152921504606846976 ] 2>/dev/null; then
+            continue # cgroup v1's unlimited sentinel.
+        fi
+        limit_kb=$((value / 1024))
+        if [ -z "$min_kb" ] || [ "$limit_kb" -lt "$min_kb" ]; then
+            min_kb=$limit_kb
+        fi
+    done
+    [ -n "$min_kb" ] && printf '%s' "$min_kb"
+    return 0
+}
+
+_easytrojan_detect_effective_ram_kib() {
+    local mem_kb cgroup_kb
+    # Explicit input is reserved for deterministic host-RAM unit tests.
+    mem_kb=$(_easytrojan_detect_ram_kib "${1:-}")
+    if [ -z "${1:-}" ]; then
+        cgroup_kb=$(_easytrojan_detect_cgroup_limit_kib_hierarchical)
+        if [ -n "$cgroup_kb" ] && { [ -z "$mem_kb" ] || [ "$cgroup_kb" -lt "$mem_kb" ]; }; then
+            mem_kb=$cgroup_kb
+        fi
+    fi
+    printf '%s' "$mem_kb"
+}
+
 _easytrojan_calc_tcp_mem() {
     local mem_kb="${1:-0}"
     awk -v m="$mem_kb" 'BEGIN{
@@ -506,12 +570,13 @@ doctor_network() {
     fi
 }
 
-# Echo a soft GOMEMLIMIT value in MiB (~75% of RAM), or nothing when RAM is
-# undetectable or tiny (<170MB total). Optional arg overrides MemTotal (kB) for tests.
+# Echo a soft GOMEMLIMIT value in MiB (~75% of effective RAM), or nothing when
+# RAM is undetectable or tiny (<170MB total). Effective RAM is capped by cgroups.
+# Optional arg overrides MemTotal (kB) for deterministic tests.
 # shellcheck disable=SC2120  # optional arg is exercised by tests, not this module
 derive_gomemlimit_mib() {
     local mem_kb
-    mem_kb=$(_easytrojan_detect_ram_kib "${1:-}")
+    mem_kb=$(_easytrojan_detect_effective_ram_kib "${1:-}")
     [ -n "$mem_kb" ] || return 0
     local limit_mib=$(( mem_kb * 3 / 4 / 1024 ))
     [ "$limit_mib" -ge 128 ] || return 0
@@ -519,7 +584,7 @@ derive_gomemlimit_mib() {
 }
 
 write_caddy_unit() {
-    # Soft memory cap (~75% of RAM) as an OOM guard for small VPS. GOMEMLIMIT is a
+    # Soft memory cap (~75% of effective RAM, including cgroup limits) as an OOM guard. GOMEMLIMIT is a
     # soft target: normal single-client load never nears it, but a leak/spike makes
     # Go's GC reclaim harder instead of the box OOM-killing Caddy. Omitted if RAM
     # is undetectable or tiny.

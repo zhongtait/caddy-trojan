@@ -105,6 +105,7 @@ class HubStateTests(unittest.TestCase):
         invalid_payloads = [
             1,
             {"domain": "example.com", "password": "pw", "path": "relative", "transport": "udp"},
+            {"domain": "example.com", "password": "pw", "transport": "tcp"},
             {"domain": "example.com", "password": "pw", "alpn": "bad space"},
             {"domain": "example.com", "password": "pw", "enabled": 1},
             {"domain": "example.com", "password": "pw", "id": "bad id"},
@@ -191,17 +192,70 @@ class HubStateTests(unittest.TestCase):
         node = hub.upsert_node(
             {
                 "domain": "example.com", "password": "pw", "name": "n",
-                "transport": "tcp", "alpn": "h2",
+                "transport": "ws", "alpn": "h2,http/1.1",
             }
         )
         self.assertEqual(hub.subscription_body(), hub.subscription_body())
-        self.assertIn("alpn=h2", hub.build_link(node))
+        self.assertIn("alpn=http%2F1.1", hub.build_link(node))
+        self.assertIn("type=ws", hub.build_link(node))
         self.assertIn("@example.com:443", hub.build_link(node, port=443))
         self.assertIn(
             "path=%2Frelative",
             hub.build_link({**node, "transport": "ws", "path": "relative"}),
         )
         self.assertEqual(b"", hub._encode_subscription([{**node, "enabled": False}], None, None))
+
+    def test_legacy_tcp_node_is_not_published(self):
+        hub.ensure_config()
+        websocket_node = hub.upsert_node({
+            "domain": "ws.example.com", "password": "ws-pass", "name": "ws",
+        })
+        legacy_node = {
+            "id": "legacy-tcp", "name": "legacy", "domain": "example.com",
+            "password": "pw", "server": "example.com", "port": 443,
+            "sni": "example.com", "host": "example.com", "path": "/",
+            "transport": "tcp", "alpn": "h2", "enabled": True,
+        }
+        # Loading mixed legacy data must preserve management access and keep
+        # working WS nodes in the subscription, including the cached response.
+        hub.NODES_FILE.write_text(
+            json.dumps({"nodes": [websocket_node, legacy_node]}), encoding="utf-8"
+        )
+        self.assertEqual([websocket_node, legacy_node], hub.load_nodes())
+        self.assertEqual("", hub.build_link(legacy_node))
+        self.assertEqual(b"", hub._encode_subscription([legacy_node], None, None))
+        expected = (hub.build_link(websocket_node) + "\n").encode()
+        for _ in range(2):
+            self.assertEqual(expected, base64.b64decode(hub.subscription_body()))
+        renamed = hub.rename_node(legacy_node["id"], "legacy-renamed")
+        self.assertEqual("tcp", renamed["transport"])
+        self.assertEqual(expected, base64.b64decode(hub.subscription_body()))
+        self.assertTrue(hub.delete_node(legacy_node["id"]))
+        self.assertEqual([websocket_node], hub.load_nodes())
+
+    def test_tcp_registration_and_sync_leave_existing_nodes_unchanged(self):
+        hub.ensure_config()
+        node = hub.upsert_node({"domain": "example.com", "password": "pw"})
+        legacy_node = {**node, "transport": "tcp"}
+        hub.save_nodes([legacy_node])
+        with self.assertRaisesRegex(ValueError, "transport must be ws"):
+            hub.upsert_node(legacy_node)
+        self.assertEqual([legacy_node], hub.load_nodes())
+        with self.assertRaisesRegex(ValueError, "transport must be ws"):
+            hub.sync_domain_nodes({
+                "domain": "example.com", "server": "example.com",
+                "nodes": [{**node, "password": "new-pass"}, legacy_node],
+            })
+        self.assertEqual([legacy_node], hub.load_nodes())
+        self.assertEqual(b"", hub.subscription_body())
+
+        # Re-registering the legacy identity as WS restores it without changing
+        # its stable id or leaving the cached empty subscription behind.
+        upgraded = hub.upsert_node({k: v for k, v in node.items() if k != "id"})
+        self.assertEqual(node["id"], upgraded["id"])
+        self.assertEqual("ws", upgraded["transport"])
+        expected = (hub.build_link(upgraded) + "\n").encode()
+        self.assertEqual(expected, base64.b64decode(hub.subscription_body()))
 
     def test_invalid_node_field_fails_closed(self):
         hub.ensure_config()
@@ -246,16 +300,16 @@ class HubStateTests(unittest.TestCase):
         with self.assertRaises(hub.DataStoreError):
             hub.save_nodes([])
 
-    def test_build_link_tcp_and_ipv6_and_overrides(self):
+    def test_build_link_websocket_and_ipv6_and_overrides(self):
         node = {
             "domain": "example.com",
             "password": "secret-pass",
             "name": "n1",
-            "transport": "tcp",
+            "transport": "ws",
         }
         link = hub.build_link(node)
-        self.assertIn("type=tcp", link)
-        self.assertNotIn("type=ws", link)
+        self.assertIn("type=ws", link)
+        self.assertIn("alpn=http%2F1.1", link)
         self.assertIn("udp=1", link)
         self.assertIn("fp=chrome", link)
         self.assertIn("allowInsecure=0", link)
@@ -429,6 +483,19 @@ class HubStateTests(unittest.TestCase):
 
 
 class HubHandlerTests(unittest.TestCase):
+    def test_send_header_suppresses_backend_version_banner(self):
+        handler = object.__new__(hub.Handler)
+        handler._headers_buffer = []
+        handler.request_version = "HTTP/1.1"
+
+        handler.send_header("Server", "EasyTrojanHub/1.0 Python/3.14")
+        handler.send_header("Content-Type", "application/json")
+
+        self.assertEqual(
+            [b"Content-Type: application/json\r\n"],
+            handler._headers_buffer,
+        )
+
     @staticmethod
     def make_reader(body=b"{}", **headers):
         handler = object.__new__(hub.Handler)
@@ -702,6 +769,7 @@ class HubHTTPTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual(0, health["nodes"])
         self.assertIn("no-store", headers["cache-control"])
+        self.assertNotIn("server", headers)
 
         status, body, headers = self.request("HEAD", "/")
         self.assertEqual(200, status)

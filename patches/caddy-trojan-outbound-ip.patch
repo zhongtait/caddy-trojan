@@ -1250,8 +1250,8 @@ index 69d4de2..8888957 100644
 +		if target == "" {
 +			return false
 +		}
-+		targetsMu.Lock()
-+		defer targetsMu.Unlock()
++		// Callers hold targetsMu across admission and byte accounting.
++		// This keeps the per-packet critical section to one lock acquisition.
 +		if _, ok := targets[target]; ok {
 +			return true
 +		}
@@ -1265,13 +1265,13 @@ index 69d4de2..8888957 100644
 +		if target == "" {
 +			return
 +		}
-+		targetsMu.Lock()
++		// Caller holds targetsMu.
 +		traffic := targets[target]
 +		traffic.Target = target
 +		traffic.Up += up
 +		traffic.Down += down
 +		targets[target] = traffic
-+		targetsMu.Unlock()
++		// Keep this helper lock-free; callers protect the shared map.
 +	}
  
  	type Result struct {
@@ -1286,17 +1286,20 @@ index 69d4de2..8888957 100644
  			}
  
  			if _, er := io.ReadFull(r, b[l:l+4]); er != nil {
-@@ -76,6 +126,9 @@ func HandleUDP(r io.Reader, w io.Writer, timeout time.Duration, d Dialer) (int64
+@@ -76,6 +126,12 @@ func HandleUDP(r io.Reader, w io.Writer, timeout time.Duration, d Dialer) (int64
  
  			l += (int(b[l])<<8 | int(b[l+1]))
  			nr += int64(l) + 4
-+			if targetAllowed(raddr.String()) {
-+				addTraffic(raddr.String(), int64(l)+4, 0)
++			target := raddr.String()
++			targetsMu.Lock()
++			if targetAllowed(target) {
++				addTraffic(target, int64(l)+4, 0)
 +			}
++			targetsMu.Unlock()
  
  			buf := b[raddr.Len():l]
  			if _, er := io.ReadFull(r, buf); er != nil {
-@@ -128,6 +181,15 @@ func HandleUDP(r io.Reader, w io.Writer, timeout time.Duration, d Dialer) (int64
+@@ -128,6 +184,15 @@ func HandleUDP(r io.Reader, w io.Writer, timeout time.Duration, d Dialer) (int64
  				}
  			}(b[:socks.MaxAddrLen], addr.(*net.UDPAddr))
  			nw += 4 + int64(n) + l
@@ -1305,14 +1308,14 @@ index 69d4de2..8888957 100644
 +			if original, ok := resolvedTargets[target]; ok {
 +				target = original
 +			}
-+			targetsMu.Unlock()
 +			if targetAllowed(target) {
 +				addTraffic(target, 0, 4+int64(n)+l)
 +			}
++			targetsMu.Unlock()
  
  			if _, ew := w.Write(b[socks.MaxAddrLen-l : socks.MaxAddrLen+4+n]); ew != nil {
  				err = ew
-@@ -144,5 +206,11 @@ func HandleUDP(r io.Reader, w io.Writer, timeout time.Duration, d Dialer) (int64
+@@ -144,5 +209,11 @@ func HandleUDP(r io.Reader, w io.Writer, timeout time.Duration, d Dialer) (int64
  		return r.Num, nw, err
  	}(rc, w, errCh, timeout)
  

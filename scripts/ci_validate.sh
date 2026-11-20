@@ -823,7 +823,37 @@ gml_zero=$(bash -c '. lib/system.sh; derive_gomemlimit_mib 0')
 [ -z "$gml_zero" ] || fail "expected empty GOMEMLIMIT for undetectable RAM, got '${gml_zero}'"
 gml_tiny=$(bash -c '. lib/system.sh; derive_gomemlimit_mib 65536')
 [ -z "$gml_tiny" ] || fail "expected empty GOMEMLIMIT for tiny RAM, got '${gml_tiny}'"
-pass "GOMEMLIMIT derivation: ~75% RAM, skips undetectable/tiny hosts"
+gml_fixture_dir=$(mktemp -d)
+mkdir -p "${gml_fixture_dir}/v1"
+gml_cgroup_v1_file="${gml_fixture_dir}/v1/memory.limit_in_bytes"
+trap 'rm -rf "$gml_fixture_dir"' EXIT
+printf '%s\n' 1073741824 > "$gml_fixture_dir/v2-memory.max"
+printf '%s\n' 9223372036854771712 > "$gml_cgroup_v1_file"
+gml_cgroup_kb=$(bash -c '. lib/system.sh; _easytrojan_detect_cgroup_limit_kib_hierarchical "$1" "$2"' _ \
+  "$gml_fixture_dir/v2-memory.max" "$gml_cgroup_v1_file")
+[ "$gml_cgroup_kb" = "1048576" ] || fail "expected cgroup v2 cap 1048576 KiB, got '${gml_cgroup_kb}'"
+gml_cgroup_v2=$(EASYTROJAN_MEM_TOTAL_KB=2097152 \
+  EASYTROJAN_CGROUP_V2_MEMORY_MAX_FILE="$gml_fixture_dir/v2-memory.max" \
+  EASYTROJAN_CGROUP_V1_MEMORY_LIMIT_FILE="$gml_cgroup_v1_file" \
+  bash -c '. lib/system.sh; derive_gomemlimit_mib')
+[ "$gml_cgroup_v2" = "768" ] || fail "expected 768 MiB GOMEMLIMIT under 1 GiB cgroup v2 cap, got '${gml_cgroup_v2}'"
+printf '%s\n' max > "$gml_fixture_dir/v2-memory.max"
+printf '%s\n' 536870912 > "$gml_cgroup_v1_file"
+gml_unlimited=$(bash -c '. lib/system.sh; _easytrojan_detect_cgroup_limit_kib_hierarchical "$1" "$2"' _ \
+  "$gml_fixture_dir/v2-memory.max" "$gml_cgroup_v1_file")
+[ "$gml_unlimited" = "524288" ] || fail "expected cgroup v1 cap 524288 KiB, got '${gml_unlimited}'"
+gml_cgroup_v1=$(EASYTROJAN_MEM_TOTAL_KB=2097152 \
+  EASYTROJAN_CGROUP_V2_MEMORY_MAX_FILE="$gml_fixture_dir/v2-memory.max" \
+  EASYTROJAN_CGROUP_V1_MEMORY_LIMIT_FILE="$gml_cgroup_v1_file" \
+  bash -c '. lib/system.sh; derive_gomemlimit_mib')
+[ "$gml_cgroup_v1" = "384" ] || fail "expected 384 MiB GOMEMLIMIT under 512 MiB cgroup v1 cap, got '${gml_cgroup_v1}'"
+printf '%s\n' 9223372036854771712 > "$gml_cgroup_v1_file"
+gml_unlimited=$(bash -c '. lib/system.sh; _easytrojan_detect_cgroup_limit_kib_hierarchical "$1" "$2"' _ \
+  "$gml_fixture_dir/v2-memory.max" "$gml_cgroup_v1_file")
+[ -z "$gml_unlimited" ] || fail "expected empty cap for unlimited cgroups, got '${gml_unlimited}'"
+rm -rf "$gml_fixture_dir"
+trap - EXIT
+pass "GOMEMLIMIT derivation: ~75% effective RAM, cgroup v1/v2 limits and unlimited sentinels"
 
 info "read-only network doctor"
 network_doctor_output=$(bash -c '

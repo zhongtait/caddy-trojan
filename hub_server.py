@@ -10,6 +10,7 @@ Register (nodes):
   POST /api/register
   Header: X-Hub-Token: <register_token>
   Body JSON: {"name","domain","password","server"?,"port"?,"sni"?,"host"?,"path"?,"transport"?,"alpn"?,"enabled"?}
+  Only transport="ws" is accepted (default).
 
 Unregister:
   POST /api/unregister
@@ -392,6 +393,8 @@ def _validate_node(node: Any) -> None:
     _host(node.get("host"), "host", domain)
     _text(node.get("path"), "path", "/", MAX_PATH_LENGTH)
     transport = _text(node.get("transport"), "transport", "ws", 16).lower()
+    # Accept persisted TCP records so an upgrade preserves management access;
+    # registration only accepts WS, and build_link excludes legacy TCP records.
     if transport not in ("ws", "tcp"):
         raise ValueError("transport must be ws or tcp")
     alpn = _text(node.get("alpn"), "alpn", "http/1.1", 128)
@@ -418,8 +421,8 @@ def _node_from_payload(payload: dict) -> dict:
     if not path.startswith("/"):
         path = "/" + path
     transport = _text(payload.get("transport"), "transport", "ws", 16).lower()
-    if transport not in ("ws", "tcp"):
-        raise ValueError("transport must be ws or tcp")
+    if transport != "ws":
+        raise ValueError("transport must be ws; this server exposes Trojan over WebSocket")
     alpn = _text(payload.get("alpn"), "alpn", "http/1.1", 128)
     if any(not re.fullmatch(r"[A-Za-z0-9._/-]+", item.strip()) for item in alpn.split(",")):
         raise ValueError("invalid alpn")
@@ -598,20 +601,17 @@ def build_link(node: dict, server: str | None = None, port: int | None = None) -
     if not path.startswith("/"):
         path = "/" + path
     transport = (node.get("transport") or "ws").lower()
+    # Older Hub data may still contain raw-TCP nodes. This Caddy deployment
+    # exposes Trojan through its HTTP/WebSocket handler, so never publish a
+    # link that the configured listener cannot accept.
+    if transport != "ws":
+        return ""
     user = qe(password)
     frag = qe(name)
-    alpn_raw = str(node.get("alpn") or "http/1.1").strip() or "http/1.1"
-    parts = [x.strip() for x in alpn_raw.split(",") if x.strip()]
-    if transport == "ws" or "http/1.1" in parts:
-        alpn = "http/1.1"
-    else:
-        alpn = parts[0] if parts else "http/1.1"
-    if transport == "ws":
-        return (
-            f"trojan://{user}@{authority_addr}:{p}"
-            f"?security=tls&sni={qe(sni)}&alpn={qe(alpn)}&type=ws&host={qe(host)}&path={qe(path)}&udp=1&fp=chrome&allowInsecure=0#{frag}"
-        )
-    return f"trojan://{user}@{authority_addr}:{p}?security=tls&sni={qe(sni)}&alpn={qe(alpn)}&type=tcp&udp=1&fp=chrome&allowInsecure=0#{frag}"
+    return (
+        f"trojan://{user}@{authority_addr}:{p}"
+        f"?security=tls&sni={qe(sni)}&alpn=http%2F1.1&type=ws&host={qe(host)}&path={qe(path)}&udp=1&fp=chrome&allowInsecure=0#{frag}"
+    )
 
 
 def _encode_subscription(nodes: list[dict], server: str | None, port: int | None) -> bytes:
@@ -653,6 +653,14 @@ class Handler(BaseHTTPRequestHandler):
     # keep-alive), cutting per-pull TCP/thread setup. All responses set
     # Content-Length; write verbs force-close to avoid any unread-body desync.
     protocol_version = "HTTP/1.1"
+
+    def send_header(self, keyword: str, value: str) -> None:  # noqa: N802
+        # BaseHTTPRequestHandler adds a versioned Server header by default.
+        # The hub is behind Caddy, so exposing its Python implementation adds
+        # no useful client information and makes the backend needlessly distinct.
+        if keyword.lower() == "server":
+            return
+        super().send_header(keyword, value)
 
     def log_request(self, code: Any = "-", size: Any = "-") -> None:  # noqa: N802
         # Access logs stay out of the journal; errors still reach it via log_error().

@@ -11,7 +11,7 @@
 - 系统：默认网络配置收敛为 `fq` + BBR，不再全局设置依赖具体负载的 `tcp_slow_start_after_idle` 与 `tcp_notsent_lowat`。
 - 系统：`--tune-system` 升级为按主机物理内存（RAM）和跨境代理 BDP 动态推导缓冲区，设置 `RAM/32` 单 socket 封顶与 `tcp_mem` 严格预算硬顶，并补齐 `tcp_slow_start_after_idle`、`tcp_mtu_probing`、`tcp_tw_reuse`、`tcp_fin_timeout` 等代理向协议栈参数；在 Caddy 创建 listener 前应用并逐项回读验证。
 - 系统：`doctor --network` 只读诊断增强，支持展示系统物理内存、自适应缓冲目标及 `tcp_mem` 等网络状态。
-- 系统：为 Caddy 服务设置软内存上限 `GOMEMLIMIT`（约 75% 内存），作为小内存 VPS 的 OOM 兜底；内存无法探测或过小时自动跳过。
+- 系统：为 Caddy 服务设置软内存上限 `GOMEMLIMIT`（约 75% 有效内存），同时考虑 cgroup v1/v2 的层级限额；内存无法探测或过小时自动跳过。
 - 系统：安装时在内核支持的情况下启用并持久化 `fq` + BBR；更广泛的 sysctl / limits 调优保持可选。
 - Hub：节点聚合 Hub `easytrojan hub enable|disable|status|url|token|list|remove|join`。
 - Hub：本地 Python 服务 `hub_server.py`（`127.0.0.1:2099`），经 Caddy 反代 `/sub/*`、`/api/*`。
@@ -55,6 +55,8 @@
 
 ### 修复
 
+- Hub：新注册节点限制为 Trojan over WebSocket 并固定订阅 ALPN 为 `http/1.1`；历史 TCP 节点继续可管理但不再发布成不可用的 `type=tcp` 链接。
+- 测试：cgroup v1 内存夹具沿用实际的 `memory.limit_in_bytes` 文件名，正确覆盖无限制哨兵判断。
 - 安全：入口引导不再在 GitHub commit API 不可用时执行可变的 `main` 分支归档；仓库与 Release 模块包拒绝符号链接条目。
 - 安全：拒绝含控制字符的 Trojan 密码与 Hub 显示名，分享链接服务器地址增加 IPv4/IPv6/域名校验并正确括起 IPv6。
 - 可靠性：ACME 就绪检查限定为当前域名证书；Caddy 下载临时目录在失败路径也会清理；控制面 HTTP 请求增加超时。
