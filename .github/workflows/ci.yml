@@ -11,6 +11,7 @@ on:
       - 'lib/**'
       - 'scripts/**'
       - '.github/workflows/**'
+      - 'VERSION'
   pull_request:
     branches: [main]
     paths:
@@ -21,6 +22,7 @@ on:
       - 'lib/**'
       - 'scripts/**'
       - '.github/workflows/**'
+      - 'VERSION'
   workflow_dispatch:
     inputs:
       source_ref:

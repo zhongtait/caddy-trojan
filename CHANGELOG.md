@@ -25,6 +25,7 @@
 - 命令行：`status --server ADDR` / `link --server ADDR` 让分享链接支持 Cloudflare 优选 IP（SNI / Host 仍为域名）；`status` / `link` 支持 `--port`。
 - 命令行：安装后写入 `/usr/local/bin/easytrojan` 管理入口；域名持久化到 `/etc/caddy/trojan/domain.txt`。
 - 发布：支持 release 包 SHA256 校验；GitHub Actions release 增加 `SHA256SUMS`。
+- 发布：项目版本独立于 Caddy 与 caddy-trojan 依赖，由根目录 `VERSION` 管理；Release 说明记录两项依赖的精确版本与插件提交。
 - 文档：新增 `SECURITY.md`。
 - CI：将 `shellcheck`（warning 级）接入 `scripts/ci_validate.sh` 与 GitHub Actions，新增 `.shellcheckrc`。
 - CI：新增 `scripts/ci_validate.sh` 与 GitHub Actions CI Validate（shell 语法、模块清单、Hub 冒烟测试；不安装节点）。

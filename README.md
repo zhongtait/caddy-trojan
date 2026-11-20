@@ -518,6 +518,19 @@ sudo env EASYTROJAN_ALLOW_UNSIGNED_RELEASE=1 \
   easytrojan update --version '<legacy-release-tag>'
 ```
 
+### 项目版本与构建依赖
+
+项目版本独立于 Caddy 和 `caddy-trojan`，由仓库根目录的 `VERSION` 文件设定；Release
+tag 使用 `v<VERSION>`。当前版本线从 `v2.12.0` 开始，此前版本沿用了 Caddy 版本号。
+
+检测到 Caddy 或 `caddy-trojan` 更新时，自动发布使用 `VERSION` 中的项目版本。发布成功后，
+CI 会将 `VERSION` 自动推进一个补丁号；要发布项目自身的次版本或主版本时，先修改
+`VERSION`，再手动运行 `Build Caddy-Trojan`。
+
+每个新 Release 说明都会分别列出项目版本、Caddy 版本和 `caddy-trojan` 插件版本与完整
+提交 SHA。插件版本显示为最近上游 tag 加其后的提交数，确保未打 tag 的提交也能准确识别；
+历史构建若未记录依赖提交，则会明确标为未记录。
+
 手动验证 manifest：
 
 ```bash

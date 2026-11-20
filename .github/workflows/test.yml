@@ -27,7 +27,7 @@ jobs:
       caddy_updated: ${{ steps.check.outputs.caddy_updated }}
       remote_sha: ${{ steps.check.outputs.remote_sha }}
       remote_caddy_version: ${{ steps.check.outputs.remote_caddy_version }}
-      release_tag: ${{ steps.check.outputs.release_tag }}
+      latest_release_tag: ${{ steps.check.outputs.latest_release_tag }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -65,26 +65,32 @@ jobs:
             -H "User-Agent: Caddy-Trojan-CI" \
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest")
           LOCAL_RELEASE_TAG=$(printf '%s' "$CURRENT_RELEASE_JSON" | jq -r '.tag_name')
+          LOCAL_CADDY_VERSION=$(printf '%s' "$CURRENT_RELEASE_JSON" \
+            | jq -r 'first((.body // "") | split("\n")[]
+                | try capture("^- Caddy version: \u0060(?<version>v[0-9]+[.][0-9]+[.][0-9]+)\u0060").version catch empty) // ""')
           LOCAL_SHA=$(printf '%s' "$CURRENT_RELEASE_JSON" \
             | jq -r 'first((.body // "") | split("\n")[]
-                | capture("^- Upstream plugin SHA: \u0060(?<sha>[0-9a-fA-F]{40})\u0060").sha) // ""')
+                | try capture("^- Upstream plugin SHA: \u0060(?<sha>[0-9a-fA-F]{40})\u0060").sha catch empty) // ""')
           if ! printf '%s' "$LOCAL_RELEASE_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-build\.[0-9a-fA-F]{12})?$'; then
             echo "Invalid latest release tag: ${LOCAL_RELEASE_TAG:-<empty>}" >&2
             exit 1
           fi
-          LOCAL_CADDY_VERSION="${LOCAL_RELEASE_TAG%%-build.*}"
+          if ! printf '%s' "$LOCAL_CADDY_VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            # Historical releases used the Caddy version as their tag.
+            LOCAL_CADDY_VERSION="${LOCAL_RELEASE_TAG%%-build.*}"
+          fi
+          if ! printf '%s' "$LOCAL_CADDY_VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Latest release does not record a valid Caddy version" >&2
+            exit 1
+          fi
           if ! printf '%s' "$LOCAL_SHA" | grep -Eq '^[0-9a-fA-F]{40}$'; then
             echo "Latest release does not contain a valid upstream plugin SHA" >&2
             exit 1
           fi
-          RELEASE_TAG="$REMOTE_CADDY_VERSION"
-          if [ "$REMOTE_CADDY_VERSION" = "$LOCAL_CADDY_VERSION" ] && [ "$REMOTE_SHA" != "$LOCAL_SHA" ]; then
-            RELEASE_TAG="${LOCAL_CADDY_VERSION}-build.${REMOTE_SHA:0:12}"
-          fi
           {
             echo "remote_sha=${REMOTE_SHA}"
             echo "remote_caddy_version=${REMOTE_CADDY_VERSION}"
-            echo "release_tag=${RELEASE_TAG}"
+            echo "latest_release_tag=${LOCAL_RELEASE_TAG}"
             if [ "$REMOTE_SHA" != "$LOCAL_SHA" ]; then
               echo "upstream_updated=true"
             else
@@ -104,8 +110,55 @@ jobs:
             fi
           } >> "$GITHUB_OUTPUT"
 
-  publish:
+  bump_version:
     needs: check
+    if: needs.check.outputs.updated == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      source_sha: ${{ steps.bump.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Advance project patch version for dependency update
+        id: bump
+        env:
+          LATEST_RELEASE_TAG: ${{ needs.check.outputs.latest_release_tag }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          git checkout -B main origin/main
+          PROJECT_VERSION=$(tr -d '[:space:]' < VERSION)
+          if ! printf '%s' "$PROJECT_VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+            echo "Invalid project VERSION: ${PROJECT_VERSION:-<empty>}" >&2
+            exit 1
+          fi
+          LATEST_VERSION="${LATEST_RELEASE_TAG#v}"
+          if [ "v${PROJECT_VERSION}" = "$LATEST_RELEASE_TAG" ]; then
+            IFS=. read -r major minor patch <<< "$PROJECT_VERSION"
+            PROJECT_VERSION="${major}.${minor}.$((patch + 1))"
+            printf '%s\n' "$PROJECT_VERSION" > VERSION
+            git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git config --local user.name "github-actions[bot]"
+            git add VERSION
+            git commit -m "chore(release): prepare v${PROJECT_VERSION}"
+            git push origin HEAD:refs/heads/main
+          elif [ "$(printf '%s\n%s\n' "$LATEST_VERSION" "$PROJECT_VERSION" | sort -V | tail -n 1)" != "$PROJECT_VERSION" ]; then
+            echo "VERSION ${PROJECT_VERSION} must be newer than latest release ${LATEST_RELEASE_TAG}" >&2
+            exit 1
+          fi
+          SOURCE_SHA=$(git rev-parse HEAD)
+          {
+            echo "project_version=${PROJECT_VERSION}"
+            echo "source_sha=${SOURCE_SHA}"
+          } >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: [check, bump_version]
     if: needs.check.outputs.updated == 'true'
     permissions:
       contents: write
@@ -114,8 +167,7 @@ jobs:
     with:
       upstream_sha: ${{ needs.check.outputs.remote_sha }}
       caddy_version: ${{ needs.check.outputs.remote_caddy_version }}
-      tag_name: ${{ needs.check.outputs.release_tag }}
-      source_ref: ${{ github.sha }}
+      source_ref: ${{ needs.bump_version.outputs.source_sha }}
 
   record-state:
     needs: [check, publish]

@@ -143,12 +143,24 @@ grep -F 'REMOTE_CADDY_VERSION=$(curl -sf' .github/workflows/test.yml >/dev/null 
     || fail "Scheduled update does not check Caddy release tags"
 grep -F 'repos/${GITHUB_REPOSITORY}/releases/latest' .github/workflows/test.yml >/dev/null \
     || fail "Scheduled update does not use published release metadata as its baseline"
+grep -F 'capture("^- Caddy version:' .github/workflows/test.yml >/dev/null \
+    || fail "Scheduled update does not compare the published Caddy dependency version"
 grep -F 'caddy_version: ${{ needs.check.outputs.remote_caddy_version }}' .github/workflows/test.yml >/dev/null \
     || fail "Scheduled update does not pass the checked Caddy version to the release gate"
-grep -F 'tag_name: ${{ needs.check.outputs.release_tag }}' .github/workflows/test.yml >/dev/null \
-    || fail "Scheduled update does not use its Caddy-aware release tag"
-grep -F 'RELEASE_TAG="${LOCAL_CADDY_VERSION}-build.${REMOTE_SHA:0:12}"' .github/workflows/test.yml >/dev/null \
-    || fail "Plugin-only updates do not receive a unique immutable build tag"
+grep -F 'chore(release): prepare v${PROJECT_VERSION}' .github/workflows/test.yml >/dev/null \
+    || fail "Dependency updates do not advance the project-owned version"
+grep -F 'PROJECT_VERSION=$(tr -d' .github/workflows/release.yml >/dev/null \
+    || fail "Release tag is not derived from the project VERSION file"
+grep -F 'caddy-trojan plugin version:' .github/workflows/release.yml >/dev/null \
+    || fail "Release notes do not record the caddy-trojan plugin version"
+grep -F 'Caddy version:' .github/workflows/release.yml >/dev/null \
+    || fail "Release notes do not record the Caddy version"
+grep -F 'needs: [metadata, publish]' .github/workflows/release.yml >/dev/null \
+    || fail "Project VERSION is advanced before a successful release"
+grep -F 'Increment VERSION after successful publication' .github/workflows/release.yml >/dev/null \
+    || fail "The next project patch version is not prepared after publishing"
+grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' VERSION \
+    || fail "The project-owned release version is missing or invalid"
 grep -F "needs.publish.result == 'success'" .github/workflows/test.yml >/dev/null \
     || fail "Upstream tracking SHA can advance before a successful release"
 grep -F 'EXPECTED_CADDY_VERSION:' .github/workflows/release.yml >/dev/null \
