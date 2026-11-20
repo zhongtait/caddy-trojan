@@ -28,6 +28,7 @@ jobs:
       remote_sha: ${{ steps.check.outputs.remote_sha }}
       remote_caddy_version: ${{ steps.check.outputs.remote_caddy_version }}
       latest_release_tag: ${{ steps.check.outputs.latest_release_tag }}
+      state_sync_required: ${{ steps.check.outputs.state_sync_required }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -87,10 +88,17 @@ jobs:
             echo "Latest release does not contain a valid upstream plugin SHA" >&2
             exit 1
           fi
+          TRACKED_SHA=$(tr -d '[:space:]' < sha)
           {
             echo "remote_sha=${REMOTE_SHA}"
             echo "remote_caddy_version=${REMOTE_CADDY_VERSION}"
             echo "latest_release_tag=${LOCAL_RELEASE_TAG}"
+            if [ "$TRACKED_SHA" = "$LOCAL_SHA" ]; then
+              echo "state_sync_required=false"
+            else
+              echo "state_sync_required=true"
+              echo "Tracked upstream SHA differs from the latest Release; state will be reconciled" >&2
+            fi
             if [ "$REMOTE_SHA" != "$LOCAL_SHA" ]; then
               echo "upstream_updated=true"
             else
@@ -172,8 +180,11 @@ jobs:
   record-state:
     needs: [check, publish]
     if: >-
-      always() && needs.check.outputs.updated == 'true' &&
-      needs.publish.result == 'success'
+      always() && needs.check.result == 'success' &&
+      (
+        (needs.check.outputs.updated == 'true' && needs.publish.result == 'success') ||
+        (needs.check.outputs.updated == 'false' && needs.check.outputs.state_sync_required == 'true')
+      )
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -184,20 +195,31 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - name: Record successfully published upstream SHA
+      - name: Reconcile tracked upstream SHA with latest Release
         env:
-          REMOTE_SHA: ${{ needs.check.outputs.remote_sha }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           git fetch --no-tags origin main
           git checkout -B main origin/main
-          printf '%s\n' "$REMOTE_SHA" > sha
+          RELEASE_JSON=$(curl -sf \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "User-Agent: Caddy-Trojan-CI" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest")
+          RELEASE_SHA=$(printf '%s' "$RELEASE_JSON" | jq -r 'first((.body // "") | split("\n")[]
+              | try capture("^- Upstream plugin SHA: \u0060(?<sha>[0-9a-fA-F]{40})\u0060").sha catch empty) // ""')
+          if ! printf '%s' "$RELEASE_SHA" | grep -Eq '^[0-9a-fA-F]{40}$'; then
+            echo "Latest Release does not contain a valid upstream plugin SHA" >&2
+            exit 1
+          fi
+          printf '%s\n' "$RELEASE_SHA" > sha
           if git diff --quiet -- sha; then
-            echo "Upstream ${REMOTE_SHA} is already recorded"
+            echo "Upstream ${RELEASE_SHA} is already recorded"
             exit 0
           fi
           git config --local user.email "zhongtaitest@hotmail.com"
           git config --local user.name "zhongtait"
           git add sha
-          git commit -m "chore(deps): record published upstream $(printf '%s' "$REMOTE_SHA" | cut -c1-7)"
+          git commit -m "chore(deps): record published upstream $(printf '%s' "$RELEASE_SHA" | cut -c1-7)"
           git push origin HEAD:refs/heads/main

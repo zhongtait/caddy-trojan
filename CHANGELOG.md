@@ -46,7 +46,7 @@
 - 伪装站：改为部署 [CorentinTh/it-tools](https://github.com/CorentinTh/it-tools) 静态包，下载失败时回退内置 ByteDeck 工具页；Caddyfile 对站点使用 SPA `try_files` 回退 `/index.html`。
 - Caddy：Caddyfile 明确限制 Admin API 监听 `127.0.0.1:2019`。
 - 系统：sysctl / limits 优化范围收敛，便于卸载回滚。
-- 发布：Release tag 简化为纯净版本号（如 v2.11.7），遵循发布资产不可篡改策略（immutable）。
+- 发布：Release 使用纯净版本号（如 v2.11.7）；工作流拒绝复用已有 tag、不覆盖已有资产，并通过 SHA256 与 Sigstore 校验下载完整性。
 - 界面：`status` 默认隐藏分享链接，需 `--show-link`。
 - 界面：install / status 显示客户端 ALPN 为 `http/1.1` only（而非 h2）。
 - 界面：将预期内的防火墙与固定资源完整性提示改为信息级消息，warning 仅保留给真正的失败。
@@ -70,6 +70,7 @@
 - 发布安全：上游候选先完成构建、Hub 覆盖率和真实 systemd 集成门禁，再更新 `sha`；打包、OIDC 签名与 GitHub 发布拆分为最小权限 job，发布 job 不再执行外部构建产物。
 - 测试：新增离线 Release 签名策略测试，覆盖签名缺失、显式 legacy 放宽、无效签名和有效签名路径。
 - CI：Release 必须先通过 Python/Shell 校验、Hub 100% 行与分支覆盖，以及真实 Linux + systemd + Caddy 集成测试，门禁通过后才创建 tag。
+- 发布：依赖 SHA 记录失败时，后续定时检查会从最新 Release 恢复状态；手动发布默认使用最新 Release 记录的插件提交。
 
 - Caddy：Trojan-over-WebSocket 配置不再启用 raw `listener_wrappers { trojan }`，避免其在 TLS 前拦截普通 443 流量并造成间歇性空响应；从旧配置迁移时自动完整重启 Caddy，防止旧 listener 在 graceful reload 后继续存活。
 - Hub：`_save_json` 的磁盘 / 权限错误转为 `DataStoreError`（干净的 503）而非直接断连；负数 `Content-Length` 返回 400（原为 413）。

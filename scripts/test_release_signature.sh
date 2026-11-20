@@ -131,6 +131,11 @@ grep -F 'target_commitish: ${{ needs.metadata.outputs.source_sha }}' .github/wor
     || fail "Release tag is not pinned to the tested source commit"
 grep -F 'overwrite_files: false' .github/workflows/release.yml >/dev/null \
     || fail "Release assets are still allowed to overwrite an existing tag"
+grep -F 'Release tag already exists; refusing to reuse it' .github/workflows/release.yml >/dev/null \
+    || fail "Release workflow does not reject an existing version tag"
+if grep -F 'immutable' .github/workflows/release.yml >/dev/null; then
+    fail "Release workflow overstates tag or asset immutability"
+fi
 grep -Eq 'uses: softprops/action-gh-release@[0-9a-f]{40}$' .github/workflows/release.yml \
     || fail "High-privilege Release action is not pinned to a commit"
 [ "$(grep -Fc 'uses: ./.github/workflows/release.yml' .github/workflows/test.yml)" -eq 1 ] \
@@ -143,6 +148,14 @@ grep -F 'REMOTE_CADDY_VERSION=$(curl -sf' .github/workflows/test.yml >/dev/null 
     || fail "Scheduled update does not check Caddy release tags"
 grep -F 'repos/${GITHUB_REPOSITORY}/releases/latest' .github/workflows/test.yml >/dev/null \
     || fail "Scheduled update does not use published release metadata as its baseline"
+grep -F 'state_sync_required: ${{ steps.check.outputs.state_sync_required }}' .github/workflows/test.yml >/dev/null \
+    || fail "Scheduled update does not expose stale upstream marker reconciliation"
+grep -F 'Tracked upstream SHA differs from the latest Release' .github/workflows/test.yml >/dev/null \
+    || fail "Scheduled update does not detect an upstream marker that drifted from the Release"
+grep -F 'Latest Release does not contain a valid upstream plugin SHA' .github/workflows/test.yml >/dev/null \
+    || fail "State reconciliation does not validate the latest Release upstream SHA"
+grep -F "needs.check.outputs.state_sync_required == 'true'" .github/workflows/test.yml >/dev/null \
+    || fail "Unchanged upstream checks do not retry stale marker reconciliation"
 grep -F 'capture("^- Caddy version:' .github/workflows/test.yml >/dev/null \
     || fail "Scheduled update does not compare the published Caddy dependency version"
 grep -F 'caddy_version: ${{ needs.check.outputs.remote_caddy_version }}' .github/workflows/test.yml >/dev/null \
@@ -151,6 +164,12 @@ grep -F 'chore(release): prepare v${PROJECT_VERSION}' .github/workflows/test.yml
     || fail "Dependency updates do not advance the project-owned version"
 grep -F 'PROJECT_VERSION=$(tr -d' .github/workflows/release.yml >/dev/null \
     || fail "Release tag is not derived from the project VERSION file"
+grep -F 'git show "${SOURCE_SHA}:sha"' .github/workflows/release.yml >/dev/null \
+    || fail "First release does not read the upstream marker from its resolved source commit"
+grep -F 'Unable to resolve upstream SHA from latest Release' .github/workflows/release.yml >/dev/null \
+    || fail "Manual releases do not fail safely when latest Release metadata cannot be read"
+grep -F -- "--write-out '%{http_code}'" .github/workflows/release.yml >/dev/null \
+    || fail "Manual releases do not distinguish a first release from GitHub API errors"
 grep -F 'caddy-trojan plugin version:' .github/workflows/release.yml >/dev/null \
     || fail "Release notes do not record the caddy-trojan plugin version"
 grep -F 'Caddy version:' .github/workflows/release.yml >/dev/null \
