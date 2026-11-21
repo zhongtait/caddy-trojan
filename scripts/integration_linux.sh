@@ -28,7 +28,7 @@ caddy_source="${CADDY_UNDER_TEST:-}"
 [ -n "$caddy_source" ] && [ -x "$caddy_source" ] \
     || die "CADDY_UNDER_TEST must point to an executable Caddy binary"
 
-for command_name in curl openssl ss systemctl systemd-analyze journalctl getent groupadd useradd userdel groupdel install; do
+for command_name in curl openssl ss systemctl systemd-analyze journalctl getent groupadd useradd userdel groupdel install python3; do
     command -v "$command_name" >/dev/null 2>&1 \
         || die "required command is unavailable: $command_name"
 done
@@ -187,12 +187,52 @@ grep -Fq "ExecReload=${CADDY_BIN} reload --config ${CADDYFILE} --force" "$unit_f
     || die "systemd unit has an unexpected reload command"
 grep -Fq "ReadWritePaths=${CADDY_DATA_DIR}" "$unit_file" \
     || die "systemd unit does not grant access to its isolated data directory"
+grep -qx '^TimeoutStartSec=5min$' "$unit_file" \
+    || die "systemd unit does not allow time to restore persisted target traffic"
+
+synthetic_target_records="${EASYTROJAN_SYNTHETIC_TRAFFIC_RECORDS:-0}"
+case "$synthetic_target_records" in
+    ''|*[!0-9]*) die "invalid synthetic traffic record count: $synthetic_target_records" ;;
+esac
+if [ "$synthetic_target_records" -gt 0 ]; then
+    seeder="${EASYTROJAN_TRAFFIC_SEEDER:-}"
+    [ -x "$seeder" ] || die "EASYTROJAN_TRAFFIC_SEEDER must point to the compiled record seeder"
+    "$seeder" "$CADDY_DATA_DIR" "$synthetic_target_records"
+    chown -R caddy:caddy "$CADDY_DATA_DIR"
+fi
 
 log "starting the isolated systemd service"
 systemctl daemon-reload
+startup_started_ms=$(date +%s%3N)
 systemctl start "$unit_name"
+startup_elapsed_ms=$(( $(date +%s%3N) - startup_started_ms ))
+log "Caddy systemd startup completed in ${startup_elapsed_ms}ms"
 systemctl is-active --quiet "$unit_name" || die "Caddy service is not active"
 wait_for_admin_api || die "Caddy Admin API did not become healthy"
+verify_synthetic_traffic() {
+    local expected="$1"
+    [ "$expected" -gt 0 ] || return 0
+    curl -fsS --connect-timeout 2 --max-time 90 \
+        "${ADMIN_API}/trojan/traffic" \
+        | python3 -c '
+import json, sys
+expected = int(sys.argv[1])
+rows = json.load(sys.stdin)
+actual = (len(rows), sum(row.get("up", 0) for row in rows), sum(row.get("down", 0) for row in rows))
+want = (expected, expected, expected * 2)
+if actual != want:
+    raise SystemExit(f"traffic restore mismatch: got {actual}, expected {want}")
+' "$expected" \
+        || die "synthetic traffic history was not fully restored"
+}
+print_target_restore_metrics() {
+    local metrics
+    metrics=$(journalctl -u "$unit_name" --no-pager -n 100 2>/dev/null \
+        | grep -F "restored persisted Trojan target traffic" | tail -n 1 || true)
+    [ -z "$metrics" ] || log "$metrics"
+}
+verify_synthetic_traffic "$synthetic_target_records"
+print_target_restore_metrics
 
 http_body=$(curl -fsS "http://127.0.0.1:${http_port}/.well-known/acme-challenge/health")
 grep -q integration-http-v1 <<<"$http_body" || die "HTTP challenge endpoint is unhealthy"
@@ -232,8 +272,13 @@ done
 [ "$dynamic_ready" -eq 1 ] || die "memory upstream did not expose the dynamically added user"
 
 log "restarting Caddy to verify memory+caddy persistence"
+restart_started_ms=$(date +%s%3N)
 systemctl restart "$unit_name"
+restart_elapsed_ms=$(( $(date +%s%3N) - restart_started_ms ))
+log "Caddy systemd restart completed in ${restart_elapsed_ms}ms"
 wait_for_admin_api || die "Caddy Admin API did not recover after restart"
+verify_synthetic_traffic "$synthetic_target_records"
+print_target_restore_metrics
 dynamic_users=$(curl -fsS "${ADMIN_API}/trojan/users")
 while IFS= read -r dynamic_key; do
     grep -q "$dynamic_key" <<<"$dynamic_users" \
@@ -246,8 +291,13 @@ persist_password integration-reload-password
 generate_caddyfile "$test_domain"
 
 log "reloading through the generated systemd ExecReload command"
+reload_started_ms=$(date +%s%3N)
 systemctl reload "$unit_name"
+reload_elapsed_ms=$(( $(date +%s%3N) - reload_started_ms ))
+log "Caddy systemd reload completed in ${reload_elapsed_ms}ms"
 wait_for_admin_api || die "Caddy Admin API did not recover after reload"
+verify_synthetic_traffic "$synthetic_target_records"
+print_target_restore_metrics
 pid_after=$(systemctl show "$unit_name" --property MainPID --value)
 [ "$pid_after" = "$pid_before" ] || die "reload unexpectedly replaced the Caddy process"
 admin_config=$(curl -fsS "${ADMIN_API}/config/")

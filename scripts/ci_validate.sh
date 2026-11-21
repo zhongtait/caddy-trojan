@@ -855,6 +855,28 @@ rm -rf "$gml_fixture_dir"
 trap - EXIT
 pass "GOMEMLIMIT derivation: ~75% effective RAM, cgroup v1/v2 limits and unlimited sentinels"
 
+# ---------- Caddy service startup timeout ----------
+info "Caddy service startup timeout"
+caddy_unit_test_root=$(mktemp -d)
+if ! CADDY_UNIT_FILE="${caddy_unit_test_root}/caddy.service" \
+  CADDY_BIN="${caddy_unit_test_root}/caddy" \
+  CADDYFILE="${caddy_unit_test_root}/Caddyfile" \
+  CADDY_XDG_CONFIG_HOME="${caddy_unit_test_root}/config" \
+  CADDY_XDG_DATA_HOME="${caddy_unit_test_root}/data" \
+  CADDY_DATA_DIR="${caddy_unit_test_root}/data/caddy" \
+  bash -c '
+    set -euo pipefail
+    . lib/system.sh
+    write_caddy_unit
+    grep -qx "TimeoutStartSec=5min" "$CADDY_UNIT_FILE"
+    grep -qx "TimeoutStopSec=5s" "$CADDY_UNIT_FILE"
+  '; then
+  rm -rf "$caddy_unit_test_root"
+  fail "generated Caddy service unit lacks the extended startup timeout"
+fi
+rm -rf "$caddy_unit_test_root"
+pass "generated Caddy service unit allows time for persisted traffic recovery"
+
 info "read-only network doctor"
 network_doctor_output=$(bash -c '
   set -euo pipefail

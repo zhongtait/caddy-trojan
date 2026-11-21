@@ -12,6 +12,7 @@
 - 系统：`--tune-system` 升级为按主机物理内存（RAM）和跨境代理 BDP 动态推导缓冲区，设置 `RAM/32` 单 socket 封顶与 `tcp_mem` 严格预算硬顶，并补齐 `tcp_slow_start_after_idle`、`tcp_mtu_probing`、`tcp_tw_reuse`、`tcp_fin_timeout` 等代理向协议栈参数；在 Caddy 创建 listener 前应用并逐项回读验证。
 - 系统：`doctor --network` 只读诊断增强，支持展示系统物理内存、自适应缓冲目标及 `tcp_mem` 等网络状态。
 - 系统：为 Caddy 服务设置软内存上限 `GOMEMLIMIT`（约 75% 有效内存），同时考虑 cgroup v1/v2 的层级限额；内存无法探测或过小时自动跳过。
+- 系统：将 Caddy `TimeoutStartSec` 设为 5 分钟；更新重启失败时打印最近服务日志，区分进程启动失败与 Admin API 健康检查失败。
 - 系统：安装时在内核支持的情况下启用并持久化 `fq` + BBR；更广泛的 sysctl / limits 调优保持可选。
 - Hub：节点聚合 Hub `easytrojan hub enable|disable|status|url|token|list|remove|join`。
 - Hub：本地 Python 服务 `hub_server.py`（`127.0.0.1:2099`），经 Caddy 反代 `/sub/*`、`/api/*`。
@@ -34,6 +35,7 @@
 ### 变更
 
 - Caddy 性能：Trojan upstream 切换为 `memory caddy` 混合模式，鉴权与流量计数走内存热路径，同时保留 Caddy storage 持久化；有界异步队列会在正常关闭时刷完，并跳过临时 key、自动修复损坏的用户记录。用户增删会等待 storage 确认并向 Admin API 返回错误，配置校验使用隔离 storage，避免 root 校验污染运行目录。真实 systemd 测试覆盖并发动态用户跨进程重启恢复。
+- Caddy 启动：目标流量历史恢复改为 8 路有界读取，分段记录 storage 遍历、文件读取与 JSON 解码耗时；汇总仍按单 goroutine 顺序应用，保护共享内存 map。
 - Hub 性能：按文件标识（mtime / size / inode）缓存已校验的节点与默认订阅体，重复 `/sub` 拉取不再重复解析与校验；`/sub` 启用 HTTP/1.1 keep-alive（写操作强制关闭连接）。
 - 重构：抽取 `detect_share_transport`、`hub_json_field`、`hub_register_payload`、`hub_indexed_name`、`hub_unregister_password`、`validate_port`、`http_send_json` 等公共函数，消除多处重复逻辑。
 - 重构：拆分 `easytrojan.sh` 为入口 + `lib/*.sh` 模块（common / tls / caddy / camouflage / system / hub / manage / install）；安装与更新同步到 `/usr/local/share/easytrojan/lib`。
@@ -70,6 +72,7 @@
 - 发布安全：上游候选先完成构建、Hub 覆盖率和真实 systemd 集成门禁，再更新 `sha`；打包、OIDC 签名与 GitHub 发布拆分为最小权限 job，发布 job 不再执行外部构建产物。
 - 测试：新增离线 Release 签名策略测试，覆盖签名缺失、显式 legacy 放宽、无效签名和有效签名路径。
 - CI：Release 必须先通过 Python/Shell 校验、Hub 100% 行与分支覆盖，以及真实 Linux + systemd + Caddy 集成测试，门禁通过后才创建 tag。
+- 测试：Linux 集成脚本可按需注入合成目标流量记录，比较 Caddy 启动、重启与 reload 时间，并验证恢复后的记录数和上下行总量。
 - 发布：依赖 SHA 记录失败时，后续定时检查会从最新 Release 恢复状态；手动发布默认使用最新 Release 记录的插件提交。
 
 - Caddy：Trojan-over-WebSocket 配置不再启用 raw `listener_wrappers { trojan }`，避免其在 TLS 前拦截普通 443 流量并造成间歇性空响应；从旧配置迁移时自动完整重启 Caddy，防止旧 listener 在 graceful reload 后继续存活。

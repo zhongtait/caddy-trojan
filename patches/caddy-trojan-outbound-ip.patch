@@ -234,10 +234,10 @@ index d1844bb..6d72b81 100644
  	NoProxy
  }
 diff --git a/app/upstream.go b/app/upstream.go
-index 732c54a..6de1c97 100644
+index 732c54a..a31f2ab 100644
 --- a/app/upstream.go
 +++ b/app/upstream.go
-@@ -2,8 +2,11 @@ package app
+@@ -2,10 +2,14 @@ package app
  
  import (
  	"context"
@@ -248,8 +248,11 @@ index 732c54a..6de1c97 100644
 +	"io/fs"
  	"strings"
  	"sync"
++	"time"
  
-@@ -25,6 +28,37 @@ type Traffic struct {
+ 	"github.com/caddyserver/caddy/v2"
+ 	"github.com/caddyserver/certmagic"
+@@ -25,6 +29,37 @@ type Traffic struct {
  	Down int64 `json:"down"`
  }
  
@@ -287,7 +290,7 @@ index 732c54a..6de1c97 100644
  type Upstream interface {
  	Add(string) error
  	Delete(string) error
-@@ -39,15 +73,24 @@ const (
+@@ -39,15 +74,24 @@ const (
  	TaskAdd TaskType = iota
  	TaskDelete
  	TaskConsume
@@ -312,7 +315,7 @@ index 732c54a..6de1c97 100644
  }
  
  type MemoryUpstream struct {
-@@ -56,8 +99,13 @@ type MemoryUpstream struct {
+@@ -56,8 +100,13 @@ type MemoryUpstream struct {
  	ch chan Task
  	up Upstream
  
@@ -328,7 +331,7 @@ index 732c54a..6de1c97 100644
  }
  
  func (*MemoryUpstream) CaddyModule() caddy.ModuleInfo {
-@@ -69,9 +117,10 @@ func (*MemoryUpstream) CaddyModule() caddy.ModuleInfo {
+@@ -69,9 +118,10 @@ func (*MemoryUpstream) CaddyModule() caddy.ModuleInfo {
  
  func (u *MemoryUpstream) Provision(ctx caddy.Context) error {
  	u.mm = make(map[string]Traffic)
@@ -340,7 +343,7 @@ index 732c54a..6de1c97 100644
  		return nil
  	}
  
-@@ -85,36 +134,109 @@ func (u *MemoryUpstream) Provision(ctx caddy.Context) error {
+@@ -85,36 +135,109 @@ func (u *MemoryUpstream) Provision(ctx caddy.Context) error {
  		u.AddKey(k)
  		u.Consume(k, nr, nw)
  	})
@@ -464,7 +467,7 @@ index 732c54a..6de1c97 100644
  	return nil
  }
  
-@@ -122,23 +244,17 @@ func (u *MemoryUpstream) Add(s string) error {
+@@ -122,23 +245,17 @@ func (u *MemoryUpstream) Add(s string) error {
  	b := [trojan.HeaderLen]byte{}
  	trojan.GenKey(s, b[:])
  
@@ -493,7 +496,7 @@ index 732c54a..6de1c97 100644
  	}
  	u.mu.Unlock()
  }
-@@ -147,18 +263,62 @@ func (u *MemoryUpstream) Delete(s string) error {
+@@ -147,18 +264,62 @@ func (u *MemoryUpstream) Delete(s string) error {
  	b := [trojan.HeaderLen]byte{}
  	trojan.GenKey(s, b[:])
  	key := x.ByteSliceToString(b[:])
@@ -563,7 +566,7 @@ index 732c54a..6de1c97 100644
  }
  
  func (u *MemoryUpstream) Range(fn func(string, int64, int64)) {
-@@ -177,23 +337,38 @@ func (u *MemoryUpstream) Validate(k string) bool {
+@@ -177,23 +338,38 @@ func (u *MemoryUpstream) Validate(k string) bool {
  }
  
  func (u *MemoryUpstream) Consume(k string, nr, nw int64) error {
@@ -615,16 +618,43 @@ index 732c54a..6de1c97 100644
  }
  
  type CaddyUpstream struct {
-@@ -202,6 +377,8 @@ type CaddyUpstream struct {
+@@ -202,6 +378,35 @@ type CaddyUpstream struct {
  	logger  *zap.Logger
  }
  
 +const targetPrefix = "trojan-target/"
++const targetRangeWorkers = 8
++
++func runTargetWorkers(count int, fn func(int)) {
++	workers := targetRangeWorkers
++	if workers > count {
++		workers = count
++	}
++	if workers == 0 {
++		return
++	}
++	jobs := make(chan int)
++	var wg sync.WaitGroup
++	wg.Add(workers)
++	for worker := 0; worker < workers; worker++ {
++		go func() {
++			defer wg.Done()
++			for index := range jobs {
++				fn(index)
++			}
++		}()
++	}
++	for index := 0; index < count; index++ {
++		jobs <- index
++	}
++	close(jobs)
++	wg.Wait()
++}
 +
  func (CaddyUpstream) CaddyModule() caddy.ModuleInfo {
  	return caddy.ModuleInfo{
  		ID:  "trojan.upstream.caddy",
-@@ -220,8 +397,17 @@ func (u *CaddyUpstream) Add(s string) error {
+@@ -220,8 +425,17 @@ func (u *CaddyUpstream) Add(s string) error {
  	b := [trojan.HeaderLen]byte{}
  	trojan.GenKey(s, b[:])
  	key := u.prefix + string(b[:])
@@ -644,7 +674,7 @@ index 732c54a..6de1c97 100644
  	}
  	traffic := Traffic{
  		Up:   0,
-@@ -238,10 +424,53 @@ func (u *CaddyUpstream) Delete(s string) error {
+@@ -238,10 +452,121 @@ func (u *CaddyUpstream) Delete(s string) error {
  	b := [trojan.HeaderLen]byte{}
  	trojan.GenKey(s, b[:])
  	key := u.prefix + x.ByteSliceToString(b[:])
@@ -656,7 +686,8 @@ index 732c54a..6de1c97 100644
 +	}
 +	if err := u.storage.Delete(context.Background(), key); err != nil {
 +		return err
-+	}
+ 	}
+-	return u.storage.Delete(context.Background(), key)
 +	targets, err := u.storage.List(context.Background(), u.prefix+targetPrefix+x.ByteSliceToString(b[:])+"/", false)
 +	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 +		return err
@@ -670,37 +701,104 @@ index 732c54a..6de1c97 100644
 +}
 +
 +func (u *CaddyUpstream) RangeTargets(fn func(string, string, string, int64, int64)) {
++	type targetRecord struct {
++		key, ip, target string
++		storageKey      string
++	}
++	started := time.Now()
 +	prefix := u.prefix + targetPrefix
++	listStarted := time.Now()
 +	keys, err := u.storage.List(context.Background(), prefix, true)
-+	if err != nil {
++	listDuration := time.Since(listStarted)
++	if errors.Is(err, fs.ErrNotExist) {
++		keys = nil
++	} else if err != nil {
++		u.logger.Error("listing persisted Trojan target traffic", zap.Error(err))
 +		return
 +	}
++	parseStarted := time.Now()
++	records := make([]targetRecord, 0, len(keys))
++	invalidKeys := 0
++	directoryEntries := 0
 +	for _, key := range keys {
 +		rel := strings.TrimPrefix(key, prefix)
 +		parts := strings.SplitN(rel, "/", 2)
++		if len(parts) == 1 && isTrojanStorageKey(parts[0]) {
++			directoryEntries++
++			continue
++		}
 +		if len(parts) != 2 || !isTrojanStorageKey(parts[0]) {
++			invalidKeys++
 +			continue
 +		}
 +		targetBytes, err := hex.DecodeString(parts[1])
 +		if err != nil {
++			invalidKeys++
 +			continue
 +		}
 +		ip, target := splitTargetKey(string(targetBytes))
-+		b, err := u.storage.Load(context.Background(), key)
-+		if err != nil {
++		records = append(records, targetRecord{key: parts[0], ip: ip, target: target, storageKey: key})
++	}
++	parseDuration := time.Since(parseStarted)
++	data := make([][]byte, len(records))
++	loadErrors := make([]error, len(records))
++	readStarted := time.Now()
++	runTargetWorkers(len(records), func(index int) {
++		data[index], loadErrors[index] = u.storage.Load(context.Background(), records[index].storageKey)
++	})
++	readDuration := time.Since(readStarted)
++	traffic := make([]Traffic, len(records))
++	decodeErrors := make([]error, len(records))
++	decodeStarted := time.Now()
++	runTargetWorkers(len(records), func(index int) {
++		if loadErrors[index] == nil {
++			decodeErrors[index] = json.Unmarshal(data[index], &traffic[index])
++		}
++	})
++	decodeDuration := time.Since(decodeStarted)
++	loadErrorCount, decodeErrorCount, loaded := 0, 0, 0
++	var firstLoadError, firstDecodeError error
++	for index, record := range records {
++		if loadErrors[index] != nil {
++			loadErrorCount++
++			if firstLoadError == nil {
++				firstLoadError = loadErrors[index]
++			}
 +			continue
 +		}
-+		traffic := Traffic{}
-+		if json.Unmarshal(b, &traffic) != nil {
++		if decodeErrors[index] != nil {
++			decodeErrorCount++
++			if firstDecodeError == nil {
++				firstDecodeError = decodeErrors[index]
++			}
 +			continue
 +		}
-+		fn(parts[0], ip, target, traffic.Up, traffic.Down)
- 	}
--	return u.storage.Delete(context.Background(), key)
++		loaded++
++		fn(record.key, record.ip, record.target, traffic[index].Up, traffic[index].Down)
++	}
++	workerCount := targetRangeWorkers
++	if workerCount > len(records) {
++		workerCount = len(records)
++	}
++	fields := []zap.Field{
++		zap.Int("listed", len(keys)), zap.Int("loaded", loaded),
++		zap.Int("directory_entries", directoryEntries), zap.Int("invalid_keys", invalidKeys),
++		zap.Int("load_errors", loadErrorCount), zap.Int("decode_errors", decodeErrorCount),
++		zap.Duration("list_elapsed", listDuration), zap.Duration("key_parse_elapsed", parseDuration),
++		zap.Duration("load_elapsed", readDuration), zap.Duration("decode_elapsed", decodeDuration),
++		zap.Duration("total_elapsed", time.Since(started)), zap.Int("load_workers", workerCount),
++	}
++	if firstLoadError != nil {
++		fields = append(fields, zap.NamedError("first_load_error", firstLoadError))
++	}
++	if firstDecodeError != nil {
++		fields = append(fields, zap.NamedError("first_decode_error", firstDecodeError))
++	}
++	u.logger.Info("restored persisted Trojan target traffic", fields...)
  }
  
  func (u *CaddyUpstream) Range(fn func(k string, up, down int64)) {
-@@ -250,24 +479,41 @@ func (u *CaddyUpstream) Range(fn func(k string, up, down int64)) {
+@@ -250,24 +575,41 @@ func (u *CaddyUpstream) Range(fn func(k string, up, down int64)) {
  		return
  	}
  
@@ -745,7 +843,7 @@ index 732c54a..6de1c97 100644
  }
  
  func (u *CaddyUpstream) Consume(k string, nr, nw int64) error {
-@@ -297,9 +543,95 @@ func (u *CaddyUpstream) Consume(k string, nr, nw int64) error {
+@@ -297,9 +639,95 @@ func (u *CaddyUpstream) Consume(k string, nr, nw int64) error {
  	return u.storage.Store(context.Background(), key, b)
  }
  
@@ -1206,7 +1304,7 @@ index ce4770a..4303419 100644
 +	return nil, 0, 0, errors.New("command error")
  }
 diff --git a/pkgs/trojan/trojan_udp.go b/pkgs/trojan/trojan_udp.go
-index 69d4de2..8888957 100644
+index 69d4de2..1e49563 100644
 --- a/pkgs/trojan/trojan_udp.go
 +++ b/pkgs/trojan/trojan_udp.go
 @@ -6,6 +6,7 @@ import (

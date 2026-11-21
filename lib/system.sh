@@ -612,6 +612,10 @@ Environment=XDG_CONFIG_HOME=${xdg_config_home} XDG_DATA_HOME=${xdg_data_home} HO
 ${gomemlimit_env}
 ExecStart=${CADDY_BIN} run --environ --config ${CADDYFILE}
 ExecReload=${CADDY_BIN} reload --config ${CADDYFILE} --force
+# Caddy synchronously restores persisted Trojan traffic records before it
+# notifies systemd that the service is ready. Large histories can exceed the
+# systemd default start timeout.
+TimeoutStartSec=5min
 TimeoutStopSec=5s
 LimitNOFILE=1048576
 LimitNPROC=512

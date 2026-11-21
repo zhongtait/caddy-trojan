@@ -625,14 +625,37 @@ do_update() {
     if [ -n "$old_digest" ] && [ "$old_digest" = "$new_digest" ]; then
         if [ "$unit_refresh" = "1" ] && systemctl is-active --quiet caddy 2>/dev/null; then
             info "Restarting Caddy to apply the current hardened service unit..."
-            systemctl restart caddy.service
-            wait_for_admin_api || error "Caddy did not become healthy after service unit refresh"
+            if ! systemctl restart caddy.service; then
+                warn "Caddy failed to start while refreshing its service unit; recent service logs follow:"
+                journalctl -u caddy.service -n 40 --no-pager >&2 2>/dev/null || true
+                error "Caddy did not start after service unit refresh; inspect the journal above"
+            fi
+            if ! wait_for_admin_api; then
+                warn "Caddy started but its Admin API did not become healthy; recent service logs follow:"
+                journalctl -u caddy.service -n 40 --no-pager >&2 2>/dev/null || true
+                error "Caddy Admin API did not become healthy after service unit refresh"
+            fi
         fi
         ok "Caddy binary already up to date: $new_version"
     else
         if systemctl is-active --quiet caddy 2>/dev/null; then
             info "Caddy binary changed; restarting service..."
-            if ! systemctl restart caddy.service || ! wait_for_admin_api; then
+            if ! systemctl restart caddy.service; then
+                warn "Caddy failed to start after the binary update; recent service logs follow:"
+                journalctl -u caddy.service -n 40 --no-pager >&2 2>/dev/null || true
+                if [ -n "$backup" ] && [ -f "$backup" ]; then
+                    warn "Restoring the previous Caddy binary..."
+                    cp -f "$backup" "$CADDY_BIN"
+                    chmod 755 "$CADDY_BIN"
+                    systemctl restart caddy.service || true
+                    rm -f "$backup"
+                    error "Caddy update rolled back because the new service failed to start; inspect the journal above"
+                fi
+                error "Caddy update failed because the new service did not start; inspect the journal above"
+            fi
+            if ! wait_for_admin_api; then
+                warn "Caddy started but its Admin API did not become healthy; recent service logs follow:"
+                journalctl -u caddy.service -n 40 --no-pager >&2 2>/dev/null || true
                 if [ -n "$backup" ] && [ -f "$backup" ]; then
                     warn "Caddy update failed health check; restoring previous binary..."
                     cp -f "$backup" "$CADDY_BIN"
