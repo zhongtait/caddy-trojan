@@ -58,6 +58,7 @@
 
 ### 修复
 
+- 流量统计：重置持久化目标记录改为最多 8 路并发删除，避免数万条历史记录逐条删除导致 Admin API 超时；CLI 等待时间延长至 180 秒，并在超时时提示检查处理状态后再重试。
 - CI：Python 3.8 验证固定到仍提供该版本的 Ubuntu runner，避免 `ubuntu-latest` 升级后导致安装失败。
 - 自动构建：每日同时比较最新 Release 所记录的插件 SHA/Caddy 版本与上游；Caddy 更新用纯版本 tag，插件单独更新用唯一构建后缀，构建或发布失败时基准不前移，定时任务可重试。
 - Hub：新注册节点限制为 Trojan over WebSocket 并固定订阅 ALPN 为 `http/1.1`；历史 TCP 节点继续可管理但不再发布成不可用的 `type=tcp` 链接。

@@ -306,4 +306,11 @@ grep -q integration-reload-password <<<"$admin_config" \
 site_body=$(curl -kfsS --http1.1 --resolve "${test_domain}:${https_port}:127.0.0.1" "$site_url")
 grep -q integration-v1 <<<"$site_body" || die "HTTPS endpoint failed after reload"
 
+log "resetting persisted traffic records through the admin API"
+curl -fsS --max-time 180 -X DELETE "${ADMIN_API}/trojan/traffic" >/dev/null \
+    || die "traffic reset API failed"
+curl -fsS --max-time 30 "${ADMIN_API}/trojan/traffic" \
+    | python3 -c 'import json,sys; rows=json.load(sys.stdin); raise SystemExit(1 if rows else 0)' \
+    || die "traffic reset left persisted target records"
+
 log "real Linux + systemd + Caddy validation passed"

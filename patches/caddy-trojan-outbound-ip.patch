@@ -843,7 +843,7 @@ index 732c54a..a31f2ab 100644
  }
  
  func (u *CaddyUpstream) Consume(k string, nr, nw int64) error {
-@@ -297,9 +639,95 @@ func (u *CaddyUpstream) Consume(k string, nr, nw int64) error {
+@@ -297,9 +639,105 @@ func (u *CaddyUpstream) Consume(k string, nr, nw int64) error {
  	return u.storage.Store(context.Background(), key, b)
  }
  
@@ -895,16 +895,26 @@ index 732c54a..a31f2ab 100644
 +	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 +		return err
 +	}
++	targetKeys := make([]string, 0, len(keys))
 +	for _, targetKey := range keys {
 +		rel := strings.TrimPrefix(targetKey, prefix)
 +		parts := strings.SplitN(rel, "/", 2)
-+		if len(parts) != 2 || (key != "" && parts[0] != key) {
-+			continue
++		if len(parts) == 2 && (key == "" || parts[0] == key) {
++			targetKeys = append(targetKeys, targetKey)
 +		}
++	}
++	deleteErrors := make([]error, len(targetKeys))
++	runTargetWorkers(len(targetKeys), func(index int) {
++		targetKey := targetKeys[index]
 +		u.storage.Lock(context.Background(), targetKey)
-+		err = u.storage.Delete(context.Background(), targetKey)
++		deleteErrors[index] = u.storage.Delete(context.Background(), targetKey)
 +		u.storage.Unlock(context.Background(), targetKey)
-+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
++		if errors.Is(deleteErrors[index], fs.ErrNotExist) {
++			deleteErrors[index] = nil
++		}
++	})
++	for _, err := range deleteErrors {
++		if err != nil {
 +			return err
 +		}
 +	}
