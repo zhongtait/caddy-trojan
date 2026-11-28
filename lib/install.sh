@@ -123,6 +123,9 @@ do_install() {
 
     # Source of truth: passwd.txt -> Caddyfile static users (imgk style)
     persist_password "$trojan_passwd"
+    if [ -n "${ws_path:-}" ]; then
+        ws_path=$(normalize_ws_path "$ws_path")
+    fi
     info "Generating Caddyfile..."
     generate_caddyfile "$site_domain"
 
@@ -203,8 +206,9 @@ do_install() {
 
     install_self
     ok "Management command installed: easytrojan / easytrojan.sh"
-    local share_link
-    share_link=$(build_share_link "$site_domain" "$trojan_passwd" "ws")
+    local share_link active_ws_path
+    active_ws_path=$(read_ws_path)
+    share_link=$(build_share_link "$site_domain" "$trojan_passwd" "ws" "" 443 "" "$active_ws_path")
 
     echo ""
     echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
@@ -215,7 +219,7 @@ do_install() {
     echo -e "${GREEN}║${NC}  Port     : ${CYAN}443${NC}"
     echo -e "${GREEN}║${NC}  Password : ${CYAN}${trojan_passwd}${NC}"
     echo -e "${GREEN}║${NC}  ALPN     : ${CYAN}http/1.1 only${NC}  ${YELLOW}(WebSocket)${NC}"
-    echo -e "${GREEN}║${NC}  Transport: ${CYAN}websocket${NC}"
+    echo -e "${GREEN}║${NC}  Transport: ${CYAN}websocket${NC}  (path: ${active_ws_path})"
     echo -e "${GREEN}║${NC}  TLS mode : ${CYAN}$(read_tls_mode)${NC}  (easytrojan cert status)"
     echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${GREEN}║${NC}  Manage   : systemctl {start|stop|restart|status} caddy"
@@ -227,7 +231,7 @@ do_install() {
     echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${GREEN}║${NC}  ${YELLOW}Share Link:${NC}"
     echo -e "${GREEN}║${NC}  ${CYAN}${share_link}${NC}"
-    echo -e "${GREEN}║${NC}  ${YELLOW}Client:${NC} ALPN=http/1.1; SNI/Host=domain; path=/"
+    echo -e "${GREEN}║${NC}  ${YELLOW}Client:${NC} ALPN=http/1.1; SNI/Host=domain; path=${active_ws_path}"
     echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 }

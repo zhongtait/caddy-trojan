@@ -399,10 +399,31 @@ enable_bbr() {
     fi
     current=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
     if [ "$current" = "bbr" ]; then
+        apply_fq_qdisc_to_default_iface || true
         ok "BBR enabled and persisted (${config_file})"
     else
         warn "BBR did not become active; current congestion control: ${current:-unknown}"
     fi
+}
+
+apply_fq_qdisc_to_default_iface() {
+    check_cmd tc && check_cmd ip || return 0
+    local ifaces iface updated=0
+    ifaces=$(
+        {
+            ip route show default 2>/dev/null || true
+            ip -6 route show default 2>/dev/null || true
+        } | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | awk 'NF && !seen[$0]++'
+    )
+    [ -n "$ifaces" ] || return 0
+    while IFS= read -r iface; do
+        [ -n "$iface" ] || continue
+        if tc qdisc replace dev "$iface" root fq 2>/dev/null; then
+            ok "Active interface (${iface}) qdisc updated to fq"
+            updated=1
+        fi
+    done <<< "$ifaces"
+    [ "$updated" -eq 1 ] || return 0
 }
 
 apply_sysctl_limits() {
@@ -765,4 +786,405 @@ EOF
     systemctl enable caddy-renew.timer &>/dev/null
     systemctl restart caddy-renew.timer &>/dev/null || systemctl start caddy-renew.timer &>/dev/null
     ok "Certificate maintenance timer enabled (daily)"
+}
+
+write_traffic_schedule_units() {
+    local reset_calendar="${1:-}" has_maintain="${2:-0}"
+    local reset_service="${TRAFFIC_RESET_SERVICE_FILE:-/etc/systemd/system/easytrojan-traffic-reset.service}"
+    local reset_timer="${TRAFFIC_RESET_TIMER_FILE:-/etc/systemd/system/easytrojan-traffic-reset.timer}"
+    local maint_service="${TRAFFIC_MAINTAIN_SERVICE_FILE:-/etc/systemd/system/easytrojan-traffic-maintain.service}"
+    local maint_timer="${TRAFFIC_MAINTAIN_TIMER_FILE:-/etc/systemd/system/easytrojan-traffic-maintain.timer}"
+    local script_bin="${SCRIPT_BIN:-/usr/local/bin/easytrojan}"
+
+    mkdir -p "$(dirname "$reset_service")"
+    if [ -n "$reset_calendar" ]; then
+        cat > "$reset_service" <<EOF
+[Unit]
+Description=EasyTrojan Scheduled Traffic Reset
+After=network-online.target caddy.service
+Wants=caddy.service
+
+[Service]
+Type=oneshot
+ExecStart=${script_bin} traffic reset --yes
+Nice=10
+EOF
+        cat > "$reset_timer" <<EOF
+[Unit]
+Description=EasyTrojan Scheduled Traffic Reset Timer
+
+[Timer]
+OnCalendar=${reset_calendar}
+Persistent=true
+Unit=easytrojan-traffic-reset.service
+
+[Install]
+WantedBy=timers.target
+EOF
+    else
+        rm -f -- "$reset_timer" "$reset_service"
+    fi
+
+    if [ "$has_maintain" = "1" ]; then
+        cat > "$maint_service" <<EOF
+[Unit]
+Description=EasyTrojan Traffic Maintenance (Prune / Quota)
+After=network-online.target caddy.service
+Wants=caddy.service
+
+[Service]
+Type=oneshot
+ExecStart=${script_bin} traffic maintain
+Nice=10
+EOF
+        cat > "$maint_timer" <<'EOF'
+[Unit]
+Description=EasyTrojan Traffic Maintenance Timer
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Persistent=true
+Unit=easytrojan-traffic-maintain.service
+
+[Install]
+WantedBy=timers.target
+EOF
+    else
+        rm -f -- "$maint_timer" "$maint_service"
+    fi
+}
+
+remove_traffic_schedule_units() {
+    local reset_service="${TRAFFIC_RESET_SERVICE_FILE:-/etc/systemd/system/easytrojan-traffic-reset.service}"
+    local reset_timer="${TRAFFIC_RESET_TIMER_FILE:-/etc/systemd/system/easytrojan-traffic-reset.timer}"
+    local maint_service="${TRAFFIC_MAINTAIN_SERVICE_FILE:-/etc/systemd/system/easytrojan-traffic-maintain.service}"
+    local maint_timer="${TRAFFIC_MAINTAIN_TIMER_FILE:-/etc/systemd/system/easytrojan-traffic-maintain.timer}"
+
+    if check_cmd systemctl; then
+        systemctl stop easytrojan-traffic-reset.timer easytrojan-traffic-maintain.timer &>/dev/null || true
+        systemctl disable easytrojan-traffic-reset.timer easytrojan-traffic-maintain.timer &>/dev/null || true
+    fi
+    rm -f -- "$reset_timer" "$reset_service" "$maint_timer" "$maint_service"
+    if check_cmd systemctl; then
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+}
+
+cf_firewall_script_path() {
+    printf '%s' "${CF_FIREWALL_BIN:-/usr/local/bin/easytrojan-cf-firewall}"
+}
+
+cf_firewall_unit_path() {
+    printf '%s' "${CF_FIREWALL_SERVICE_FILE:-/etc/systemd/system/${CF_FIREWALL_UNIT:-easytrojan-cf-firewall.service}}"
+}
+
+cf_firewall_conf_path() {
+    printf '%s' "${CF_FIREWALL_CONF:-${TROJAN_DIR}/cf-firewall.conf}"
+}
+
+resolve_cloudflare_cidrs() {
+    local family="$1" refresh="${2:-0}" fallback="" url="" fetched="" valid="" line="" count=0
+    if [ "$family" = "4" ]; then
+        fallback=$(cloudflare_ipv4_cidrs)
+        url="https://www.cloudflare.com/ips-v4"
+    else
+        fallback=$(cloudflare_ipv6_cidrs)
+        url="https://www.cloudflare.com/ips-v6"
+    fi
+
+    if [ "$refresh" = "1" ] && check_cmd curl; then
+        fetched=$(curl -fsS --connect-timeout 3 --max-time 8 "$url" 2>/dev/null || true)
+        if [ -n "$fetched" ]; then
+            while IFS= read -r line; do
+                line=$(printf '%s' "$line" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                [ -n "$line" ] || continue
+                if [ "$family" = "4" ] && [[ "$line" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+                    valid="${valid:+${valid} }${line}"
+                    count=$((count + 1))
+                elif [ "$family" = "6" ] && [[ "$line" =~ ^[0-9a-fA-F:]+/[0-9]{1,3}$ ]]; then
+                    valid="${valid:+${valid} }${line}"
+                    count=$((count + 1))
+                else
+                    valid=""
+                    count=0
+                    break
+                fi
+            done <<< "$fetched"
+        fi
+        if [ "$count" -ge 5 ] && [ -n "$valid" ]; then
+            printf '%s' "$valid"
+            return 0
+        fi
+        warn "Failed to refresh Cloudflare IPv${family} list; using built-in CIDRs"
+    fi
+    printf '%s' "$fallback"
+}
+
+write_cf_firewall_helper() {
+    local bin_path="$1"
+    local bin_dir tmp_bin
+    bin_dir=$(dirname "$bin_path")
+    mkdir -p "$bin_dir"
+    tmp_bin=$(mktemp "${bin_path}.tmp.XXXXXX")
+    cat > "$tmp_bin" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+CONF="${CF_FIREWALL_CONF:-/etc/caddy/trojan/cf-firewall.conf}"
+MODE="off"
+PORT="443"
+V4_CIDRS=""
+V6_CIDRS=""
+
+load_conf() {
+    [ -f "$CONF" ] || return 0
+    local k v
+    while IFS='=' read -r k v; do
+        case "$k" in
+            ''|\#*) continue ;;
+            MODE) MODE="$v" ;;
+            PORT) PORT="$v" ;;
+            V4_CIDRS) V4_CIDRS="$v" ;;
+            V6_CIDRS) V6_CIDRS="$v" ;;
+        esac
+    done < "$CONF"
+}
+
+select_backend() {
+    if [ -n "${CF_FIREWALL_BACKEND:-}" ]; then
+        printf '%s' "$CF_FIREWALL_BACKEND"
+        return 0
+    fi
+    if command -v nft >/dev/null 2>&1 && nft list tables >/dev/null 2>&1; then
+        printf 'nft'
+        return 0
+    fi
+    if command -v iptables >/dev/null 2>&1; then
+        printf 'iptables'
+        return 0
+    fi
+    return 1
+}
+
+remove_iptables_chain() {
+    local cmd="$1" w_flag="" rule_args=""
+    command -v "$cmd" >/dev/null 2>&1 || return 0
+    if "$cmd" -w -L INPUT >/dev/null 2>&1; then
+        w_flag="-w"
+    fi
+    while IFS= read -r rule_args; do
+        [ -n "$rule_args" ] || continue
+        # shellcheck disable=SC2086
+        "$cmd" $w_flag -D $rule_args 2>/dev/null || true
+    done < <("$cmd" $w_flag -S INPUT 2>/dev/null | awk '/-j EASYTROJAN_CF/ { sub(/^-A /, ""); print }')
+    "$cmd" $w_flag -F EASYTROJAN_CF 2>/dev/null || true
+    "$cmd" $w_flag -X EASYTROJAN_CF 2>/dev/null || true
+}
+
+remove_all() {
+    if command -v nft >/dev/null 2>&1 && nft list table inet easytrojan_cf >/dev/null 2>&1; then
+        nft delete table inet easytrojan_cf 2>/dev/null || true
+    fi
+    remove_iptables_chain iptables
+    remove_iptables_chain ip6tables
+}
+
+apply_nft() {
+    local v4_csv="" v6_csv="" c
+    for c in $V4_CIDRS; do
+        [[ "$c" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] || continue
+        v4_csv="${v4_csv:+${v4_csv}, }${c}"
+    done
+    for c in $V6_CIDRS; do
+        [[ "$c" =~ ^[0-9a-fA-F:]+/[0-9]{1,3}$ ]] || continue
+        v6_csv="${v6_csv:+${v6_csv}, }${c}"
+    done
+    [ -n "$v4_csv" ] || return 1
+
+    remove_all
+    {
+        printf 'table inet easytrojan_cf {\n'
+        printf '    set cf_v4 {\n        type ipv4_addr\n        flags interval\n        elements = { %s }\n    }\n' "$v4_csv"
+        if [ -n "$v6_csv" ]; then
+            printf '    set cf_v6 {\n        type ipv6_addr\n        flags interval\n        elements = { %s }\n    }\n' "$v6_csv"
+        fi
+        printf '    chain input {\n'
+        printf '        type filter hook input priority -10; policy accept;\n'
+        printf '        iifname "lo" accept\n'
+        printf '        ct state established,related accept\n'
+        printf '        tcp dport != %s accept\n' "$PORT"
+        printf '        ip saddr @cf_v4 accept\n'
+        if [ -n "$v6_csv" ]; then
+            printf '        ip6 saddr @cf_v6 accept\n'
+        fi
+        printf '        counter drop\n'
+        printf '    }\n'
+        printf '}\n'
+    } | nft -f -
+}
+
+apply_iptables_family() {
+    local cmd="$1" cidrs="$2" w_flag="" c added=0
+    command -v "$cmd" >/dev/null 2>&1 || return 0
+    if "$cmd" -w -L INPUT >/dev/null 2>&1; then
+        w_flag="-w"
+    fi
+    "$cmd" $w_flag -N EASYTROJAN_CF
+    "$cmd" $w_flag -A EASYTROJAN_CF -i lo -j RETURN
+    "$cmd" $w_flag -A EASYTROJAN_CF -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN 2>/dev/null \
+        || "$cmd" $w_flag -A EASYTROJAN_CF -m state --state ESTABLISHED,RELATED -j RETURN 2>/dev/null \
+        || true
+    for c in $cidrs; do
+        [ -n "$c" ] || continue
+        "$cmd" $w_flag -A EASYTROJAN_CF -s "$c" -j RETURN
+        added=$((added + 1))
+    done
+    [ "$added" -gt 0 ] || return 1
+    "$cmd" $w_flag -A EASYTROJAN_CF -j DROP
+    "$cmd" $w_flag -I INPUT 1 -p tcp --dport "$PORT" -j EASYTROJAN_CF
+}
+
+apply_rules() {
+    load_conf
+    if [ "$MODE" != "cf-only" ]; then
+        remove_all
+        return 0
+    fi
+    if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+        echo "Invalid firewall port: $PORT" >&2
+        return 1
+    fi
+    local backend
+    backend=$(select_backend) || { echo "Neither nft nor iptables is available" >&2; return 1; }
+    if [ "$backend" = "nft" ]; then
+        apply_nft
+    else
+        remove_all
+        apply_iptables_family iptables "$V4_CIDRS"
+        if [ -n "$V6_CIDRS" ]; then
+            apply_iptables_family ip6tables "$V6_CIDRS"
+        fi
+    fi
+}
+
+status_rules() {
+    load_conf
+    echo "mode=${MODE}"
+    echo "port=${PORT}"
+    if command -v nft >/dev/null 2>&1 && nft list table inet easytrojan_cf >/dev/null 2>&1; then
+        echo "active_backend=nft"
+        nft list table inet easytrojan_cf 2>/dev/null
+    elif command -v iptables >/dev/null 2>&1 && iptables -S EASYTROJAN_CF >/dev/null 2>&1; then
+        echo "active_backend=iptables"
+        iptables -S EASYTROJAN_CF 2>/dev/null || true
+        ip6tables -S EASYTROJAN_CF 2>/dev/null || true
+    else
+        echo "active_backend=none"
+    fi
+}
+
+case "${1:-apply}" in
+    apply) apply_rules ;;
+    remove|off) remove_all ;;
+    status) status_rules ;;
+    *)
+        echo "Usage: $0 {apply|remove|status}" >&2
+        exit 1
+        ;;
+esac
+EOF
+    chmod 755 "$tmp_bin"
+    mv -f "$tmp_bin" "$bin_path"
+}
+
+write_cf_firewall_unit() {
+    local unit_path="$1" bin_path="$2" conf_path="$3"
+    local unit_dir tmp_unit
+    unit_dir=$(dirname "$unit_path")
+    mkdir -p "$unit_dir"
+    tmp_unit=$(mktemp "${unit_path}.tmp.XXXXXX")
+    cat > "$tmp_unit" <<EOF
+[Unit]
+Description=EasyTrojan Cloudflare Origin Firewall (TCP port protection)
+After=network-pre.target nftables.service netfilter-persistent.service ufw.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=CF_FIREWALL_CONF=${conf_path}
+ExecStart=${bin_path} apply
+ExecStop=${bin_path} remove
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 644 "$tmp_unit"
+    mv -f "$tmp_unit" "$unit_path"
+}
+
+apply_cf_only_firewall() {
+    local port="${1:-443}" refresh="${2:-0}" dry_run="${3:-0}"
+    local v4_cidrs v6_cidrs conf_path bin_path unit_path tmp_conf
+    validate_port "$port" "--port"
+    v4_cidrs=$(resolve_cloudflare_cidrs 4 "$refresh")
+    v6_cidrs=$(resolve_cloudflare_cidrs 6 "$refresh")
+
+    if [ "$dry_run" = "1" ]; then
+        echo "mode=cf-only"
+        echo "port=${port}"
+        echo "v4_cidrs=${v4_cidrs}"
+        echo "v6_cidrs=${v6_cidrs}"
+        return 0
+    fi
+
+    conf_path=$(cf_firewall_conf_path)
+    bin_path=$(cf_firewall_script_path)
+    unit_path=$(cf_firewall_unit_path)
+
+    mkdir -p "$(dirname "$conf_path")"
+    tmp_conf=$(mktemp "${conf_path}.tmp.XXXXXX")
+    {
+        printf 'MODE=cf-only\n'
+        printf 'PORT=%s\n' "$port"
+        printf 'V4_CIDRS=%s\n' "$v4_cidrs"
+        printf 'V6_CIDRS=%s\n' "$v6_cidrs"
+    } > "$tmp_conf"
+    chmod 640 "$tmp_conf"
+    mv -f "$tmp_conf" "$conf_path"
+
+    write_cf_firewall_helper "$bin_path"
+    write_cf_firewall_unit "$unit_path" "$bin_path" "$conf_path"
+
+    if [ "${CF_FIREWALL_SKIP_APPLY:-0}" != "1" ]; then
+        CF_FIREWALL_CONF="$conf_path" "$bin_path" apply
+        if check_cmd systemctl; then
+            systemctl daemon-reload &>/dev/null || true
+            systemctl enable "$(basename "$unit_path")" &>/dev/null || true
+            systemctl restart "$(basename "$unit_path")" &>/dev/null || true
+        fi
+    fi
+}
+
+disable_cf_firewall() {
+    local conf_path bin_path unit_path unit_name
+    conf_path=$(cf_firewall_conf_path)
+    bin_path=$(cf_firewall_script_path)
+    unit_path=$(cf_firewall_unit_path)
+    unit_name=$(basename "$unit_path")
+
+    if [ "${CF_FIREWALL_SKIP_APPLY:-0}" != "1" ]; then
+        if [ -x "$bin_path" ]; then
+            CF_FIREWALL_CONF="$conf_path" "$bin_path" remove || true
+        fi
+        if check_cmd systemctl; then
+            systemctl stop "$unit_name" &>/dev/null || true
+            systemctl disable "$unit_name" &>/dev/null || true
+        fi
+    fi
+    rm -f -- "$conf_path" "$unit_path" "$bin_path"
+    if [ "${CF_FIREWALL_SKIP_APPLY:-0}" != "1" ] && check_cmd systemctl; then
+        systemctl daemon-reload &>/dev/null || true
+    fi
 }

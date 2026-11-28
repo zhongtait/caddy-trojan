@@ -186,6 +186,29 @@ if [ "$managed_caddy" = "1" ] && { [ -f /etc/systemd/system/caddy-renew.timer ] 
     ok "Certificate renewal timer removed"
 fi
 
+for timer_name in easytrojan-traffic-reset easytrojan-traffic-maintain; do
+    if [ -f "/etc/systemd/system/${timer_name}.timer" ] || [ -f "/etc/systemd/system/${timer_name}.service" ]; then
+        systemctl stop "${timer_name}.timer" &>/dev/null || true
+        systemctl disable "${timer_name}.timer" &>/dev/null || true
+        rm -f "/etc/systemd/system/${timer_name}.timer" "/etc/systemd/system/${timer_name}.service"
+        ok "Removed ${timer_name} timer"
+    fi
+done
+
+if [ -x /usr/local/bin/easytrojan-cf-firewall ]; then
+    /usr/local/bin/easytrojan-cf-firewall remove &>/dev/null || true
+fi
+if [ -f /etc/systemd/system/easytrojan-cf-firewall.service ]; then
+    systemctl stop easytrojan-cf-firewall.service &>/dev/null || true
+    systemctl disable easytrojan-cf-firewall.service &>/dev/null || true
+    rm -f /etc/systemd/system/easytrojan-cf-firewall.service
+    ok "Removed Cloudflare origin firewall service"
+fi
+if [ -f /usr/local/bin/easytrojan-cf-firewall ]; then
+    rm -f /usr/local/bin/easytrojan-cf-firewall
+    ok "Removed /usr/local/bin/easytrojan-cf-firewall"
+fi
+
 if [ "$managed_caddy" = "1" ] && [ -d /etc/caddy ]; then
     for path in /etc/caddy/Caddyfile /etc/caddy/.easytrojan-managed /etc/caddy/trojan \
         /etc/caddy/www /etc/caddy/certs /etc/caddy/certificates /etc/caddy/acme \

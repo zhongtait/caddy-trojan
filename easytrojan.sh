@@ -4,7 +4,7 @@
 # Supports: CentOS/RedHat 7+, Debian 9+, Ubuntu 16+
 #
 # Usage:
-#   bash easytrojan.sh install --domain DOMAIN [--password PASS] [--version VER] [--outbound-ip ipv4|ipv6] [--skip-domain-check]
+#   bash easytrojan.sh install --domain DOMAIN [--password PASS] [--version VER] [--outbound-ip ipv4|ipv6] [--ws-path PATH|auto] [--skip-domain-check]
 #                            [--tls-mode auto|origin] [--origin-cert PATH] [--origin-key PATH]
 #                            [--tune-system]
 #   bash easytrojan.sh update  [--version VER]
@@ -12,10 +12,16 @@
 #   bash easytrojan.sh status [--show-link] [--server ADDR] [--port PORT] [--name NAME]
 #   bash easytrojan.sh doctor [--network]
 #   bash easytrojan.sh tune-system
-#   bash easytrojan.sh traffic [--key HASH] [--password PASS] [--ip CLIENT_IP] [--target HOST:PORT] [--top N] [--sort total|up|down|target|client|ip] [--show-password] [--flat] [--json]
+#   bash easytrojan.sh traffic [--key HASH] [--password PASS] [--ip CLIENT_IP] [--target HOST:PORT] [--top N] [--offset N] [--sort total|up|down|target|client|ip] [--show-password] [--flat] [--json]
+#   bash easytrojan.sh traffic reset --yes [--key HASH]
+#   bash easytrojan.sh traffic prune [--days N] [--max-per-user N] [--yes]
+#   bash easytrojan.sh traffic enforce-quota [--dry-run]
+#   bash easytrojan.sh traffic schedule {status|enable|disable} ...
 #   bash easytrojan.sh link [--server ADDR] [--port PORT] [--password PASS] [--name NAME]
 #   bash easytrojan.sh cert {auto|origin|status} ...
-#   bash easytrojan.sh user {add|list|remark|del} ...
+#   bash easytrojan.sh ws-path {status|auto|reset|/PATH}
+#   bash easytrojan.sh firewall {cf-only|off|status} [--port PORT] [--refresh]
+#   bash easytrojan.sh user {add|list|remark|quota|del} ...
 #   bash easytrojan.sh hub enable|disable|status|url|token|list|remove|join|leave ...
 #   bash easytrojan.sh <password> <domain>   # legacy
 #
@@ -43,10 +49,17 @@ CADDY_DATA_DIR="${CADDY_XDG_DATA_HOME}/caddy"
 CADDY_DATA_MARKER="${CADDY_DATA_DIR}/.easytrojan-managed"
 TROJAN_DIR="${CADDY_DIR}/trojan"
 PASSWD_FILE="${TROJAN_DIR}/passwd.txt"
+SUSPENDED_PASSWD_FILE="${TROJAN_DIR}/suspended-passwd.txt"
 REMARKS_DIR="${TROJAN_DIR}/remarks"
+QUOTAS_DIR="${TROJAN_DIR}/quotas"
+TRAFFIC_SCHEDULE_CONF="${TROJAN_DIR}/traffic-schedule.conf"
 CONFIG_LOCK_FILE="${TROJAN_DIR}/.config.lock"
 DOMAIN_FILE="${TROJAN_DIR}/domain.txt"
 OUTBOUND_IP_PRIORITY_FILE="${TROJAN_DIR}/outbound-ip-priority.txt"
+WS_PATH_FILE="${TROJAN_DIR}/ws-path.txt"
+CF_FIREWALL_CONF="${TROJAN_DIR}/cf-firewall.conf"
+CF_FIREWALL_BIN="/usr/local/bin/easytrojan-cf-firewall"
+CF_FIREWALL_UNIT="easytrojan-cf-firewall.service"
 TLS_MODE_FILE="${TROJAN_DIR}/tls-mode.txt"
 TLS_CERT_FILE_REC="${TROJAN_DIR}/tls-cert.path"
 TLS_KEY_FILE_REC="${TROJAN_DIR}/tls-key.path"
@@ -426,6 +439,7 @@ origin_cert_src=""
 origin_key_src=""
 tune_system="0"
 outbound_ip_priority=""
+ws_path=""
 
 cmd="${1:-}"
 case "$cmd" in
@@ -466,6 +480,14 @@ case "$cmd" in
     cert|tls)
         shift
         do_cert "$@"
+        ;;
+    ws-path|ws_path)
+        shift
+        do_ws_path "$@"
+        ;;
+    firewall|fw)
+        shift
+        do_firewall "$@"
         ;;
     user)
         shift

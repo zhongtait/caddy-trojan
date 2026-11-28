@@ -210,6 +210,14 @@ with_config_lock() {
 # upstream keeps authentication and counters on the hot path in memory while
 # asynchronously persisting them to Caddy storage; delete must clear storage
 # through the Admin API as well as updating passwd.txt/Caddyfile.
+cloudflare_ipv4_cidrs() {
+    printf '%s' "173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22"
+}
+
+cloudflare_ipv6_cidrs() {
+    printf '%s' "2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32"
+}
+
 _generate_caddyfile() {
     local site_domain="${1:-}"
     if [ -z "$site_domain" ]; then
@@ -220,6 +228,7 @@ _generate_caddyfile() {
     chown root:caddy "$CADDY_DIR" "$TROJAN_DIR" "$WWW_DIR" 2>/dev/null || true
     chmod 750 "$CADDY_DIR" "$TROJAN_DIR"
     local users_block tls_line hub_proxy="" config_tmp outbound_ip
+    local active_ws_path ws_directive cf_cidrs
     local https_port="${CADDY_HTTPS_PORT:-443}" http_port="${CADDY_HTTP_PORT:-80}"
     local admin_listen="${CADDY_ADMIN_LISTEN:-127.0.0.1:2019}"
     local https_redirect_port="" https_site_label
@@ -246,6 +255,17 @@ _generate_caddyfile() {
     # NOTE: $(...) strips trailing newlines; keep ${tls_line} on its own line in the heredoc.
     tls_line=$(tls_directive_line "$site_domain")
     outbound_ip=$(current_outbound_ip_priority)
+    if declare -F current_ws_path >/dev/null 2>&1; then
+        active_ws_path=$(current_ws_path)
+    else
+        active_ws_path="/"
+    fi
+    if [ "$active_ws_path" = "/" ]; then
+        ws_directive="websocket"
+    else
+        ws_directive="websocket ${active_ws_path}"
+    fi
+    cf_cidrs=$(printf '%s %s' "$(cloudflare_ipv4_cidrs)" "$(cloudflare_ipv6_cidrs)")
     if hub_enabled; then
         # Sibling handle blocks are mutually exclusive. SPA try_files MUST live in its own
         # catch-all handle; otherwise it rewrites /sub/* and /api/* to index.html (browser 404).
@@ -278,7 +298,7 @@ _generate_caddyfile() {
     servers :${https_port} {
         # Browsers may use h2; Trojan WebSocket clients must offer http/1.1 only.
         protocols h2 h1
-        trusted_proxies static 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32
+        trusted_proxies static ${cf_cidrs}
         trusted_proxies_strict
         client_ip_headers CF-Connecting-IP X-Forwarded-For
     }
@@ -297,7 +317,7 @@ ${tls_line}
     }
     trojan {
         connect_method
-        websocket
+        ${ws_directive}
     }
 ${hub_proxy}    # Camouflage SPA (IT-Tools): only when hub routes above did not match
     handle {
@@ -338,6 +358,11 @@ EOF
     printf '%s\n' "$outbound_ip" > "$OUTBOUND_IP_PRIORITY_FILE"
     chown root:caddy "$OUTBOUND_IP_PRIORITY_FILE" 2>/dev/null || true
     chmod 640 "$OUTBOUND_IP_PRIORITY_FILE"
+    if [ -n "${WS_PATH_FILE:-}" ]; then
+        printf '%s\n' "$active_ws_path" > "$WS_PATH_FILE"
+        chown root:caddy "$WS_PATH_FILE" 2>/dev/null || true
+        chmod 640 "$WS_PATH_FILE"
+    fi
     printf 'managed_by=easytrojan\nversion=1\n' > "$MANAGED_MARKER"
     chown root:caddy "$MANAGED_MARKER" 2>/dev/null || true
     chmod 640 "$MANAGED_MARKER"

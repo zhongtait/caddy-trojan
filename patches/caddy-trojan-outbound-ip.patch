@@ -14,7 +14,7 @@ index fd5bc98..8500b97 100644
  
  	app.lg = ctx.Logger(app)
 diff --git a/app/proxy.go b/app/proxy.go
-index d1844bb..6d72b81 100644
+index d1844bb..418e1b0 100644
 --- a/app/proxy.go
 +++ b/app/proxy.go
 @@ -2,6 +2,7 @@ package app
@@ -25,17 +25,19 @@ index d1844bb..6d72b81 100644
  	"encoding/base64"
  	"encoding/json"
  	"errors"
-@@ -9,7 +10,9 @@ import (
+@@ -9,7 +10,11 @@ import (
  	"io"
  	"net"
  	"net/http"
 +	"net/netip"
++	"slices"
++	"strings"
  	"sync"
 +	"time"
  
  	"golang.org/x/net/proxy"
  
-@@ -34,7 +37,19 @@ func init() {
+@@ -34,7 +39,19 @@ func init() {
  	fn := ProxyParser(nil)
  
  	fn = func(args []string) (json.RawMessage, error) {
@@ -56,23 +58,250 @@ index d1844bb..6d72b81 100644
  	}
  	RegisterProxyParser("none", fn)
  	RegisterProxyParser("no_proxy", fn)
-@@ -95,7 +110,14 @@ type Proxy interface {
+@@ -95,7 +112,241 @@ type Proxy interface {
  	trojan.Dialer
  }
  
 -type NoProxy struct{}
 +const (
-+	noProxyDialTimeout   = 10 * time.Second
-+	noProxyFallbackDelay = 300 * time.Millisecond
++	noProxyDialTimeout        = 10 * time.Second
++	noProxyDNSTimeout         = 5 * time.Second
++	noProxyFallbackDelay      = 300 * time.Millisecond
++	noProxyFastFallbackDelay  = 10 * time.Millisecond
++	noProxyDNSPositiveTTL     = 30 * time.Second
++	noProxyDNSNegativeTTL     = 5 * time.Second
++	noProxyFamilyMemoryTTL    = 2 * time.Minute
++	noProxyMaxCacheEntries    = 2048
 +)
++
++type dnsCacheEntry struct {
++	ips       []net.IP
++	err       error
++	expiresAt time.Time
++}
++
++type dnsInflight struct {
++	done chan struct{}
++	ips  []net.IP
++	err  error
++}
++
++type familyPrefEntry struct {
++	preferIPv4 bool
++	expiresAt  time.Time
++}
++
++type noProxyCache struct {
++	mu       sync.Mutex
++	dns      map[string]dnsCacheEntry
++	inflight map[string]*dnsInflight
++	families map[string]familyPrefEntry
++}
++
++func newNoProxyCache() *noProxyCache {
++	return &noProxyCache{
++		dns:      make(map[string]dnsCacheEntry),
++		inflight: make(map[string]*dnsInflight),
++		families: make(map[string]familyPrefEntry),
++	}
++}
++
++var defaultNoProxyCache = newNoProxyCache()
 +
 +type NoProxy struct {
 +	Network string `json:"network,omitempty"`
++
++	cache    *noProxyCache                                                     `json:"-"`
++	nowFn    func() time.Time                                                  `json:"-"`
++	lookupIP func(ctx context.Context, network, host string) ([]net.IP, error) `json:"-"`
++	dialFn   func(ctx context.Context, network, addr string) (net.Conn, error) `json:"-"`
++}
++
++func (p *NoProxy) getCache() *noProxyCache {
++	if p.cache != nil {
++		return p.cache
++	}
++	return defaultNoProxyCache
++}
++
++func (p *NoProxy) now() time.Time {
++	if p.nowFn != nil {
++		return p.nowFn()
++	}
++	return time.Now()
++}
++
++func (p *NoProxy) lookup(ctx context.Context, network, host string) ([]net.IP, error) {
++	if p.lookupIP != nil {
++		return p.lookupIP(ctx, network, host)
++	}
++	return net.DefaultResolver.LookupIP(ctx, network, host)
++}
++
++func (p *NoProxy) dialWithContext(ctx context.Context, network, addr string) (net.Conn, error) {
++	if p.dialFn != nil {
++		return p.dialFn(ctx, network, addr)
++	}
++	return (&net.Dialer{}).DialContext(ctx, network, addr)
++}
++
++func shouldNegativeCacheDNSError(err error) bool {
++	if err == nil {
++		return false
++	}
++	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
++		return false
++	}
++	var dnsErr *net.DNSError
++	if errors.As(err, &dnsErr) && dnsErr.IsTimeout {
++		return false
++	}
++	return true
++}
++
++func (c *noProxyCache) pruneExpiredLocked(now time.Time) {
++	for k, v := range c.dns {
++		if !now.Before(v.expiresAt) {
++			delete(c.dns, k)
++		}
++	}
++	for k, v := range c.families {
++		if !now.Before(v.expiresAt) {
++			delete(c.families, k)
++		}
++	}
++}
++
++func (p *NoProxy) resolveCached(ctx context.Context, host string) ([]net.IP, error) {
++	key := strings.ToLower(strings.TrimSuffix(host, "."))
++	cache := p.getCache()
++	now := p.now()
++
++	cache.mu.Lock()
++	if entry, ok := cache.dns[key]; ok && now.Before(entry.expiresAt) {
++		ips := slices.Clone(entry.ips)
++		err := entry.err
++		cache.mu.Unlock()
++		return ips, err
++	}
++	if in, ok := cache.inflight[key]; ok {
++		cache.mu.Unlock()
++		select {
++		case <-in.done:
++			return slices.Clone(in.ips), in.err
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		}
++	}
++	in := &dnsInflight{done: make(chan struct{})}
++	cache.inflight[key] = in
++	cache.mu.Unlock()
++
++	lookupCtx, cancel := context.WithTimeout(context.Background(), noProxyDNSTimeout)
++	ips, err := p.lookup(lookupCtx, "ip", host)
++	lookupErr := lookupCtx.Err()
++	cancel()
++
++	cloned := slices.Clone(ips)
++	in.ips = cloned
++	in.err = err
++	close(in.done)
++
++	finishNow := p.now()
++	cache.mu.Lock()
++	delete(cache.inflight, key)
++	if err == nil && len(cloned) > 0 {
++		if len(cache.dns) >= noProxyMaxCacheEntries {
++			cache.pruneExpiredLocked(finishNow)
++			for k := range cache.dns {
++				if len(cache.dns) < noProxyMaxCacheEntries {
++					break
++				}
++				delete(cache.dns, k)
++			}
++		}
++		cache.dns[key] = dnsCacheEntry{
++			ips:       cloned,
++			expiresAt: finishNow.Add(noProxyDNSPositiveTTL),
++		}
++	} else if err != nil && lookupErr == nil && shouldNegativeCacheDNSError(err) {
++		if len(cache.dns) >= noProxyMaxCacheEntries {
++			cache.pruneExpiredLocked(finishNow)
++			for k := range cache.dns {
++				if len(cache.dns) < noProxyMaxCacheEntries {
++					break
++				}
++				delete(cache.dns, k)
++			}
++		}
++		cache.dns[key] = dnsCacheEntry{
++			err:       err,
++			expiresAt: finishNow.Add(noProxyDNSNegativeTTL),
++		}
++	}
++	cache.mu.Unlock()
++
++	if err != nil {
++		return nil, err
++	}
++	return slices.Clone(cloned), nil
++}
++
++func (c *noProxyCache) preferredFamily(key string, now time.Time) (preferIPv4 bool, ok bool) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	entry, exists := c.families[key]
++	if !exists || !now.Before(entry.expiresAt) {
++		if exists {
++			delete(c.families, key)
++		}
++		return false, false
++	}
++	return entry.preferIPv4, true
++}
++
++func (c *noProxyCache) recordFamilyOutcome(key string, wonIPv4, primaryWasIPv4 bool, now time.Time) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if wonIPv4 == primaryWasIPv4 {
++		// Primary family succeeded as expected; clear any prior fallback preference
++		delete(c.families, key)
++		return
++	}
++	if len(c.families) >= noProxyMaxCacheEntries {
++		c.pruneExpiredLocked(now)
++		for k := range c.families {
++			if len(c.families) < noProxyMaxCacheEntries {
++				break
++			}
++			delete(c.families, k)
++		}
++	}
++	c.families[key] = familyPrefEntry{
++		preferIPv4: wonIPv4,
++		expiresAt:  now.Add(noProxyFamilyMemoryTTL),
++	}
++}
++
++func filterIPsForNetwork(network string, ips []net.IP) []net.IP {
++	wantV4 := strings.HasSuffix(network, "4")
++	wantV6 := strings.HasSuffix(network, "6")
++	if !wantV4 && !wantV6 {
++		return ips
++	}
++	out := make([]net.IP, 0, len(ips))
++	for _, ip := range ips {
++		isV4 := ip.To4() != nil
++		if (wantV4 && isV4) || (wantV6 && !isV4) {
++			out = append(out, ip)
++		}
++	}
++	return out
 +}
  
  func (NoProxy) CaddyModule() caddy.ModuleInfo {
  	return caddy.ModuleInfo{
-@@ -108,14 +130,158 @@ func (*NoProxy) Close() error {
+@@ -108,14 +359,215 @@ func (*NoProxy) Close() error {
  	return nil
  }
  
@@ -88,18 +317,28 @@ index d1844bb..6d72b81 100644
 +	if err := ctx.Err(); err != nil {
 +		return nil, err
 +	}
-+	if p.Network == "" || !isTCPOrUDP(network) {
-+		return (&net.Dialer{}).DialContext(ctx, network, addr)
++	if !isTCPOrUDP(network) {
++		return p.dialWithContext(ctx, network, addr)
 +	}
 +	host, port, err := net.SplitHostPort(addr)
 +	if err != nil || isIPLiteral(host) {
-+		return (&net.Dialer{}).DialContext(ctx, network, addr)
++		return p.dialWithContext(ctx, network, addr)
 +	}
-+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
++	ips, err := p.resolveCached(ctx, host)
 +	if err != nil {
 +		return nil, err
 +	}
-+	primary, fallback := p.prioritizedIPs(ips)
++	ips = filterIPsForNetwork(network, ips)
++	if len(ips) == 0 {
++		return nil, fmt.Errorf("no IP address found for %s", host)
++	}
++
++	hostKey := strings.ToLower(strings.TrimSuffix(host, "."))
++	cache := p.getCache()
++	now := p.now()
++	preferredV4, hasFamilyPref := cache.preferredFamily(hostKey, now)
++
++	primary, fallback := p.prioritizedIPsWithHint(ips, preferredV4, hasFamilyPref)
 +	if isUDPNetwork(network) {
 +		if len(primary) == 0 {
 +			primary = fallback
@@ -107,9 +346,22 @@ index d1844bb..6d72b81 100644
 +		if len(primary) == 0 {
 +			return nil, fmt.Errorf("no IP address found for %s", host)
 +		}
-+		return (&net.Dialer{}).DialContext(ctx, network, net.JoinHostPort(primary[0].String(), port))
++		return p.dialWithContext(ctx, network, net.JoinHostPort(primary[0].String(), port))
 +	}
-+	return dialTCPPreferred(ctx, network, port, primary, fallback)
++
++	fallbackDelay := noProxyFallbackDelay
++	if p.Network != "" && hasFamilyPref {
++		configuredV4 := p.Network == "ipv4"
++		if preferredV4 != configuredV4 {
++			fallbackDelay = noProxyFastFallbackDelay
++		}
++	}
++	initialPrimaryV4 := len(primary) > 0 && primary[0].To4() != nil
++	conn, wonIPv4, err := dialTCPPreferred(ctx, network, port, primary, fallback, fallbackDelay, p.dialWithContext)
++	if err == nil && len(primary) > 0 && len(fallback) > 0 {
++		cache.recordFamilyOutcome(hostKey, wonIPv4, initialPrimaryV4, p.now())
++	}
++	return conn, err
 +}
 +
 +func isTCPOrUDP(network string) bool {
@@ -134,9 +386,31 @@ index d1844bb..6d72b81 100644
  }
  
 +func (p *NoProxy) prioritizedIPs(ips []net.IP) (primary, fallback []net.IP) {
++	return p.prioritizedIPsWithHint(ips, false, false)
++}
++
++func (p *NoProxy) prioritizedIPsWithHint(ips []net.IP, preferredV4, hasFamilyPref bool) (primary, fallback []net.IP) {
++	if p.Network == "ipv4" || p.Network == "ipv6" {
++		for _, ip := range ips {
++			isV4 := ip.To4() != nil
++			if (p.Network == "ipv4" && isV4) || (p.Network == "ipv6" && !isV4) {
++				primary = append(primary, ip)
++			} else {
++				fallback = append(fallback, ip)
++			}
++		}
++		return primary, fallback
++	}
++	if len(ips) == 0 {
++		return nil, nil
++	}
++	firstIsV4 := ips[0].To4() != nil
++	if hasFamilyPref {
++		firstIsV4 = preferredV4
++	}
 +	for _, ip := range ips {
 +		isV4 := ip.To4() != nil
-+		if (p.Network == "ipv4" && isV4) || (p.Network == "ipv6" && !isV4) {
++		if isV4 == firstIsV4 {
 +			primary = append(primary, ip)
 +		} else {
 +			fallback = append(fallback, ip)
@@ -145,7 +419,13 @@ index d1844bb..6d72b81 100644
 +	return primary, fallback
 +}
 +
-+func dialTCPPreferred(parent context.Context, network, port string, primary, fallback []net.IP) (net.Conn, error) {
++func dialTCPPreferred(
++	parent context.Context,
++	network, port string,
++	primary, fallback []net.IP,
++	fallbackDelay time.Duration,
++	dialFn func(ctx context.Context, network, addr string) (net.Conn, error),
++) (net.Conn, bool, error) {
 +	type result struct {
 +		conn net.Conn
 +		err  error
@@ -155,7 +435,13 @@ index d1844bb..6d72b81 100644
 +		primary, fallback = fallback, nil
 +	}
 +	if len(primary) == 0 {
-+		return nil, errors.New("no IP address found")
++		return nil, false, errors.New("no IP address found")
++	}
++	if fallbackDelay <= 0 {
++		fallbackDelay = noProxyFallbackDelay
++	}
++	if dialFn == nil {
++		dialFn = (&net.Dialer{}).DialContext
 +	}
 +	ctx, cancel := context.WithCancel(parent)
 +	defer cancel()
@@ -165,7 +451,7 @@ index d1844bb..6d72b81 100644
 +		workers.Add(1)
 +		go func() {
 +			defer workers.Done()
-+			conn, err := (&net.Dialer{}).DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
++			conn, err := dialFn(ctx, network, net.JoinHostPort(ip.String(), port))
 +			results <- result{conn: conn, err: err, ipv4: ipv4}
 +		}()
 +	}
@@ -184,7 +470,7 @@ index d1844bb..6d72b81 100644
 +
 +	dial(primary[0], primary[0].To4() != nil)
 +	primaryNext, fallbackNext, pending := 1, 0, 1
-+	timer := time.NewTimer(noProxyFallbackDelay)
++	timer := time.NewTimer(fallbackDelay)
 +	defer timer.Stop()
 +	var timerC <-chan time.Time = timer.C
 +	primaryV4 := primary[0].To4() != nil
@@ -193,12 +479,12 @@ index d1844bb..6d72b81 100644
 +		select {
 +		case <-ctx.Done():
 +			cleanup()
-+			return nil, ctx.Err()
++			return nil, false, ctx.Err()
 +		case got := <-results:
 +			pending--
 +			if got.err == nil {
 +				cleanup()
-+				return got.conn, nil
++				return got.conn, got.ipv4, nil
 +			}
 +			if got.conn != nil {
 +				_ = got.conn.Close()
@@ -216,7 +502,7 @@ index d1844bb..6d72b81 100644
 +		case <-timerC:
 +			if ctx.Err() != nil {
 +				cleanup()
-+				return nil, ctx.Err()
++				return nil, false, ctx.Err()
 +			}
 +			if fallbackNext < len(fallback) {
 +				dial(fallback[fallbackNext], fallback[fallbackNext].To4() != nil)
@@ -227,17 +513,164 @@ index d1844bb..6d72b81 100644
 +		}
 +	}
 +	cancel()
-+	return nil, lastErr
++	return nil, false, lastErr
 +}
 +
  type noProxy struct {
  	NoProxy
  }
+diff --git a/app/proxy_test.go b/app/proxy_test.go
+new file mode 100644
+index 0000000..abc2a90
+--- /dev/null
++++ b/app/proxy_test.go
+@@ -0,0 +1,141 @@
++package app
++
++import (
++	"context"
++	"errors"
++	"net"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++func TestNoProxyDNSPositiveNegativeCacheAndExpiry(t *testing.T) {
++	now := time.Unix(1_700_000_000, 0)
++	var mu sync.Mutex
++	var lookups atomic.Int32
++	lookupErr := error(nil)
++	resolvedIPs := []net.IP{net.ParseIP("93.184.216.34")}
++
++	p := &NoProxy{
++		cache: newNoProxyCache(),
++		nowFn: func() time.Time {
++			mu.Lock()
++			defer mu.Unlock()
++			return now
++		},
++		lookupIP: func(ctx context.Context, network, host string) ([]net.IP, error) {
++			lookups.Add(1)
++			mu.Lock()
++			defer mu.Unlock()
++			if lookupErr != nil {
++				return nil, lookupErr
++			}
++			return resolvedIPs, nil
++		},
++		dialFn: func(ctx context.Context, network, addr string) (net.Conn, error) {
++			c1, c2 := net.Pipe()
++			_ = c2.Close()
++			return c1, nil
++		},
++	}
++
++	// 1. Positive cache hit within 30s
++	for i := 0; i < 3; i++ {
++		conn, err := p.dialContext(context.Background(), "tcp", "example.com:443")
++		if err != nil {
++			t.Fatalf("dial %d error = %v", i, err)
++		}
++		_ = conn.Close()
++	}
++	if lookups.Load() != 1 {
++		t.Fatalf("lookups = %d, want 1 positive cached lookup", lookups.Load())
++	}
++
++	// 2. Expiry after 31s triggers fresh lookup, and permanent DNS error is negative-cached for 5s
++	mu.Lock()
++	now = now.Add(31 * time.Second)
++	lookupErr = &net.DNSError{Err: "no such host", Name: "example.com", IsNotFound: true}
++	mu.Unlock()
++
++	if _, err := p.dialContext(context.Background(), "tcp", "example.com:443"); err == nil {
++		t.Fatal("expected DNS error on expired refresh")
++	}
++	if _, err := p.dialContext(context.Background(), "tcp", "example.com:443"); err == nil {
++		t.Fatal("expected cached negative DNS error")
++	}
++	if lookups.Load() != 2 {
++		t.Fatalf("lookups = %d, want 2 (negative cache hit)", lookups.Load())
++	}
++
++	// 3. After 6s negative TTL expires and succeeds again
++	mu.Lock()
++	now = now.Add(6 * time.Second)
++	lookupErr = nil
++	mu.Unlock()
++
++	conn, err := p.dialContext(context.Background(), "tcp", "example.com:443")
++	if err != nil {
++		t.Fatalf("dial after negative TTL error = %v", err)
++	}
++	_ = conn.Close()
++	if lookups.Load() != 3 {
++		t.Fatalf("lookups = %d, want 3 after negative TTL expiry", lookups.Load())
++	}
++}
++
++func TestNoProxyHappyEyeballsFamilyMemory(t *testing.T) {
++	now := time.Unix(1_700_000_000, 0)
++	var mu sync.Mutex
++	var dialedAddrs []string
++
++	p := &NoProxy{
++		cache: newNoProxyCache(),
++		nowFn: func() time.Time {
++			mu.Lock()
++			defer mu.Unlock()
++			return now
++		},
++		lookupIP: func(ctx context.Context, network, host string) ([]net.IP, error) {
++			// Return IPv6 first, then IPv4
++			return []net.IP{net.ParseIP("2001:db8::1"), net.ParseIP("93.184.216.34")}, nil
++		},
++		dialFn: func(ctx context.Context, network, addr string) (net.Conn, error) {
++			mu.Lock()
++			dialedAddrs = append(dialedAddrs, addr)
++			mu.Unlock()
++			host, _, _ := net.SplitHostPort(addr)
++			if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
++				return nil, errors.New("ipv6 unreachable")
++			}
++			c1, c2 := net.Pipe()
++			_ = c2.Close()
++			return c1, nil
++		},
++	}
++
++	// First dial tries IPv6 first, fails, falls back to IPv4 and records IPv4 preference
++	conn, err := p.dialContext(context.Background(), "tcp", "dualstack.example.com:443")
++	if err != nil {
++		t.Fatalf("first dial error = %v", err)
++	}
++	_ = conn.Close()
++
++	mu.Lock()
++	dialedAddrs = nil
++	mu.Unlock()
++
++	// Second dial within 2 minutes must prefer IPv4 immediately without touching IPv6
++	conn, err = p.dialContext(context.Background(), "tcp", "dualstack.example.com:443")
++	if err != nil {
++		t.Fatalf("second dial error = %v", err)
++	}
++	_ = conn.Close()
++
++	mu.Lock()
++	got := append([]string(nil), dialedAddrs...)
++	mu.Unlock()
++	if len(got) != 1 || got[0] != "93.184.216.34:443" {
++		t.Fatalf("second dial addrs = %v, want [93.184.216.34:443]", got)
++	}
++}
 diff --git a/app/upstream.go b/app/upstream.go
-index 732c54a..a31f2ab 100644
+index 732c54a..ec6a6f0 100644
 --- a/app/upstream.go
 +++ b/app/upstream.go
-@@ -2,10 +2,14 @@ package app
+@@ -2,10 +2,15 @@ package app
  
  import (
  	"context"
@@ -246,16 +679,24 @@ index 732c54a..a31f2ab 100644
 +	"errors"
  	"fmt"
 +	"io/fs"
++	"sort"
  	"strings"
  	"sync"
 +	"time"
  
  	"github.com/caddyserver/caddy/v2"
  	"github.com/caddyserver/certmagic"
-@@ -25,6 +29,37 @@ type Traffic struct {
- 	Down int64 `json:"down"`
+@@ -21,8 +26,48 @@ func init() {
  }
  
+ type Traffic struct {
+-	Up   int64 `json:"up"`
+-	Down int64 `json:"down"`
++	Up        int64 `json:"up"`
++	Down      int64 `json:"down"`
++	UpdatedAt int64 `json:"updated_at,omitempty"`
++}
++
 +type TargetTraffic struct {
 +	Key    string `json:"key"`
 +	IP     string `json:"ip,omitempty"`
@@ -268,8 +709,16 @@ index 732c54a..a31f2ab 100644
 +	RangeTargets(func(string, string, string, int64, int64))
 +}
 +
++type TargetDetailUpstream interface {
++	RangeTargetDetails(func(TargetTraffic))
++}
++
 +type TrafficResetter interface {
 +	ResetTraffic(string) error
++}
++
++type TrafficPruner interface {
++	PruneTargets(maxAge time.Duration, maxPerUser int) (int, error)
 +}
 +
 +func targetKeyString(ip, target string) string {
@@ -285,57 +734,78 @@ index 732c54a..a31f2ab 100644
 +		return parts[0], parts[1]
 +	}
 +	return "", raw
-+}
-+
+ }
+ 
  type Upstream interface {
- 	Add(string) error
- 	Delete(string) error
-@@ -39,15 +74,24 @@ const (
+@@ -39,25 +84,55 @@ const (
  	TaskAdd TaskType = iota
  	TaskDelete
  	TaskConsume
 +	TaskConsumeTarget
 +	TaskResetTraffic
++	TaskPruneTargets
++)
++
++const (
++	memoryUpstreamQueueSize     = 256
++	memoryUpstreamFlushInterval = time.Second
  )
  
-+const memoryUpstreamQueueSize = 256
-+
 +var errMemoryUpstreamClosed = errors.New("memory upstream is closed")
++
++type pendingTargetKey struct {
++	key    string
++	ip     string
++	target string
++}
 +
  type Task struct {
  	Type  TaskType
  	Value struct {
- 		Password string
- 		Key      string
+-		Password string
+-		Key      string
++		Password   string
++		Key        string
  		Traffic
-+		IP     string
-+		Target string
++		IP         string
++		Target     string
++		MaxAge     time.Duration
++		MaxPerUser int
  	}
-+	Done chan error
++	Pruned *int
++	Done   chan error
  }
  
  type MemoryUpstream struct {
-@@ -56,8 +100,13 @@ type MemoryUpstream struct {
- 	ch chan Task
- 	up Upstream
+ 	UpstreamRaw json.RawMessage `json:"persist" caddy:"namespace=trojan.upstream inline_key=upstream"`
+ 
+-	ch chan Task
+-	up Upstream
++	ch      chan Task
++	flushCh chan struct{}
++	up      Upstream
  
 -	mu sync.RWMutex
 -	mm map[string]Traffic
-+	mu        sync.RWMutex
-+	mm        map[string]Traffic
-+	tm        map[string]map[string]Traffic
-+	persistMu sync.RWMutex
-+	closed    bool
-+	worker    sync.WaitGroup
-+	logger    *zap.Logger
++	mu             sync.RWMutex
++	mm             map[string]Traffic
++	tm             map[string]map[string]Traffic
++	pendingUsers   map[string]Traffic
++	pendingTargets map[pendingTargetKey]Traffic
++	persistMu      sync.RWMutex
++	closed         bool
++	worker         sync.WaitGroup
++	logger         *zap.Logger
  }
  
  func (*MemoryUpstream) CaddyModule() caddy.ModuleInfo {
-@@ -69,9 +118,10 @@ func (*MemoryUpstream) CaddyModule() caddy.ModuleInfo {
+@@ -69,9 +144,12 @@ func (*MemoryUpstream) CaddyModule() caddy.ModuleInfo {
  
  func (u *MemoryUpstream) Provision(ctx caddy.Context) error {
  	u.mm = make(map[string]Traffic)
 +	u.tm = make(map[string]map[string]Traffic)
++	u.pendingUsers = make(map[string]Traffic)
++	u.pendingTargets = make(map[pendingTargetKey]Traffic)
 +	u.logger = ctx.Logger(u)
  
  	if u.UpstreamRaw == nil {
@@ -343,14 +813,19 @@ index 732c54a..a31f2ab 100644
  		return nil
  	}
  
-@@ -85,36 +135,109 @@ func (u *MemoryUpstream) Provision(ctx caddy.Context) error {
+@@ -85,36 +163,164 @@ func (u *MemoryUpstream) Provision(ctx caddy.Context) error {
  		u.AddKey(k)
  		u.Consume(k, nr, nw)
  	})
-+	if targets, ok := up.(TargetUpstream); ok {
++	if details, ok := up.(TargetDetailUpstream); ok {
++		details.RangeTargetDetails(func(row TargetTraffic) {
++			u.AddTargetKey(row.Key, row.IP, row.Target)
++			u.consumeTargetMemoryAt(row.Key, row.IP, row.Target, row.Up, row.Down, row.UpdatedAt)
++		})
++	} else if targets, ok := up.(TargetUpstream); ok {
 +		targets.RangeTargets(func(k, ip, target string, nr, nw int64) {
 +			u.AddTargetKey(k, ip, target)
-+			u.consumeTargetMemory(k, ip, target, nr, nw)
++			u.consumeTargetMemoryAt(k, ip, target, nr, nw, 0)
 +		})
 +	}
  
@@ -360,65 +835,151 @@ index 732c54a..a31f2ab 100644
 +	return nil
 +}
  
+-	go func(up Upstream, ch chan Task) {
 +func (u *MemoryUpstream) startPersistenceWorker(up Upstream) {
 +	u.up = up
 +	u.ch = make(chan Task, memoryUpstreamQueueSize)
++	u.flushCh = make(chan struct{}, 1)
 +	u.worker.Add(1)
- 	go func(up Upstream, ch chan Task) {
--		for {
++	go func(up Upstream, ch chan Task, flushCh chan struct{}) {
++		defer u.worker.Done()
++		ticker := time.NewTicker(memoryUpstreamFlushInterval)
++		defer ticker.Stop()
+ 		for {
 -			t, ok := <-ch
 -			if !ok {
 -				break
--			}
-+		defer u.worker.Done()
-+		for t := range ch {
-+			var err error
- 			switch t.Type {
- 			case TaskAdd:
--				up.Add(t.Value.Password)
-+				err = up.Add(t.Value.Password)
- 			case TaskDelete:
--				up.Delete(t.Value.Password)
-+				err = up.Delete(t.Value.Password)
- 			case TaskConsume:
--				up.Consume(t.Value.Key, t.Value.Up, t.Value.Down)
-+				err = up.Consume(t.Value.Key, t.Value.Up, t.Value.Down)
-+			case TaskConsumeTarget:
-+				if targets, ok := up.(TargetUpstream); ok {
-+					err = targets.ConsumeTarget(t.Value.Key, t.Value.IP, t.Value.Target, t.Value.Up, t.Value.Down)
++			select {
++			case t, ok := <-ch:
++				if !ok {
++					u.flushPending(up)
++					return
 +				}
-+			case TaskResetTraffic:
-+				if resetter, ok := up.(TrafficResetter); ok {
-+					err = resetter.ResetTraffic(t.Value.Key)
-+				}
- 			default:
++				u.executeTask(up, t)
++			case <-flushCh:
++				u.flushPending(up)
++			case <-ticker.C:
++				u.flushPending(up)
  			}
-+			if t.Done != nil {
-+				t.Done <- err
-+				close(t.Done)
-+			} else if err != nil && u.logger != nil {
-+				u.logger.Error("persisting Trojan upstream state", zap.Error(err))
-+			}
+-			switch t.Type {
+-			case TaskAdd:
+-				up.Add(t.Value.Password)
+-			case TaskDelete:
+-				up.Delete(t.Value.Password)
+-			case TaskConsume:
+-				up.Consume(t.Value.Key, t.Value.Up, t.Value.Down)
+-			default:
++		}
++	}(u.up, u.ch, u.flushCh)
++}
++
++func (u *MemoryUpstream) executeTask(up Upstream, t Task) {
++	var err error
++	switch t.Type {
++	case TaskAdd:
++		err = up.Add(t.Value.Password)
++	case TaskDelete:
++		err = up.Delete(t.Value.Password)
++	case TaskConsume:
++		err = up.Consume(t.Value.Key, t.Value.Up, t.Value.Down)
++	case TaskConsumeTarget:
++		if targets, ok := up.(TargetUpstream); ok {
++			err = targets.ConsumeTarget(t.Value.Key, t.Value.IP, t.Value.Target, t.Value.Up, t.Value.Down)
++		}
++	case TaskResetTraffic:
++		if resetter, ok := up.(TrafficResetter); ok {
++			err = resetter.ResetTraffic(t.Value.Key)
++		}
++	case TaskPruneTargets:
++		if pruner, ok := up.(TrafficPruner); ok {
++			var pruned int
++			pruned, err = pruner.PruneTargets(t.Value.MaxAge, t.Value.MaxPerUser)
++			if t.Pruned != nil {
++				*t.Pruned = pruned
+ 			}
  		}
- 	}(u.up, u.ch)
+-	}(u.up, u.ch)
++	default:
++	}
++	if t.Done != nil {
++		t.Done <- err
++		close(t.Done)
++	} else if err != nil && u.logger != nil {
++		u.logger.Error("persisting Trojan upstream state", zap.Error(err))
++	}
 +}
  
-+func (u *MemoryUpstream) Cleanup() error {
+-	return nil
++func (u *MemoryUpstream) flushPending(up Upstream) {
++	u.mu.Lock()
++	users := u.pendingUsers
++	targets := u.pendingTargets
++	if len(users) > 0 {
++		u.pendingUsers = make(map[string]Traffic)
++	}
++	if len(targets) > 0 {
++		u.pendingTargets = make(map[pendingTargetKey]Traffic)
++	}
++	u.mu.Unlock()
++
++	if len(users) > 0 {
++		userKeys := make([]string, 0, len(users))
++		for k := range users {
++			userKeys = append(userKeys, k)
++		}
++		runTargetWorkers(len(userKeys), func(index int) {
++			k := userKeys[index]
++			delta := users[k]
++			if err := up.Consume(k, delta.Up, delta.Down); err != nil && u.logger != nil {
++				u.logger.Error("persisting Trojan user traffic", zap.Error(err))
++			}
++		})
++	}
++	if len(targets) > 0 {
++		if targetUp, ok := up.(TargetUpstream); ok {
++			targetKeys := make([]pendingTargetKey, 0, len(targets))
++			for tk := range targets {
++				targetKeys = append(targetKeys, tk)
++			}
++			runTargetWorkers(len(targetKeys), func(index int) {
++				tk := targetKeys[index]
++				delta := targets[tk]
++				if err := targetUp.ConsumeTarget(tk.key, tk.ip, tk.target, delta.Up, delta.Down); err != nil && u.logger != nil {
++					u.logger.Error("persisting Trojan target traffic", zap.Error(err))
++				}
++			})
++		}
++	}
++}
++
++func (u *MemoryUpstream) notifyFlush() {
++	if u.flushCh == nil {
++		return
++	}
++	select {
++	case u.flushCh <- struct{}{}:
++	default:
++	}
+ }
+ 
+ func (u *MemoryUpstream) Cleanup() error {
+-	if u.ch == nil {
+-		return nil
 +	u.persistMu.Lock()
++	u.mu.Lock()
 +	if !u.closed {
 +		u.closed = true
 +		if u.ch != nil {
 +			close(u.ch)
 +		}
-+	}
+ 	}
+-	close(u.ch)
++	u.mu.Unlock()
 +	u.persistMu.Unlock()
 +	u.worker.Wait()
- 	return nil
- }
- 
--func (u *MemoryUpstream) Cleanup() error {
--	if u.ch == nil {
--		return nil
++	return nil
++}
++
 +func (u *MemoryUpstream) persistAndApply(task Task, apply func()) error {
 +	u.persistMu.RLock()
 +	defer u.persistMu.RUnlock()
@@ -433,41 +994,10 @@ index 732c54a..a31f2ab 100644
 +		}
 +	}
 +	apply()
-+	return nil
-+}
-+
-+func (u *MemoryUpstream) persistAndApplyExclusive(task Task, apply func()) error {
-+	u.persistMu.Lock()
-+	defer u.persistMu.Unlock()
-+	if u.closed {
-+		return errMemoryUpstreamClosed
-+	}
-+	if u.up != nil {
-+		task.Done = make(chan error, 1)
-+		u.ch <- task
-+		if err := <-task.Done; err != nil {
-+			return err
-+		}
-+	}
-+	apply()
-+	return nil
-+}
-+
-+func (u *MemoryUpstream) applyAndQueue(task Task, apply func()) error {
-+	u.persistMu.RLock()
-+	defer u.persistMu.RUnlock()
-+	if u.closed {
-+		return errMemoryUpstreamClosed
-+	}
-+	apply()
-+	if u.up != nil {
-+		u.ch <- task
- 	}
--	close(u.ch)
  	return nil
  }
  
-@@ -122,23 +245,17 @@ func (u *MemoryUpstream) Add(s string) error {
+@@ -122,23 +328,17 @@ func (u *MemoryUpstream) Add(s string) error {
  	b := [trojan.HeaderLen]byte{}
  	trojan.GenKey(s, b[:])
  
@@ -496,12 +1026,20 @@ index 732c54a..a31f2ab 100644
  	}
  	u.mu.Unlock()
  }
-@@ -147,18 +264,62 @@ func (u *MemoryUpstream) Delete(s string) error {
+@@ -147,17 +347,174 @@ func (u *MemoryUpstream) Delete(s string) error {
  	b := [trojan.HeaderLen]byte{}
  	trojan.GenKey(s, b[:])
  	key := x.ByteSliceToString(b[:])
 +	t := Task{Type: TaskDelete}
 +	t.Value.Password = s
++	u.mu.Lock()
++	delete(u.pendingUsers, key)
++	for tk := range u.pendingTargets {
++		if tk.key == key {
++			delete(u.pendingTargets, tk)
++		}
++	}
++	u.mu.Unlock()
 +	return u.persistAndApply(t, func() {
 +		u.mu.Lock()
 +		delete(u.mm, key)
@@ -520,26 +1058,27 @@ index 732c54a..a31f2ab 100644
 +	if _, ok := u.tm[key][raw]; !ok {
 +		u.tm[key][raw] = Traffic{}
 +	}
- 	u.mu.Unlock()
++	u.mu.Unlock()
 +}
- 
--	if u.up == nil {
--		return nil
++
 +func (u *MemoryUpstream) consumeTargetMemory(key, ip, target string, nr, nw int64) {
++	u.consumeTargetMemoryAt(key, ip, target, nr, nw, time.Now().Unix())
++}
++
++func (u *MemoryUpstream) consumeTargetMemoryAt(key, ip, target string, nr, nw, updatedAt int64) {
 +	if _, ok := u.tm[key]; !ok {
 +		u.tm[key] = make(map[string]Traffic)
- 	}
++	}
 +	raw := targetKeyString(ip, target)
 +	traffic := u.tm[key][raw]
 +	traffic.Up += nr
 +	traffic.Down += nw
++	if updatedAt > traffic.UpdatedAt {
++		traffic.UpdatedAt = updatedAt
++	}
 +	u.tm[key][raw] = traffic
 +}
- 
--	t := Task{Type: TaskDelete}
--	t.Value.Password = s
--	u.ch <- t
--	return nil
++
 +func (u *MemoryUpstream) RangeTargets(fn func(string, string, string, int64, int64)) {
 +	u.mu.RLock()
 +	defer u.mu.RUnlock()
@@ -551,74 +1090,192 @@ index 732c54a..a31f2ab 100644
 +	}
 +}
 +
-+func (u *MemoryUpstream) ConsumeTarget(key, ip, target string, nr, nw int64) error {
-+	t := Task{Type: TaskConsumeTarget}
-+	t.Value.Key = key
-+	t.Value.IP = ip
-+	t.Value.Target = target
-+	t.Value.Up = nr
-+	t.Value.Down = nw
-+	return u.applyAndQueue(t, func() {
-+		u.mu.Lock()
-+		u.consumeTargetMemory(key, ip, target, nr, nw)
-+		u.mu.Unlock()
-+	})
- }
- 
- func (u *MemoryUpstream) Range(fn func(string, int64, int64)) {
-@@ -177,23 +338,38 @@ func (u *MemoryUpstream) Validate(k string) bool {
- }
- 
- func (u *MemoryUpstream) Consume(k string, nr, nw int64) error {
--	u.mu.Lock()
--	traffic := u.mm[k]
--	traffic.Up += nr
--	traffic.Down += nw
--	u.mm[k] = traffic
--	u.mu.Unlock()
--
--	if u.up == nil {
--		return nil
--	}
--
- 	t := Task{Type: TaskConsume}
- 	t.Value.Key = k
- 	t.Value.Up = nr
- 	t.Value.Down = nw
--	u.ch <- t
--	return nil
-+	return u.applyAndQueue(t, func() {
-+		u.mu.Lock()
-+		traffic := u.mm[k]
-+		traffic.Up += nr
-+		traffic.Down += nw
-+		u.mm[k] = traffic
-+		u.mu.Unlock()
-+	})
++func (u *MemoryUpstream) RangeTargetDetails(fn func(TargetTraffic)) {
++	u.mu.RLock()
++	defer u.mu.RUnlock()
++	for key, targets := range u.tm {
++		for raw, traffic := range targets {
++			ip, target := splitTargetKey(raw)
++			fn(TargetTraffic{Key: key, IP: ip, Target: target, Traffic: traffic})
++		}
++	}
 +}
 +
++func (u *MemoryUpstream) PruneTargets(maxAge time.Duration, maxPerUser int) (int, error) {
++	if maxAge < 0 || maxPerUser < 0 {
++		return 0, errors.New("prune parameters must be non-negative")
++	}
++	if maxAge == 0 && maxPerUser == 0 {
++		return 0, nil
++	}
++
++	now := time.Now().Unix()
++	maxAgeSec := int64(maxAge / time.Second)
++	memPruned := 0
++
++	u.mu.Lock()
++	if u.closed {
++		u.mu.Unlock()
++		return 0, errMemoryUpstreamClosed
++	}
++	for userKey, targets := range u.tm {
++		if maxAge > 0 {
++			for raw, traffic := range targets {
++				if traffic.UpdatedAt > 0 && now-traffic.UpdatedAt > maxAgeSec {
++					delete(targets, raw)
++					ip, target := splitTargetKey(raw)
++					delete(u.pendingTargets, pendingTargetKey{key: userKey, ip: ip, target: target})
++					memPruned++
++				}
++			}
++		}
++		if maxPerUser > 0 && len(targets) > maxPerUser {
++			type entry struct {
++				raw     string
++				traffic Traffic
++			}
++			items := make([]entry, 0, len(targets))
++			for raw, traffic := range targets {
++				items = append(items, entry{raw: raw, traffic: traffic})
++			}
++			sort.Slice(items, func(i, j int) bool {
++				if items[i].traffic.UpdatedAt != items[j].traffic.UpdatedAt {
++					return items[i].traffic.UpdatedAt > items[j].traffic.UpdatedAt
++				}
++				ti := items[i].traffic.Up + items[i].traffic.Down
++				tj := items[j].traffic.Up + items[j].traffic.Down
++				if ti != tj {
++					return ti > tj
++				}
++				return items[i].raw < items[j].raw
++			})
++			for _, drop := range items[maxPerUser:] {
++				delete(targets, drop.raw)
++				ip, target := splitTargetKey(drop.raw)
++				delete(u.pendingTargets, pendingTargetKey{key: userKey, ip: ip, target: target})
++				memPruned++
++			}
++		}
++		if len(targets) == 0 {
++			delete(u.tm, userKey)
++		}
++	}
+ 	u.mu.Unlock()
+ 
+ 	if u.up == nil {
+-		return nil
++		return memPruned, nil
+ 	}
++	diskPruned := 0
++	t := Task{Type: TaskPruneTargets, Pruned: &diskPruned}
++	t.Value.MaxAge = maxAge
++	t.Value.MaxPerUser = maxPerUser
++	if err := u.persistAndApply(t, func() {}); err != nil {
++		return memPruned, err
++	}
++	if diskPruned > memPruned {
++		return diskPruned, nil
++	}
++	return memPruned, nil
++}
+ 
+-	t := Task{Type: TaskDelete}
+-	t.Value.Password = s
+-	u.ch <- t
++func (u *MemoryUpstream) ConsumeTarget(key, ip, target string, nr, nw int64) error {
++	u.mu.Lock()
++	if u.closed {
++		u.mu.Unlock()
++		return errMemoryUpstreamClosed
++	}
++	u.consumeTargetMemory(key, ip, target, nr, nw)
++	if u.up != nil {
++		if u.pendingTargets == nil {
++			u.pendingTargets = make(map[pendingTargetKey]Traffic)
++		}
++		tk := pendingTargetKey{key: key, ip: ip, target: target}
++		delta := u.pendingTargets[tk]
++		delta.Up += nr
++		delta.Down += nw
++		u.pendingTargets[tk] = delta
++	}
++	u.mu.Unlock()
++	if u.up != nil {
++		u.notifyFlush()
++	}
+ 	return nil
+ }
+ 
+@@ -178,22 +535,60 @@ func (u *MemoryUpstream) Validate(k string) bool {
+ 
+ func (u *MemoryUpstream) Consume(k string, nr, nw int64) error {
+ 	u.mu.Lock()
++	if u.closed {
++		u.mu.Unlock()
++		return errMemoryUpstreamClosed
++	}
+ 	traffic := u.mm[k]
+ 	traffic.Up += nr
+ 	traffic.Down += nw
+ 	u.mm[k] = traffic
++	if u.up != nil {
++		if u.pendingUsers == nil {
++			u.pendingUsers = make(map[string]Traffic)
++		}
++		delta := u.pendingUsers[k]
++		delta.Up += nr
++		delta.Down += nw
++		u.pendingUsers[k] = delta
++	}
+ 	u.mu.Unlock()
++	if u.up != nil {
++		u.notifyFlush()
++	}
++	return nil
++}
+ 
+-	if u.up == nil {
+-		return nil
 +func (u *MemoryUpstream) ResetTraffic(key string) error {
++	u.mu.Lock()
++	if u.closed {
++		u.mu.Unlock()
++		return errMemoryUpstreamClosed
+ 	}
++	if key == "" {
++		for k := range u.mm {
++			u.mm[k] = Traffic{}
++		}
++		u.tm = make(map[string]map[string]Traffic)
++		u.pendingUsers = make(map[string]Traffic)
++		u.pendingTargets = make(map[pendingTargetKey]Traffic)
++	} else {
++		if _, ok := u.mm[key]; ok {
++			u.mm[key] = Traffic{}
++		}
++		delete(u.tm, key)
++		delete(u.pendingUsers, key)
++		for tk := range u.pendingTargets {
++			if tk.key == key {
++				delete(u.pendingTargets, tk)
++			}
++		}
++	}
++	u.mu.Unlock()
+ 
+-	t := Task{Type: TaskConsume}
+-	t.Value.Key = k
+-	t.Value.Up = nr
+-	t.Value.Down = nw
+-	u.ch <- t
+-	return nil
 +	t := Task{Type: TaskResetTraffic}
 +	t.Value.Key = key
-+	return u.persistAndApplyExclusive(t, func() {
-+		u.mu.Lock()
-+		if key == "" {
-+			for k := range u.mm {
-+				u.mm[k] = Traffic{}
-+			}
-+			u.tm = make(map[string]map[string]Traffic)
-+		} else {
-+			if _, ok := u.mm[key]; ok {
-+				u.mm[key] = Traffic{}
-+			}
-+			delete(u.tm, key)
-+		}
-+		u.mu.Unlock()
-+	})
++	return u.persistAndApply(t, func() {})
  }
  
  type CaddyUpstream struct {
-@@ -202,6 +378,35 @@ type CaddyUpstream struct {
+@@ -202,6 +597,35 @@ type CaddyUpstream struct {
  	logger  *zap.Logger
  }
  
@@ -654,7 +1311,7 @@ index 732c54a..a31f2ab 100644
  func (CaddyUpstream) CaddyModule() caddy.ModuleInfo {
  	return caddy.ModuleInfo{
  		ID:  "trojan.upstream.caddy",
-@@ -220,8 +425,17 @@ func (u *CaddyUpstream) Add(s string) error {
+@@ -220,8 +644,17 @@ func (u *CaddyUpstream) Add(s string) error {
  	b := [trojan.HeaderLen]byte{}
  	trojan.GenKey(s, b[:])
  	key := u.prefix + string(b[:])
@@ -674,7 +1331,7 @@ index 732c54a..a31f2ab 100644
  	}
  	traffic := Traffic{
  		Up:   0,
-@@ -238,10 +452,121 @@ func (u *CaddyUpstream) Delete(s string) error {
+@@ -238,10 +671,163 @@ func (u *CaddyUpstream) Delete(s string) error {
  	b := [trojan.HeaderLen]byte{}
  	trojan.GenKey(s, b[:])
  	key := u.prefix + x.ByteSliceToString(b[:])
@@ -686,119 +1343,161 @@ index 732c54a..a31f2ab 100644
 +	}
 +	if err := u.storage.Delete(context.Background(), key); err != nil {
 +		return err
- 	}
--	return u.storage.Delete(context.Background(), key)
++	}
 +	targets, err := u.storage.List(context.Background(), u.prefix+targetPrefix+x.ByteSliceToString(b[:])+"/", false)
 +	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 +		return err
 +	}
-+	for _, targetKey := range targets {
-+		if err := u.storage.Delete(context.Background(), targetKey); err != nil && !errors.Is(err, fs.ErrNotExist) {
++	deleteErrors := make([]error, len(targets))
++	runTargetWorkers(len(targets), func(index int) {
++		deleteErrors[index] = u.storage.Delete(context.Background(), targets[index])
++		if errors.Is(deleteErrors[index], fs.ErrNotExist) {
++			deleteErrors[index] = nil
++		}
++	})
++	for _, err := range deleteErrors {
++		if err != nil {
 +			return err
 +		}
 +	}
 +	return nil
 +}
 +
-+func (u *CaddyUpstream) RangeTargets(fn func(string, string, string, int64, int64)) {
-+	type targetRecord struct {
-+		key, ip, target string
-+		storageKey      string
-+	}
-+	started := time.Now()
++type caddyTargetRecord struct {
++	TargetTraffic
++	storageKey string
++}
++
++type targetListStats struct {
++	listed            int
++	directoryEntries  int
++	invalidKeys       int
++	loadErrorCount    int
++	decodeErrorCount  int
++	listDuration      time.Duration
++	parseDuration     time.Duration
++	readDecodeElapsed time.Duration
++	firstLoadError    error
++	firstDecodeError  error
++}
++
++func (u *CaddyUpstream) listTargetRecords() ([]caddyTargetRecord, targetListStats, error) {
++	var stats targetListStats
 +	prefix := u.prefix + targetPrefix
 +	listStarted := time.Now()
 +	keys, err := u.storage.List(context.Background(), prefix, true)
-+	listDuration := time.Since(listStarted)
++	stats.listDuration = time.Since(listStarted)
 +	if errors.Is(err, fs.ErrNotExist) {
 +		keys = nil
 +	} else if err != nil {
-+		u.logger.Error("listing persisted Trojan target traffic", zap.Error(err))
-+		return
++		return nil, stats, err
 +	}
++	stats.listed = len(keys)
++
 +	parseStarted := time.Now()
-+	records := make([]targetRecord, 0, len(keys))
-+	invalidKeys := 0
-+	directoryEntries := 0
++	records := make([]caddyTargetRecord, 0, len(keys))
 +	for _, key := range keys {
 +		rel := strings.TrimPrefix(key, prefix)
 +		parts := strings.SplitN(rel, "/", 2)
 +		if len(parts) == 1 && isTrojanStorageKey(parts[0]) {
-+			directoryEntries++
++			stats.directoryEntries++
 +			continue
 +		}
 +		if len(parts) != 2 || !isTrojanStorageKey(parts[0]) {
-+			invalidKeys++
++			stats.invalidKeys++
 +			continue
 +		}
 +		targetBytes, err := hex.DecodeString(parts[1])
 +		if err != nil {
-+			invalidKeys++
++			stats.invalidKeys++
 +			continue
 +		}
 +		ip, target := splitTargetKey(string(targetBytes))
-+		records = append(records, targetRecord{key: parts[0], ip: ip, target: target, storageKey: key})
++		records = append(records, caddyTargetRecord{
++			TargetTraffic: TargetTraffic{Key: parts[0], IP: ip, Target: target},
++			storageKey:    key,
++		})
 +	}
-+	parseDuration := time.Since(parseStarted)
-+	data := make([][]byte, len(records))
++	stats.parseDuration = time.Since(parseStarted)
++
 +	loadErrors := make([]error, len(records))
-+	readStarted := time.Now()
-+	runTargetWorkers(len(records), func(index int) {
-+		data[index], loadErrors[index] = u.storage.Load(context.Background(), records[index].storageKey)
-+	})
-+	readDuration := time.Since(readStarted)
-+	traffic := make([]Traffic, len(records))
 +	decodeErrors := make([]error, len(records))
-+	decodeStarted := time.Now()
++	readDecodeStarted := time.Now()
 +	runTargetWorkers(len(records), func(index int) {
-+		if loadErrors[index] == nil {
-+			decodeErrors[index] = json.Unmarshal(data[index], &traffic[index])
++		raw, err := u.storage.Load(context.Background(), records[index].storageKey)
++		if err != nil {
++			loadErrors[index] = err
++			return
 +		}
++		decodeErrors[index] = json.Unmarshal(raw, &records[index].Traffic)
 +	})
-+	decodeDuration := time.Since(decodeStarted)
-+	loadErrorCount, decodeErrorCount, loaded := 0, 0, 0
-+	var firstLoadError, firstDecodeError error
++	stats.readDecodeElapsed = time.Since(readDecodeStarted)
++
++	loaded := make([]caddyTargetRecord, 0, len(records))
 +	for index, record := range records {
 +		if loadErrors[index] != nil {
-+			loadErrorCount++
-+			if firstLoadError == nil {
-+				firstLoadError = loadErrors[index]
++			stats.loadErrorCount++
++			if stats.firstLoadError == nil {
++				stats.firstLoadError = loadErrors[index]
 +			}
 +			continue
 +		}
 +		if decodeErrors[index] != nil {
-+			decodeErrorCount++
-+			if firstDecodeError == nil {
-+				firstDecodeError = decodeErrors[index]
++			stats.decodeErrorCount++
++			if stats.firstDecodeError == nil {
++				stats.firstDecodeError = decodeErrors[index]
 +			}
 +			continue
 +		}
-+		loaded++
-+		fn(record.key, record.ip, record.target, traffic[index].Up, traffic[index].Down)
++		loaded = append(loaded, record)
++	}
++	return loaded, stats, nil
++}
++
++func (u *CaddyUpstream) RangeTargets(fn func(string, string, string, int64, int64)) {
++	u.RangeTargetDetails(func(row TargetTraffic) {
++		fn(row.Key, row.IP, row.Target, row.Up, row.Down)
++	})
++}
++
++func (u *CaddyUpstream) RangeTargetDetails(fn func(TargetTraffic)) {
++	started := time.Now()
++	loaded, stats, err := u.listTargetRecords()
++	if err != nil {
++		if u.logger != nil {
++			u.logger.Error("listing persisted Trojan target traffic", zap.Error(err))
++		}
++		return
++	}
++	for _, record := range loaded {
++		fn(record.TargetTraffic)
 +	}
 +	workerCount := targetRangeWorkers
-+	if workerCount > len(records) {
-+		workerCount = len(records)
++	if workerCount > stats.listed {
++		workerCount = stats.listed
 +	}
 +	fields := []zap.Field{
-+		zap.Int("listed", len(keys)), zap.Int("loaded", loaded),
-+		zap.Int("directory_entries", directoryEntries), zap.Int("invalid_keys", invalidKeys),
-+		zap.Int("load_errors", loadErrorCount), zap.Int("decode_errors", decodeErrorCount),
-+		zap.Duration("list_elapsed", listDuration), zap.Duration("key_parse_elapsed", parseDuration),
-+		zap.Duration("load_elapsed", readDuration), zap.Duration("decode_elapsed", decodeDuration),
++		zap.Int("listed", stats.listed), zap.Int("loaded", len(loaded)),
++		zap.Int("directory_entries", stats.directoryEntries), zap.Int("invalid_keys", stats.invalidKeys),
++		zap.Int("load_errors", stats.loadErrorCount), zap.Int("decode_errors", stats.decodeErrorCount),
++		zap.Duration("list_elapsed", stats.listDuration), zap.Duration("key_parse_elapsed", stats.parseDuration),
++		zap.Duration("load_decode_elapsed", stats.readDecodeElapsed),
 +		zap.Duration("total_elapsed", time.Since(started)), zap.Int("load_workers", workerCount),
 +	}
-+	if firstLoadError != nil {
-+		fields = append(fields, zap.NamedError("first_load_error", firstLoadError))
++	if stats.firstLoadError != nil {
++		fields = append(fields, zap.NamedError("first_load_error", stats.firstLoadError))
 +	}
-+	if firstDecodeError != nil {
-+		fields = append(fields, zap.NamedError("first_decode_error", firstDecodeError))
++	if stats.firstDecodeError != nil {
++		fields = append(fields, zap.NamedError("first_decode_error", stats.firstDecodeError))
 +	}
-+	u.logger.Info("restored persisted Trojan target traffic", fields...)
++	if u.logger != nil {
++		u.logger.Info("restored persisted Trojan target traffic", fields...)
+ 	}
+-	return u.storage.Delete(context.Background(), key)
  }
  
  func (u *CaddyUpstream) Range(fn func(k string, up, down int64)) {
-@@ -250,24 +575,41 @@ func (u *CaddyUpstream) Range(fn func(k string, up, down int64)) {
+@@ -250,24 +836,41 @@ func (u *CaddyUpstream) Range(fn func(k string, up, down int64)) {
  		return
  	}
  
@@ -843,7 +1542,7 @@ index 732c54a..a31f2ab 100644
  }
  
  func (u *CaddyUpstream) Consume(k string, nr, nw int64) error {
-@@ -297,9 +639,105 @@ func (u *CaddyUpstream) Consume(k string, nr, nw int64) error {
+@@ -297,9 +900,196 @@ func (u *CaddyUpstream) Consume(k string, nr, nw int64) error {
  	return u.storage.Store(context.Background(), key, b)
  }
  
@@ -865,11 +1564,94 @@ index 732c54a..a31f2ab 100644
 +	}
 +	traffic.Up += nr
 +	traffic.Down += nw
++	traffic.UpdatedAt = time.Now().Unix()
 +	b, err = json.Marshal(&traffic)
 +	if err != nil {
 +		return err
 +	}
 +	return u.storage.Store(context.Background(), key, b)
++}
++
++func (u *CaddyUpstream) PruneTargets(maxAge time.Duration, maxPerUser int) (int, error) {
++	if maxAge < 0 || maxPerUser < 0 {
++		return 0, errors.New("prune parameters must be non-negative")
++	}
++	if maxAge == 0 && maxPerUser == 0 {
++		return 0, nil
++	}
++	records, _, err := u.listTargetRecords()
++	if err != nil {
++		return 0, err
++	}
++	if len(records) == 0 {
++		return 0, nil
++	}
++
++	if maxAge > 0 {
++		needStat := make([]int, 0)
++		for index := range records {
++			if records[index].UpdatedAt <= 0 {
++				needStat = append(needStat, index)
++			}
++		}
++		runTargetWorkers(len(needStat), func(pos int) {
++			index := needStat[pos]
++			if info, statErr := u.storage.Stat(context.Background(), records[index].storageKey); statErr == nil {
++				records[index].UpdatedAt = info.Modified.Unix()
++			}
++		})
++	}
++
++	now := time.Now().Unix()
++	maxAgeSec := int64(maxAge / time.Second)
++	toDelete := make([]string, 0)
++	byUser := make(map[string][]caddyTargetRecord)
++	for _, rec := range records {
++		if maxAge > 0 && rec.UpdatedAt > 0 && now-rec.UpdatedAt > maxAgeSec {
++			toDelete = append(toDelete, rec.storageKey)
++			continue
++		}
++		if maxPerUser > 0 {
++			byUser[rec.Key] = append(byUser[rec.Key], rec)
++		}
++	}
++	if maxPerUser > 0 {
++		for _, userRecords := range byUser {
++			if len(userRecords) <= maxPerUser {
++				continue
++			}
++			sort.Slice(userRecords, func(i, j int) bool {
++				if userRecords[i].UpdatedAt != userRecords[j].UpdatedAt {
++					return userRecords[i].UpdatedAt > userRecords[j].UpdatedAt
++				}
++				ti := userRecords[i].Up + userRecords[i].Down
++				tj := userRecords[j].Up + userRecords[j].Down
++				if ti != tj {
++					return ti > tj
++				}
++				return userRecords[i].storageKey < userRecords[j].storageKey
++			})
++			for _, drop := range userRecords[maxPerUser:] {
++				toDelete = append(toDelete, drop.storageKey)
++			}
++		}
++	}
++	if len(toDelete) == 0 {
++		return 0, nil
++	}
++	deleteErrors := make([]error, len(toDelete))
++	runTargetWorkers(len(toDelete), func(index int) {
++		deleteErrors[index] = u.storage.Delete(context.Background(), toDelete[index])
++		if errors.Is(deleteErrors[index], fs.ErrNotExist) {
++			deleteErrors[index] = nil
++		}
++	})
++	for _, err := range deleteErrors {
++		if err != nil {
++			return 0, err
++		}
++	}
++	return len(toDelete), nil
 +}
 +
 +func (u *CaddyUpstream) ResetTraffic(key string) error {
@@ -905,10 +1687,7 @@ index 732c54a..a31f2ab 100644
 +	}
 +	deleteErrors := make([]error, len(targetKeys))
 +	runTargetWorkers(len(targetKeys), func(index int) {
-+		targetKey := targetKeys[index]
-+		u.storage.Lock(context.Background(), targetKey)
-+		deleteErrors[index] = u.storage.Delete(context.Background(), targetKey)
-+		u.storage.Unlock(context.Background(), targetKey)
++		deleteErrors[index] = u.storage.Delete(context.Background(), targetKeys[index])
 +		if errors.Is(deleteErrors[index], fs.ErrNotExist) {
 +			deleteErrors[index] = nil
 +		}
@@ -923,16 +1702,23 @@ index 732c54a..a31f2ab 100644
 +		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 +			return err
 +		}
++		userStorageKeys := make([]string, 0, len(users))
 +		for _, userKey := range users {
-+			userKey = strings.TrimPrefix(userKey, u.prefix)
-+			if isTrojanStorageKey(userKey) {
-+				storageKey := u.prefix + userKey
-+				u.storage.Lock(context.Background(), storageKey)
-+				err := u.storage.Store(context.Background(), storageKey, []byte(`{"up":0,"down":0}`))
-+				u.storage.Unlock(context.Background(), storageKey)
-+				if err != nil {
-+					return err
-+				}
++			trimmed := strings.TrimPrefix(userKey, u.prefix)
++			if isTrojanStorageKey(trimmed) {
++				userStorageKeys = append(userStorageKeys, u.prefix+trimmed)
++			}
++		}
++		resetErrors := make([]error, len(userStorageKeys))
++		runTargetWorkers(len(userStorageKeys), func(index int) {
++			storageKey := userStorageKeys[index]
++			u.storage.Lock(context.Background(), storageKey)
++			resetErrors[index] = u.storage.Store(context.Background(), storageKey, []byte(`{"up":0,"down":0}`))
++			u.storage.Unlock(context.Background(), storageKey)
++		})
++		for _, err := range resetErrors {
++			if err != nil {
++				return err
 +			}
 +		}
 +	}
@@ -940,26 +1726,39 @@ index 732c54a..a31f2ab 100644
 +}
 +
  var (
- 	_ Upstream           = (*CaddyUpstream)(nil)
- 	_ Upstream           = (*MemoryUpstream)(nil)
-+	_ TargetUpstream     = (*MemoryUpstream)(nil)
-+	_ TargetUpstream     = (*CaddyUpstream)(nil)
-+	_ TrafficResetter    = (*MemoryUpstream)(nil)
-+	_ TrafficResetter    = (*CaddyUpstream)(nil)
- 	_ caddy.CleanerUpper = (*MemoryUpstream)(nil)
- 	_ caddy.Provisioner  = (*MemoryUpstream)(nil)
+-	_ Upstream           = (*CaddyUpstream)(nil)
+-	_ Upstream           = (*MemoryUpstream)(nil)
+-	_ caddy.CleanerUpper = (*MemoryUpstream)(nil)
+-	_ caddy.Provisioner  = (*MemoryUpstream)(nil)
++	_ Upstream             = (*CaddyUpstream)(nil)
++	_ Upstream             = (*MemoryUpstream)(nil)
++	_ TargetUpstream       = (*MemoryUpstream)(nil)
++	_ TargetUpstream       = (*CaddyUpstream)(nil)
++	_ TargetDetailUpstream = (*MemoryUpstream)(nil)
++	_ TargetDetailUpstream = (*CaddyUpstream)(nil)
++	_ TrafficResetter      = (*MemoryUpstream)(nil)
++	_ TrafficResetter      = (*CaddyUpstream)(nil)
++	_ TrafficPruner        = (*MemoryUpstream)(nil)
++	_ TrafficPruner        = (*CaddyUpstream)(nil)
++	_ caddy.CleanerUpper   = (*MemoryUpstream)(nil)
++	_ caddy.Provisioner    = (*MemoryUpstream)(nil)
  )
 diff --git a/app/upstream_test.go b/app/upstream_test.go
 new file mode 100644
-index 0000000..3a8e473
+index 0000000..3a53535
 --- /dev/null
 +++ b/app/upstream_test.go
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,300 @@
 +package app
 +
 +import (
++	"context"
++	"encoding/hex"
++	"sync"
 +	"testing"
++	"time"
 +
++	"github.com/caddyserver/certmagic"
 +	"github.com/imgk/caddy-trojan/pkgs/trojan"
 +	"github.com/imgk/caddy-trojan/pkgs/x"
 +)
@@ -998,19 +1797,274 @@ index 0000000..3a8e473
 +		t.Fatalf("target traffic was not reset: %d rows remain", count)
 +	}
 +}
++
++type slowResetUpstream struct {
++	mu           sync.Mutex
++	consumeCalls int
++	users        map[string]Traffic
++	targets      map[string]Traffic
++	resetStarted chan struct{}
++	releaseReset chan struct{}
++}
++
++func newSlowResetUpstream() *slowResetUpstream {
++	return &slowResetUpstream{
++		users:        make(map[string]Traffic),
++		targets:      make(map[string]Traffic),
++		resetStarted: make(chan struct{}),
++		releaseReset: make(chan struct{}),
++	}
++}
++
++func (s *slowResetUpstream) Add(string) error { return nil }
++func (s *slowResetUpstream) Delete(string) error {
++	return nil
++}
++func (s *slowResetUpstream) Range(fn func(string, int64, int64)) {}
++func (s *slowResetUpstream) Validate(string) bool                { return true }
++func (s *slowResetUpstream) Consume(k string, nr, nw int64) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	s.consumeCalls++
++	t := s.users[k]
++	t.Up += nr
++	t.Down += nw
++	s.users[k] = t
++	return nil
++}
++func (s *slowResetUpstream) ConsumeTarget(k, ip, target string, nr, nw int64) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	tk := k + "/" + targetKeyString(ip, target)
++	t := s.targets[tk]
++	t.Up += nr
++	t.Down += nw
++	s.targets[tk] = t
++	return nil
++}
++func (s *slowResetUpstream) RangeTargets(fn func(string, string, string, int64, int64)) {}
++func (s *slowResetUpstream) ResetTraffic(key string) error {
++	close(s.resetStarted)
++	<-s.releaseReset
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if key == "" {
++		s.users = make(map[string]Traffic)
++		s.targets = make(map[string]Traffic)
++	} else {
++		delete(s.users, key)
++	}
++	return nil
++}
++
++func TestMemoryUpstreamConsumeDoesNotBlockDuringReset(t *testing.T) {
++	backing := newSlowResetUpstream()
++	u := &MemoryUpstream{
++		mm:             make(map[string]Traffic),
++		tm:             make(map[string]map[string]Traffic),
++		pendingUsers:   make(map[string]Traffic),
++		pendingTargets: make(map[pendingTargetKey]Traffic),
++	}
++	u.startPersistenceWorker(backing)
++
++	keyBytes := [trojan.HeaderLen]byte{}
++	trojan.GenKey("secret", keyBytes[:])
++	key := x.ByteSliceToString(keyBytes[:])
++	u.AddKey(key)
++
++	for i := 0; i < 50; i++ {
++		if err := u.Consume(key, 1, 2); err != nil {
++			t.Fatal(err)
++		}
++		if err := u.ConsumeTarget(key, "198.51.100.1", "example.com:443", 1, 2); err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	resetErr := make(chan error, 1)
++	go func() {
++		resetErr <- u.ResetTraffic("")
++	}()
++
++	<-backing.resetStarted
++
++	done := make(chan error, 1)
++	go func() {
++		if err := u.Consume(key, 10, 20); err != nil {
++			done <- err
++			return
++		}
++		done <- u.ConsumeTarget(key, "198.51.100.1", "example.com:443", 10, 20)
++	}()
++
++	select {
++	case err := <-done:
++		if err != nil {
++			t.Fatalf("Consume during ResetTraffic failed: %v", err)
++		}
++	case <-time.After(500 * time.Millisecond):
++		close(backing.releaseReset)
++		t.Fatal("Consume blocked while ResetTraffic was in progress")
++	}
++
++	close(backing.releaseReset)
++	if err := <-resetErr; err != nil {
++		t.Fatalf("ResetTraffic failed: %v", err)
++	}
++	if err := u.Cleanup(); err != nil {
++		t.Fatal(err)
++	}
++
++	backing.mu.Lock()
++	defer backing.mu.Unlock()
++	if got := backing.users[key]; got != (Traffic{Up: 10, Down: 20}) {
++		t.Fatalf("persisted user traffic after concurrent reset = %+v, want {10 20}", got)
++	}
++	if got := backing.targets[key+"/198.51.100.1/example.com:443"]; got != (Traffic{Up: 10, Down: 20}) {
++		t.Fatalf("persisted target traffic after concurrent reset = %+v, want {10 20}", got)
++	}
++	if backing.consumeCalls > 10 {
++		t.Fatalf("expected coalesced Consume calls, got %d", backing.consumeCalls)
++	}
++}
++
++func TestCaddyUpstreamRangeTargetsResetAndDelete(t *testing.T) {
++	u := &CaddyUpstream{
++		prefix:  "trojan/",
++		storage: &certmagic.FileStorage{Path: t.TempDir()},
++	}
++	if err := u.Add("pass-one"); err != nil {
++		t.Fatal(err)
++	}
++	if err := u.Add("pass-two"); err != nil {
++		t.Fatal(err)
++	}
++
++	b1 := [trojan.HeaderLen]byte{}
++	trojan.GenKey("pass-one", b1[:])
++	k1 := x.ByteSliceToString(b1[:])
++
++	b2 := [trojan.HeaderLen]byte{}
++	trojan.GenKey("pass-two", b2[:])
++	k2 := x.ByteSliceToString(b2[:])
++
++	if err := u.Consume(k1, 5, 10); err != nil {
++		t.Fatal(err)
++	}
++	if err := u.ConsumeTarget(k1, "203.0.113.10", "example.com:443", 5, 10); err != nil {
++		t.Fatal(err)
++	}
++	if err := u.ConsumeTarget(k2, "203.0.113.20", "example.org:443", 7, 14); err != nil {
++		t.Fatal(err)
++	}
++
++	if err := u.Delete("pass-two"); err != nil {
++		t.Fatal(err)
++	}
++
++	var rows int
++	u.RangeTargets(func(key, ip, target string, up, down int64) {
++		rows++
++		if key != k1 || up != 5 || down != 10 {
++			t.Fatalf("unexpected target row: key=%s up=%d down=%d", key, up, down)
++		}
++	})
++	if rows != 1 {
++		t.Fatalf("RangeTargets count = %d, want 1", rows)
++	}
++
++	if err := u.ResetTraffic(""); err != nil {
++		t.Fatal(err)
++	}
++	rows = 0
++	u.RangeTargets(func(key, ip, target string, up, down int64) { rows++ })
++	if rows != 0 {
++		t.Fatalf("RangeTargets after ResetTraffic = %d, want 0", rows)
++	}
++	u.Range(func(k string, up, down int64) {
++		if up != 0 || down != 0 {
++			t.Fatalf("user %s traffic after ResetTraffic = %d/%d, want 0/0", k, up, down)
++		}
++	})
++}
++
++func TestCaddyUpstreamPruneTargets(t *testing.T) {
++	storage := &certmagic.FileStorage{Path: t.TempDir()}
++	u := &CaddyUpstream{
++		prefix:  "trojan/",
++		storage: storage,
++	}
++	if err := u.Add("pass-prune"); err != nil {
++		t.Fatal(err)
++	}
++	b := [trojan.HeaderLen]byte{}
++	trojan.GenKey("pass-prune", b[:])
++	k := x.ByteSliceToString(b[:])
++
++	mem := &MemoryUpstream{
++		mm:             map[string]Traffic{k: {}},
++		tm:             make(map[string]map[string]Traffic),
++		pendingUsers:   make(map[string]Traffic),
++		pendingTargets: make(map[pendingTargetKey]Traffic),
++	}
++	mem.startPersistenceWorker(u)
++
++	// Seed 1 expired target directly on disk and in memory, plus 3 fresh targets.
++	expiredRaw := targetKeyString("203.0.113.9", "old.example:443")
++	mem.mu.Lock()
++	oldTime := time.Now().Add(-40 * 24 * time.Hour).Unix()
++	mem.tm[k] = map[string]Traffic{
++		expiredRaw: {Up: 1, Down: 1, UpdatedAt: oldTime},
++	}
++	mem.mu.Unlock()
++	if err := storage.Store(context.Background(), u.prefix+targetPrefix+k+"/"+hex.EncodeToString([]byte(expiredRaw)), []byte(`{"up":1,"down":1,"updated_at":1}`)); err != nil {
++		t.Fatal(err)
++	}
++
++	for index, host := range []string{"a.example:443", "b.example:443", "c.example:443"} {
++		if err := mem.ConsumeTarget(k, "203.0.113.10", host, int64(10*(index+1)), 20); err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	pruned, err := mem.PruneTargets(30*24*time.Hour, 2)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if pruned != 2 {
++		t.Fatalf("pruned = %d, want 2 (1 expired + 1 over per-user cap)", pruned)
++	}
++	if err := mem.Cleanup(); err != nil {
++		t.Fatal(err)
++	}
++
++	remaining := 0
++	u.RangeTargets(func(key, ip, target string, up, down int64) {
++		remaining++
++		if target == "old.example:443" {
++			t.Fatalf("expired target was not pruned")
++		}
++	})
++	if remaining != 2 {
++		t.Fatalf("remaining targets on disk = %d, want 2", remaining)
++	}
++}
 diff --git a/modules/admin/admin.go b/modules/admin/admin.go
-index 7a988a8..8592e4d 100644
+index 7a988a8..07ce980 100644
 --- a/modules/admin/admin.go
 +++ b/modules/admin/admin.go
-@@ -5,6 +5,7 @@ import (
+@@ -5,6 +5,10 @@ import (
  	"errors"
  	"io"
  	"net/http"
 +	"sort"
++	"strconv"
++	"strings"
++	"time"
  
  	"github.com/caddyserver/caddy/v2"
  
-@@ -58,9 +59,61 @@ func (al *Admin) Routes() []caddy.AdminRoute {
+@@ -58,7 +62,187 @@ func (al *Admin) Routes() []caddy.AdminRoute {
  			Pattern: "/trojan/users/delete",
  			Handler: caddy.AdminHandlerFunc(al.DeleteUser),
  		},
@@ -1018,9 +2072,68 @@ index 7a988a8..8592e4d 100644
 +			Pattern: "/trojan/traffic",
 +			Handler: caddy.AdminHandlerFunc(al.Traffic),
 +		},
++		{
++			Pattern: "/trojan/traffic/prune",
++			Handler: caddy.AdminHandlerFunc(al.PruneTraffic),
++		},
++	}
++}
++
++func parseNonNegativeIntParam(raw, name string) (int, error) {
++	if raw == "" {
++		return 0, nil
++	}
++	v, err := strconv.Atoi(raw)
++	if err != nil || v < 0 {
++		return 0, caddy.APIError{
++			HTTPStatus: http.StatusBadRequest,
++			Err:        errors.New(name + " must be a non-negative integer"),
++		}
++	}
++	return v, nil
++}
++
++func (al *Admin) PruneTraffic(w http.ResponseWriter, r *http.Request) error {
++	if r.Method != http.MethodPost {
++		return caddy.APIError{
++			HTTPStatus: http.StatusMethodNotAllowed,
++			Err:        errors.New("trojan traffic prune method error"),
++		}
++	}
++	pruner, ok := al.upstream.(app.TrafficPruner)
++	if !ok {
++		return errors.New("trojan traffic pruning is unavailable")
++	}
++	q := r.URL.Query()
++	daysRaw := q.Get("max_age_days")
++	if daysRaw == "" {
++		daysRaw = q.Get("days")
  	}
- }
- 
++	days, err := parseNonNegativeIntParam(daysRaw, "max_age_days")
++	if err != nil {
++		return err
++	}
++	maxPerUser, err := parseNonNegativeIntParam(q.Get("max_per_user"), "max_per_user")
++	if err != nil {
++		return err
++	}
++	if days == 0 && maxPerUser == 0 {
++		return caddy.APIError{
++			HTTPStatus: http.StatusBadRequest,
++			Err:        errors.New("specify max_age_days or max_per_user > 0"),
++		}
++	}
++	pruned, err := pruner.PruneTargets(time.Duration(days)*24*time.Hour, maxPerUser)
++	if err != nil {
++		return err
++	}
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(http.StatusOK)
++	return json.NewEncoder(w).Encode(struct {
++		Pruned int `json:"pruned"`
++	}{Pruned: pruned})
++}
++
 +func (al *Admin) Traffic(w http.ResponseWriter, r *http.Request) error {
 +	if r.Method == http.MethodDelete {
 +		resetter, ok := al.upstream.(app.TrafficResetter)
@@ -1036,27 +2149,52 @@ index 7a988a8..8592e4d 100644
 +	if r.Method != http.MethodGet {
 +		return errors.New("trojan traffic method error")
 +	}
-+	targets, ok := al.upstream.(app.TargetUpstream)
-+	if !ok {
++	q := r.URL.Query()
++	filterKey := q.Get("key")
++	filterIP := q.Get("ip")
++	filterTarget := q.Get("target")
++	sortBy := strings.ToLower(q.Get("sort"))
++	switch sortBy {
++	case "", "default", "total", "up", "down", "key", "ip", "target":
++	default:
++		return caddy.APIError{
++			HTTPStatus: http.StatusBadRequest,
++			Err:        errors.New("invalid sort parameter (allowed: total, up, down, key, ip, target)"),
++		}
++	}
++	offset, err := parseNonNegativeIntParam(q.Get("offset"), "offset")
++	if err != nil {
++		return err
++	}
++	limit, err := parseNonNegativeIntParam(q.Get("limit"), "limit")
++	if err != nil {
++		return err
++	}
++
++	rows := make([]app.TargetTraffic, 0)
++	appendRow := func(row app.TargetTraffic) {
++		if filterKey != "" && filterKey != row.Key {
++			return
++		}
++		if filterIP != "" && filterIP != row.IP {
++			return
++		}
++		if filterTarget != "" && filterTarget != row.Target {
++			return
++		}
++		rows = append(rows, row)
++	}
++	if details, ok := al.upstream.(app.TargetDetailUpstream); ok {
++		details.RangeTargetDetails(appendRow)
++	} else if targets, ok := al.upstream.(app.TargetUpstream); ok {
++		targets.RangeTargets(func(key, ip, target string, up, down int64) {
++			appendRow(app.TargetTraffic{Key: key, IP: ip, Target: target, Traffic: app.Traffic{Up: up, Down: down}})
++		})
++	} else {
 +		return errors.New("trojan target traffic is unavailable")
 +	}
-+	filterKey := r.URL.Query().Get("key")
-+	filterIP := r.URL.Query().Get("ip")
-+	filterTarget := r.URL.Query().Get("target")
-+	rows := make([]app.TargetTraffic, 0)
-+	targets.RangeTargets(func(key, ip, target string, up, down int64) {
-+		if filterKey != "" && filterKey != key {
-+			return
-+		}
-+		if filterIP != "" && filterIP != ip {
-+			return
-+		}
-+		if filterTarget != "" && filterTarget != target {
-+			return
-+		}
-+		rows = append(rows, app.TargetTraffic{Key: key, IP: ip, Target: target, Traffic: app.Traffic{Up: up, Down: down}})
-+	})
-+	sort.Slice(rows, func(i, j int) bool {
++
++	compareDefault := func(i, j int) bool {
 +		if rows[i].Key != rows[j].Key {
 +			return rows[i].Key < rows[j].Key
 +		}
@@ -1064,15 +2202,57 @@ index 7a988a8..8592e4d 100644
 +			return rows[i].IP < rows[j].IP
 +		}
 +		return rows[i].Target < rows[j].Target
++	}
++	sort.Slice(rows, func(i, j int) bool {
++		switch sortBy {
++		case "total":
++			ti := rows[i].Up + rows[i].Down
++			tj := rows[j].Up + rows[j].Down
++			if ti != tj {
++				return ti > tj
++			}
++		case "up":
++			if rows[i].Up != rows[j].Up {
++				return rows[i].Up > rows[j].Up
++			}
++		case "down":
++			if rows[i].Down != rows[j].Down {
++				return rows[i].Down > rows[j].Down
++			}
++		case "ip":
++			if rows[i].IP != rows[j].IP {
++				return rows[i].IP < rows[j].IP
++			}
++		case "target":
++			li := strings.ToLower(rows[i].Target)
++			lj := strings.ToLower(rows[j].Target)
++			if li != lj {
++				return li < lj
++			}
++		case "key":
++			if rows[i].Key != rows[j].Key {
++				return rows[i].Key < rows[j].Key
++			}
++		}
++		return compareDefault(i, j)
 +	})
++
++	if offset >= len(rows) {
++		rows = rows[:0]
++	} else if offset > 0 {
++		rows = rows[offset:]
++	}
++	if limit > 0 && limit < len(rows) {
++		rows = rows[:limit]
++	}
++
++	w.Header().Set("Content-Type", "application/json")
 +	w.WriteHeader(http.StatusOK)
 +	return json.NewEncoder(w).Encode(rows)
-+}
-+
+ }
+ 
  func (al *Admin) GetUsers(w http.ResponseWriter, r *http.Request) error {
- 	if al.upstream == nil {
- 		return nil
-@@ -108,7 +161,9 @@ func (al *Admin) AddUser(w http.ResponseWriter, r *http.Request) error {
+@@ -108,7 +292,9 @@ func (al *Admin) AddUser(w http.ResponseWriter, r *http.Request) error {
  		return err
  	}
  	if user.Password != "" {
@@ -1083,7 +2263,7 @@ index 7a988a8..8592e4d 100644
  	}
  
  	w.WriteHeader(http.StatusOK)
-@@ -137,7 +192,9 @@ func (al *Admin) DeleteUser(w http.ResponseWriter, r *http.Request) error {
+@@ -137,7 +323,9 @@ func (al *Admin) DeleteUser(w http.ResponseWriter, r *http.Request) error {
  		return err
  	}
  	if user.Password != "" {
@@ -1094,8 +2274,111 @@ index 7a988a8..8592e4d 100644
  	}
  
  	w.WriteHeader(http.StatusOK)
+diff --git a/modules/admin/admin_test.go b/modules/admin/admin_test.go
+new file mode 100644
+index 0000000..50b3bd5
+--- /dev/null
++++ b/modules/admin/admin_test.go
+@@ -0,0 +1,97 @@
++package admin
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++	"time"
++
++	"github.com/imgk/caddy-trojan/app"
++)
++
++type stubTrafficUpstream struct {
++	rows   []app.TargetTraffic
++	pruned int
++	days   time.Duration
++	maxPer int
++}
++
++func (s *stubTrafficUpstream) Add(string) error               { return nil }
++func (s *stubTrafficUpstream) Delete(string) error            { return nil }
++func (s *stubTrafficUpstream) Range(func(string, int64, int64)) {}
++func (s *stubTrafficUpstream) Validate(string) bool           { return true }
++func (s *stubTrafficUpstream) Consume(string, int64, int64) error {
++	return nil
++}
++func (s *stubTrafficUpstream) ConsumeTarget(string, string, string, int64, int64) error {
++	return nil
++}
++func (s *stubTrafficUpstream) RangeTargets(fn func(string, string, string, int64, int64)) {
++	for _, r := range s.rows {
++		fn(r.Key, r.IP, r.Target, r.Up, r.Down)
++	}
++}
++func (s *stubTrafficUpstream) RangeTargetDetails(fn func(app.TargetTraffic)) {
++	for _, r := range s.rows {
++		fn(r)
++	}
++}
++func (s *stubTrafficUpstream) ResetTraffic(string) error { return nil }
++func (s *stubTrafficUpstream) PruneTargets(maxAge time.Duration, maxPerUser int) (int, error) {
++	s.days = maxAge
++	s.maxPer = maxPerUser
++	return s.pruned, nil
++}
++
++func TestAdminTrafficSortAndPagination(t *testing.T) {
++	stub := &stubTrafficUpstream{
++		rows: []app.TargetTraffic{
++			{Key: "k1", IP: "1.1.1.1", Target: "a.example:443", Traffic: app.Traffic{Up: 10, Down: 20}},
++			{Key: "k1", IP: "1.1.1.2", Target: "b.example:443", Traffic: app.Traffic{Up: 100, Down: 200}},
++			{Key: "k2", IP: "2.2.2.2", Target: "c.example:443", Traffic: app.Traffic{Up: 50, Down: 50}},
++		},
++	}
++	al := &Admin{upstream: stub}
++
++	req := httptest.NewRequest(http.MethodGet, "/trojan/traffic?sort=total&offset=1&limit=1", nil)
++	rec := httptest.NewRecorder()
++	if err := al.Traffic(rec, req); err != nil {
++		t.Fatal(err)
++	}
++	var got []app.TargetTraffic
++	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
++		t.Fatal(err)
++	}
++	if len(got) != 1 || got[0].Target != "c.example:443" {
++		t.Fatalf("unexpected paginated traffic result: %+v", got)
++	}
++
++	badReq := httptest.NewRequest(http.MethodGet, "/trojan/traffic?limit=-1", nil)
++	if err := al.Traffic(httptest.NewRecorder(), badReq); err == nil {
++		t.Fatal("expected error for negative limit")
++	}
++}
++
++func TestAdminPruneTraffic(t *testing.T) {
++	stub := &stubTrafficUpstream{pruned: 7}
++	al := &Admin{upstream: stub}
++
++	req := httptest.NewRequest(http.MethodPost, "/trojan/traffic/prune?max_age_days=30&max_per_user=100", nil)
++	rec := httptest.NewRecorder()
++	if err := al.PruneTraffic(rec, req); err != nil {
++		t.Fatal(err)
++	}
++	if stub.days != 30*24*time.Hour || stub.maxPer != 100 {
++		t.Fatalf("unexpected prune args: days=%v maxPer=%d", stub.days, stub.maxPer)
++	}
++	var resp struct {
++		Pruned int `json:"pruned"`
++	}
++	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
++		t.Fatal(err)
++	}
++	if resp.Pruned != 7 {
++		t.Fatalf("pruned = %d, want 7", resp.Pruned)
++	}
++}
 diff --git a/modules/handler/handler.go b/modules/handler/handler.go
-index 3e7b7a1..e255deb 100644
+index 3e7b7a1..8edf092 100644
 --- a/modules/handler/handler.go
 +++ b/modules/handler/handler.go
 @@ -5,6 +5,7 @@ import (
@@ -1106,7 +2389,47 @@ index 3e7b7a1..e255deb 100644
  	"net/http"
  	"strings"
  
-@@ -95,11 +96,12 @@ func (m *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
+@@ -32,10 +33,11 @@ func init() {
+ 
+ // Handler implements an HTTP handler that ...
+ type Handler struct {
+-	ProxyName string `json:"proxy_name,omitempty"`
+-	WebSocket bool   `json:"websocket,omitempty"`
+-	Connect   bool   `json:"connect_method,omitempty"`
+-	Verbose   bool   `json:"verbose,omitempty"`
++	ProxyName     string `json:"proxy_name,omitempty"`
++	WebSocket     bool   `json:"websocket,omitempty"`
++	WebSocketPath string `json:"websocket_path,omitempty"`
++	Connect       bool   `json:"connect_method,omitempty"`
++	Verbose       bool   `json:"verbose,omitempty"`
+ 
+ 	upstream app.Upstream
+ 	proxy    app.Proxy
+@@ -43,6 +45,13 @@ type Handler struct {
+ 	upgrader websocket.Upgrader
+ }
+ 
++func (m *Handler) matchWebSocketPath(requestPath string) bool {
++	if m.WebSocketPath == "" {
++		return true
++	}
++	return requestPath == m.WebSocketPath
++}
++
+ // CaddyModule returns the Caddy module information.
+ func (Handler) CaddyModule() caddy.ModuleInfo {
+ 	return caddy.ModuleInfo{
+@@ -54,6 +63,9 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
+ // Provision implements caddy.Provisioner.
+ func (m *Handler) Provision(ctx caddy.Context) error {
+ 	m.logger = ctx.Logger(m)
++	if m.WebSocketPath != "" && !strings.HasPrefix(m.WebSocketPath, "/") {
++		m.WebSocketPath = "/" + m.WebSocketPath
++	}
+ 	if _, err := ctx.AppIfConfigured(app.CaddyAppID); err != nil {
+ 		return fmt.Errorf("trojan handler configure error: %w", err)
+ 	}
+@@ -95,16 +107,17 @@ func (m *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
  			m.logger.Info(fmt.Sprintf("handle trojan http%d from %v", r.ProtoMajor, r.RemoteAddr))
  		}
  
@@ -1120,7 +2443,13 @@ index 3e7b7a1..e255deb 100644
  		return nil
  	}
  
-@@ -125,17 +127,46 @@ func (m *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
+ 	// handle websocket
+-	if m.WebSocket && websocket.IsWebSocketUpgrade(r) {
++	if m.WebSocket && websocket.IsWebSocketUpgrade(r) && m.matchWebSocketPath(r.URL.Path) {
+ 		conn, err := m.upgrader.Upgrade(w, r, nil)
+ 		if err != nil {
+ 			return err
+@@ -125,17 +138,46 @@ func (m *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
  			m.logger.Info(fmt.Sprintf("handle trojan websocket.Conn from %v", r.RemoteAddr))
  		}
  
@@ -1168,19 +2497,38 @@ index 3e7b7a1..e255deb 100644
  // UnmarshalCaddyfile unmarshals Caddyfile tokens into h.
  func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
  	if !d.Next() {
+@@ -153,6 +195,16 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+ 				return d.Err("only one websocket is not allowed")
+ 			}
+ 			h.WebSocket = true
++			args := d.RemainingArgs()
++			if len(args) > 1 {
++				return d.ArgErr()
++			}
++			if len(args) == 1 {
++				if args[0] == "" || !strings.HasPrefix(args[0], "/") {
++					return d.Errf("websocket path must start with '/': %s", args[0])
++				}
++				h.WebSocketPath = args[0]
++			}
+ 		case "connect_method":
+ 			if h.Connect {
+ 				return d.Err("only one connect_method is not allowed")
 diff --git a/modules/handler/handler_test.go b/modules/handler/handler_test.go
 new file mode 100644
-index 0000000..f5feb04
+index 0000000..a9c14a1
 --- /dev/null
 +++ b/modules/handler/handler_test.go
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,111 @@
 +package handler
 +
 +import (
 +	"context"
 +	"net/http"
++	"net/http/httptest"
 +	"testing"
 +
++	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 +	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 +)
 +
@@ -1205,6 +2553,82 @@ index 0000000..f5feb04
 +	r.RemoteAddr = "192.0.2.10:443"
 +	if got := clientIPFromRequest(r); got != "192.0.2.10" {
 +		t.Fatalf("client IP = %q, want peer IP", got)
++	}
++}
++
++func TestUnmarshalCaddyfileWebSocketPath(t *testing.T) {
++	d := caddyfile.NewTestDispenser(`
++trojan {
++	connect_method
++	websocket /ws-secret
++}
++`)
++	var h Handler
++	if err := h.UnmarshalCaddyfile(d); err != nil {
++		t.Fatalf("UnmarshalCaddyfile() error = %v", err)
++	}
++	if !h.WebSocket || h.WebSocketPath != "/ws-secret" {
++		t.Fatalf("got (%v, %q), want (true, %q)", h.WebSocket, h.WebSocketPath, "/ws-secret")
++	}
++
++	dDefault := caddyfile.NewTestDispenser(`
++trojan {
++	websocket
++}
++`)
++	var hDefault Handler
++	if err := hDefault.UnmarshalCaddyfile(dDefault); err != nil {
++		t.Fatalf("UnmarshalCaddyfile() default error = %v", err)
++	}
++	if !hDefault.WebSocket || hDefault.WebSocketPath != "" {
++		t.Fatalf("got (%v, %q), want (true, empty)", hDefault.WebSocket, hDefault.WebSocketPath)
++	}
++
++	dBad := caddyfile.NewTestDispenser(`
++trojan {
++	websocket no-leading-slash
++}
++`)
++	var hBad Handler
++	if err := hBad.UnmarshalCaddyfile(dBad); err == nil {
++		t.Fatal("expected error for websocket path without leading '/'")
++	}
++}
++
++func TestServeHTTPWebSocketPathFiltering(t *testing.T) {
++	nextCalled := false
++	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
++		nextCalled = true
++		w.WriteHeader(http.StatusTeapot)
++		return nil
++	})
++
++	h := &Handler{
++		WebSocket:     true,
++		WebSocketPath: "/secret-ws",
++	}
++
++	// Non-matching path with Upgrade: websocket must fall through to camouflage next handler
++	req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
++	req.Header.Set("Connection", "Upgrade")
++	req.Header.Set("Upgrade", "websocket")
++	rec := httptest.NewRecorder()
++	if err := h.ServeHTTP(rec, req, next); err != nil {
++		t.Fatalf("ServeHTTP(/) error = %v", err)
++	}
++	if !nextCalled || rec.Code != http.StatusTeapot {
++		t.Fatalf("expected fallthrough to next handler on '/', nextCalled=%v code=%d", nextCalled, rec.Code)
++	}
++
++	// Matching path must NOT fall through to next handler (enters WS upgrade path)
++	nextCalled = false
++	reqMatch := httptest.NewRequest(http.MethodGet, "https://example.com/secret-ws", nil)
++	reqMatch.Header.Set("Connection", "Upgrade")
++	reqMatch.Header.Set("Upgrade", "websocket")
++	recMatch := httptest.NewRecorder()
++	_ = h.ServeHTTP(recMatch, reqMatch, next)
++	if nextCalled {
++		t.Fatal("matching websocket path should not fall through to next handler")
 +	}
 +}
 diff --git a/modules/listener/listener.go b/modules/listener/listener.go

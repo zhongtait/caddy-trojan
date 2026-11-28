@@ -21,12 +21,13 @@ except Exception:
 
 # Build a Trojan node registration JSON payload with all string fields escaped.
 hub_register_payload() {
-    local name="$1" domain="$2" passwd="$3" server="$4" port="$5" transport="$6"
-    printf '{"name":"%s","domain":"%s","password":"%s","server":"%s","port":%s,"sni":"%s","host":"%s","path":"/","transport":"%s","alpn":"http/1.1"}' \
+    local name="$1" domain="$2" passwd="$3" server="$4" port="$5" transport="$6" ws_path="${7:-}"
+    [ -n "$ws_path" ] || ws_path=$(read_ws_path)
+    printf '{"name":"%s","domain":"%s","password":"%s","server":"%s","port":%s,"sni":"%s","host":"%s","path":"%s","transport":"%s","alpn":"http/1.1"}' \
         "$(json_escape "$name")" "$(json_escape "$domain")" "$(json_escape "$passwd")" \
         "$(json_escape "$server")" "$port" \
         "$(json_escape "$domain")" "$(json_escape "$domain")" \
-        "$(json_escape "$transport")"
+        "$(json_escape "$ws_path")" "$(json_escape "$transport")"
 }
 
 # Nth display name for multi-password hosts: base, then base-2, base-3, ...
@@ -235,11 +236,12 @@ PY
 )
 
 _hub_sync_payload() {
-    local gzip_output="$1" name_base="$2" domain="$3" server="$4" port="$5" transport="$6"
-    python3 - "$PASSWD_FILE" "$name_base" "$domain" "$server" "$port" "$transport" "$gzip_output" <<'PY'
+    local gzip_output="$1" name_base="$2" domain="$3" server="$4" port="$5" transport="$6" ws_path="${7:-}"
+    [ -n "$ws_path" ] || ws_path=$(read_ws_path)
+    python3 - "$PASSWD_FILE" "$name_base" "$domain" "$server" "$port" "$transport" "$gzip_output" "$ws_path" <<'PY'
 import gzip, json, sys
 
-path, base, domain, server, port, transport, gzip_output = sys.argv[1:8]
+path, base, domain, server, port, transport, gzip_output, ws_path = sys.argv[1:9]
 max_nodes, max_password = 10_000, 512
 
 def passwords():
@@ -276,7 +278,7 @@ try:
         name = base[:128 - len(suffix)] + suffix
         node = {
             "name": name, "password": password, "server": server,
-            "port": int(port), "sni": domain, "host": domain, "path": "/",
+            "port": int(port), "sni": domain, "host": domain, "path": ws_path,
             "transport": transport, "alpn": "http/1.1",
         }
         if index > 1:
@@ -301,7 +303,8 @@ hub_write_gzip_sync_payload() {
 }
 
 hub_sync_domain() (
-    local base_url="$1" token="$2" name_base="$3" domain="$4" server="$5" port="$6" transport="$7"
+    local base_url="$1" token="$2" name_base="$3" domain="$4" server="$5" port="$6" transport="$7" ws_path="${8:-}"
+    [ -n "$ws_path" ] || ws_path=$(read_ws_path)
     local cfg="" body=""
     [[ "$token" =~ ^[A-Za-z0-9._~-]+$ ]] || return 2
     cfg=$(mktemp) || return 1
@@ -310,7 +313,7 @@ hub_sync_domain() (
     chmod 600 "$cfg" "$body" 2>/dev/null || true
     printf 'header = "Content-Type: application/json"\nheader = "Content-Encoding: gzip"\nheader = "X-Hub-Token: %s"\n' \
         "$token" > "$cfg"
-    hub_write_gzip_sync_payload "$body" "$name_base" "$domain" "$server" "$port" "$transport" \
+    hub_write_gzip_sync_payload "$body" "$name_base" "$domain" "$server" "$port" "$transport" "$ws_path" \
         || return 1
     curl -sf --connect-timeout 2 --max-time 30 -X POST --config "$cfg" \
         --data-binary "@${body}" "${base_url%/}/api/sync" >/dev/null

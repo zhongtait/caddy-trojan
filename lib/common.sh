@@ -7,21 +7,27 @@ usage() {
 EasyTrojan - One-click Caddy-Trojan installer
 
 Usage:
-  bash easytrojan.sh install --domain DOMAIN [--password PASSWORD] [--version VERSION] [--outbound-ip ipv4|ipv6] [--skip-domain-check]
+  bash easytrojan.sh install --domain DOMAIN [--password PASSWORD] [--version VERSION] [--outbound-ip ipv4|ipv6] [--ws-path PATH|auto] [--skip-domain-check]
                              [--tls-mode auto|origin] [--origin-cert PATH] [--origin-key PATH] [--tune-system]
   bash easytrojan.sh update  [--version VERSION]
   bash easytrojan.sh renew [--force]
   bash easytrojan.sh status [--show-link] [--server ADDR] [--port PORT] [--name NAME]
   bash easytrojan.sh doctor [--network]
   bash easytrojan.sh tune-system
-  bash easytrojan.sh traffic [--key HASH] [--password PASS] [--ip CLIENT_IP] [--target HOST:PORT] [--top N] [--sort total|up|down|target|client|ip] [--show-password] [--flat] [--json]
+  bash easytrojan.sh traffic [--key HASH] [--password PASS] [--ip CLIENT_IP] [--target HOST:PORT] [--top N] [--offset N] [--sort total|up|down|target|client|ip] [--show-password] [--flat] [--json]
   bash easytrojan.sh traffic reset --yes [--key HASH]
+  bash easytrojan.sh traffic prune [--days N] [--max-per-user N] [--yes]
+  bash easytrojan.sh traffic enforce-quota [--dry-run]
+  bash easytrojan.sh traffic schedule status|enable|disable [...]
   bash easytrojan.sh link [--server ADDR] [--port PORT] [--password PASSWORD] [--name NAME]
   bash easytrojan.sh cert auto
   bash easytrojan.sh cert origin --cert PATH --key PATH
   bash easytrojan.sh cert status
+  bash easytrojan.sh ws-path status|auto|reset|/PATH
+  bash easytrojan.sh firewall cf-only|off|status [--port PORT] [--refresh] [--dry-run]
   bash easytrojan.sh user add [--password PASSWORD] [--remark NAME]
   bash easytrojan.sh user remark --password PASSWORD --name NAME
+  bash easytrojan.sh user quota --password PASSWORD --limit SIZE
   bash easytrojan.sh user list
   bash easytrojan.sh user del --password PASSWORD
   bash easytrojan.sh hub enable [--name NAME]
@@ -66,7 +72,11 @@ Notes:
   - --outbound-ip ipv4|ipv6: prefer this address family for Trojan outbound TCP
     connections, while retaining fallback to the other family (default: ipv4);
     UDP forwarding follows the host resolver/socket policy
-  - BBR + fq are enabled automatically when supported by the host kernel
+  - --ws-path auto|/path: hide Trojan WebSocket behind a custom or random path
+    (default /); probes to other paths receive the camouflage site instead
+  - firewall cf-only: restrict inbound TCP on HTTPS port (443) to Cloudflare
+    IP ranges + loopback so origin IP direct scanners cannot probe port 443
+  - BBR + fq (including live interface qdisc) are enabled automatically when supported by the host kernel
   - --tune-system: opt in to high-BDP/connection-rate sysctl tuning; values are
     applied before Caddy starts and verified by reading them back
   - doctor --network: print read-only qdisc, TCP counters, softnet and Caddy FD diagnostics
@@ -83,6 +93,10 @@ Notes:
   - hub requires python3 >= 3.8 (auto-installs via apt/dnf/yum if missing)
 EOF
 }
+
+if ! declare -F check_cmd >/dev/null 2>&1; then
+    check_cmd() { command -v "$1" &>/dev/null; }
+fi
 
 detect_arch() {
     case $(uname -m) in
@@ -224,6 +238,182 @@ delete_user_remark() {
     rm -f -- "$file"
 }
 
+parse_size_bytes() {
+    local raw
+    raw=$(printf '%s' "${1:-}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+    case "$raw" in
+        ""|0|0b|unlimited|off|none)
+            printf '0'
+            return 0
+            ;;
+    esac
+    if ! printf '%s' "$raw" | grep -Eq '^[0-9]+(\.[0-9]+)?(b|k|kb|kib|m|mb|mib|g|gb|gib|t|tb|tib)?$'; then
+        return 1
+    fi
+    awk -v s="$raw" 'BEGIN{
+        num = s;
+        unit = "";
+        if (match(s, /[a-z]+$/)) {
+            unit = substr(s, RSTART);
+            num = substr(s, 1, RSTART - 1);
+        }
+        mult = 1;
+        if (unit == "" || unit == "b") mult = 1;
+        else if (unit == "k" || unit == "kib") mult = 1024;
+        else if (unit == "kb") mult = 1000;
+        else if (unit == "m" || unit == "mib") mult = 1024 * 1024;
+        else if (unit == "mb") mult = 1000 * 1000;
+        else if (unit == "g" || unit == "gib") mult = 1024 * 1024 * 1024;
+        else if (unit == "gb") mult = 1000 * 1000 * 1000;
+        else if (unit == "t" || unit == "tib") mult = 1024 * 1024 * 1024 * 1024;
+        else if (unit == "tb") mult = 1000 * 1000 * 1000 * 1000;
+        else exit 1;
+        val = num * mult;
+        if (val < 0) exit 1;
+        printf "%.0f", val;
+    }'
+}
+
+format_size_bytes() {
+    awk -v v="${1:-0}" 'BEGIN{
+        val = v + 0;
+        split("B KiB MiB GiB TiB", u, " ");
+        i = 1;
+        while (val >= 1024 && i < 5) {
+            val /= 1024;
+            i++;
+        }
+        if (i == 1) printf "%.0f %s", val, u[i];
+        else printf "%.2f %s", val, u[i];
+    }'
+}
+
+quotas_dir_path() {
+    printf '%s' "${QUOTAS_DIR:-${TROJAN_DIR:-/etc/caddy/trojan}/quotas}"
+}
+
+suspended_passwd_file_path() {
+    printf '%s' "${SUSPENDED_PASSWD_FILE:-${TROJAN_DIR:-/etc/caddy/trojan}/suspended-passwd.txt}"
+}
+
+traffic_schedule_conf_path() {
+    printf '%s' "${TRAFFIC_SCHEDULE_CONF:-${TROJAN_DIR:-/etc/caddy/trojan}/traffic-schedule.conf}"
+}
+
+quota_file_for_password() {
+    local key
+    key=$(password_key "$1") || return 1
+    printf '%s/%s' "$(quotas_dir_path)" "$key"
+}
+
+get_user_quota() {
+    local file line=""
+    file=$(quota_file_for_password "$1") || return 0
+    [ -f "$file" ] || return 0
+    IFS= read -r line < "$file" || true
+    case "$line" in
+        ''|*[!0-9]*) return 0 ;;
+    esac
+    printf '%s' "$line"
+}
+
+_set_user_quota() {
+    local passwd="$1" limit_bytes="$2" qdir file tmp
+    validate_password_value "$passwd"
+    case "$limit_bytes" in
+        ''|*[!0-9]*) error "Quota bytes must be a non-negative integer" ;;
+    esac
+    qdir=$(quotas_dir_path)
+    mkdir -p "$qdir"
+    chmod 750 "$qdir"
+    file=$(quota_file_for_password "$passwd") || error "Cannot calculate password key"
+    if [ "$limit_bytes" -eq 0 ]; then
+        rm -f -- "$file"
+        return 0
+    fi
+    tmp=$(mktemp "${qdir}/.quota.XXXXXX")
+    printf '%s\n' "$limit_bytes" > "$tmp"
+    chmod 640 "$tmp"
+    mv -f -- "$tmp" "$file"
+    chown root:caddy "$file" 2>/dev/null || true
+}
+
+set_user_quota() {
+    with_config_lock _set_user_quota "$@"
+}
+
+delete_user_quota() {
+    local file
+    file=$(quota_file_for_password "$1") || return 0
+    rm -f -- "$file"
+}
+
+_suspend_password_to_file() {
+    local passwd="$1" sfile tmp
+    validate_password_value "$passwd"
+    sfile=$(suspended_passwd_file_path)
+    mkdir -p "$(dirname "$sfile")"
+    tmp=$(mktemp "$(dirname "$sfile")/.suspended.XXXXXX")
+    {
+        [ -f "$sfile" ] && cat "$sfile"
+        printf '%s\n' "$passwd"
+    } | awk 'length($0) > 0 && !seen[$0]++' > "$tmp"
+    chmod 640 "$tmp"
+    mv -f -- "$tmp" "$sfile"
+    chown root:caddy "$sfile" 2>/dev/null || true
+    _remove_password_from_file "$passwd"
+}
+
+suspend_password_to_file() {
+    with_config_lock _suspend_password_to_file "$@"
+}
+
+_remove_suspended_password_from_file() {
+    local passwd="$1" sfile tmp
+    sfile=$(suspended_passwd_file_path)
+    [ -f "$sfile" ] || return 0
+    tmp=$(mktemp "$(dirname "$sfile")/.suspended.XXXXXX")
+    grep -Fxv -- "$passwd" "$sfile" > "$tmp" || true
+    chmod 640 "$tmp"
+    mv -f -- "$tmp" "$sfile"
+    chown root:caddy "$sfile" 2>/dev/null || true
+}
+
+remove_suspended_password_from_file() {
+    with_config_lock _remove_suspended_password_from_file "$@"
+}
+
+_restore_suspended_passwords() {
+    local filter_key="${1:-}" sfile tmp_keep line pkey restored=0
+    sfile=$(suspended_passwd_file_path)
+    [ -s "$sfile" ] || { printf '0'; return 0; }
+    tmp_keep=$(mktemp "$(dirname "$sfile")/.suspended.XXXXXX")
+    : > "$tmp_keep"
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ -n "$line" ] || continue
+        if [ -n "$filter_key" ]; then
+            pkey=$(password_key "$line" 2>/dev/null || true)
+            if [ "$pkey" != "$filter_key" ]; then
+                printf '%s\n' "$line" >> "$tmp_keep"
+                continue
+            fi
+        fi
+        _persist_password "$line"
+        restored=$((restored + 1))
+    done < "$sfile"
+    chmod 640 "$tmp_keep"
+    mv -f -- "$tmp_keep" "$sfile"
+    chown root:caddy "$sfile" 2>/dev/null || true
+    if [ ! -s "$sfile" ]; then
+        rm -f -- "$sfile"
+    fi
+    printf '%s' "$restored"
+}
+
+restore_suspended_passwords() {
+    with_config_lock _restore_suspended_passwords "$@"
+}
+
 normalize_outbound_ip_priority() {
     local value
     value=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
@@ -264,6 +454,71 @@ prompt_outbound_ip_priority() {
         esac
     fi
     outbound_ip_priority=$(normalize_outbound_ip_priority "${outbound_ip_priority:-ipv4}")
+}
+
+generate_random_ws_path() {
+    local token=""
+    if check_cmd openssl; then
+        token=$(openssl rand -hex 6 2>/dev/null || true)
+    fi
+    if [ -z "$token" ] && check_cmd python3; then
+        token=$(python3 -c 'import secrets; print(secrets.token_hex(6))' 2>/dev/null || true)
+    fi
+    if [ -z "$token" ]; then
+        token=$(od -An -tx1 -N6 /dev/urandom 2>/dev/null | tr -d ' \n' || true)
+    fi
+    [ -n "$token" ] || { error "Failed to generate a random WebSocket path"; return 1; }
+    printf '/ws-%s' "$token"
+}
+
+normalize_ws_path() {
+    local raw="${1:-}"
+    raw=$(printf '%s' "$raw" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    case "$raw" in
+        ""|/|default|reset|none)
+            printf '/'
+            return 0
+            ;;
+        auto|random)
+            generate_random_ws_path
+            return $?
+            ;;
+    esac
+    [[ "$raw" == /* ]] || raw="/${raw}"
+    [ "$raw" != "/" ] && raw="${raw%/}"
+    [ -n "$raw" ] || raw="/"
+    if [ "${#raw}" -gt 256 ]; then
+        error "WebSocket path is too long (maximum 256 characters)"
+        return 1
+    fi
+    if contains_control_chars "$raw" \
+        || [[ "$raw" == *".."* ]] \
+        || [[ "$raw" == *"//"* ]] \
+        || ! [[ "$raw" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
+        error "Invalid WebSocket path '${raw}': use [A-Za-z0-9._/-] starting with '/'"
+        return 1
+    fi
+    printf '%s' "$raw"
+}
+
+read_ws_path() {
+    local f="${WS_PATH_FILE:-}" value=""
+    if [ -n "$f" ] && [ -f "$f" ]; then
+        value=$(tr -d '\r\n' < "$f" 2>/dev/null || true)
+        if [ -n "$value" ]; then
+            normalize_ws_path "$value"
+            return 0
+        fi
+    fi
+    printf '/'
+}
+
+current_ws_path() {
+    if [ -n "${ws_path:-}" ]; then
+        normalize_ws_path "$ws_path"
+    else
+        read_ws_path
+    fi
 }
 
 # Send an HTTP request with curl while keeping secrets out of argv (ps auxww).
@@ -470,6 +725,11 @@ parse_common_args() {
                 outbound_ip_priority=$(normalize_outbound_ip_priority "$2")
                 shift 2
                 ;;
+            --ws-path|--websocket-path)
+                [ -n "${2:-}" ] || error "--ws-path requires a path (e.g. /ws-secret or auto)"
+                ws_path="$2"
+                shift 2
+                ;;
             --skip-domain-check)
                 skip_domain_check="1"
                 shift
@@ -616,7 +876,7 @@ read_installed_domain() {
 }
 
 build_share_link() {
-    local domain="$1" passwd="$2" transport="${3:-ws}" server="${4:-}" port="${5:-443}" name="${6:-$1}"
+    local domain="$1" passwd="$2" transport="${3:-ws}" server="${4:-}" port="${5:-443}" name="${6:-$1}" ws_path_arg="${7:-}"
     local encoded display_name addr
     encoded=$(urlencode "$passwd")
     display_name=$(urlencode "$name")
@@ -628,10 +888,17 @@ build_share_link() {
         addr="[${addr}]"
     fi
     if [ "$transport" = "ws" ]; then
+        local active_ws_path encoded_ws_path
+        if [ -n "$ws_path_arg" ]; then
+            active_ws_path="$ws_path_arg"
+        else
+            active_ws_path=$(read_ws_path)
+        fi
+        encoded_ws_path=$(urlencode "$active_ws_path")
         # Address may be CF anycast IP; SNI + WS Host must remain the real domain.
         # WebSocket Upgrade is HTTP/1.1; h2-first ALPN causes intermittent handshake failures.
-        printf 'trojan://%s@%s:%s?security=tls&sni=%s&alpn=http%%2F1.1&type=ws&host=%s&path=%%2F&udp=1&fp=chrome&allowInsecure=0#%s' \
-            "$encoded" "$addr" "$port" "$domain" "$domain" "$display_name"
+        printf 'trojan://%s@%s:%s?security=tls&sni=%s&alpn=http%%2F1.1&type=ws&host=%s&path=%s&udp=1&fp=chrome&allowInsecure=0#%s' \
+            "$encoded" "$addr" "$port" "$domain" "$domain" "$encoded_ws_path" "$display_name"
     else
         printf 'trojan://%s@%s:%s?security=tls&sni=%s&alpn=http%%2F1.1&type=tcp&udp=1&fp=chrome&allowInsecure=0#%s' \
             "$encoded" "$addr" "$port" "$domain" "$display_name"

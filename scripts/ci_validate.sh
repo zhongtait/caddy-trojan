@@ -328,6 +328,104 @@ fi
 rm -rf "$traffic_test_root"
 pass "traffic CLI supports IP tracking, remarks, grouping, and unmasking"
 
+# ---------- traffic quota, prune, and schedule CLI ----------
+info "traffic quota, prune, and schedule CLI"
+quota_test_root=$(mktemp -d)
+if ! bash -c '
+  set -euo pipefail
+  test_root=$1
+  TROJAN_DIR="${test_root}/trojan"
+  PASSWD_FILE="${TROJAN_DIR}/passwd.txt"
+  SUSPENDED_PASSWD_FILE="${TROJAN_DIR}/suspended-passwd.txt"
+  REMARKS_DIR="${TROJAN_DIR}/remarks"
+  QUOTAS_DIR="${TROJAN_DIR}/quotas"
+  TRAFFIC_SCHEDULE_CONF="${TROJAN_DIR}/traffic-schedule.conf"
+  DOMAIN_FILE="${TROJAN_DIR}/domain.txt"
+  CONFIG_LOCK_FILE="${TROJAN_DIR}/.config.lock"
+  TRAFFIC_RESET_SERVICE_FILE="${test_root}/systemd/easytrojan-traffic-reset.service"
+  TRAFFIC_RESET_TIMER_FILE="${test_root}/systemd/easytrojan-traffic-reset.timer"
+  TRAFFIC_MAINTAIN_SERVICE_FILE="${test_root}/systemd/easytrojan-traffic-maintain.service"
+  TRAFFIC_MAINTAIN_TIMER_FILE="${test_root}/systemd/easytrojan-traffic-maintain.timer"
+  ADMIN_API="http://127.0.0.1:2019"
+  SCRIPT_BIN="/usr/local/bin/easytrojan"
+  mkdir -p "$TROJAN_DIR" "$REMARKS_DIR" "$QUOTAS_DIR" "${test_root}/systemd"
+  printf "%s\n" "example.com" > "$DOMAIN_FILE"
+  printf "%s\n" "quota-secret-password" > "$PASSWD_FILE"
+  require_root() { :; }
+  error() { echo -e "[ERROR] $*" >&2; return 1; }
+  ok() { echo -e "[OK] $*"; }
+  warn() { echo -e "[WARN] $*"; }
+  info() { echo -e "[INFO] $*"; }
+  check_cmd() {
+    case "$1" in
+      systemctl|systemd-analyze) return 1 ;;
+      *) command -v "$1" >/dev/null 2>&1 ;;
+    esac
+  }
+  with_config_lock() { "$@"; }
+  mask_secret() { printf "****"; }
+  generate_caddyfile() { :; }
+  reload_caddy() { :; }
+  wait_for_admin_api() { :; }
+  delete_trojan_user_storage() { printf "%s\n" "$1" >> "${test_root}/deleted.log"; }
+  hub_enabled() { return 1; }
+  . lib/common.sh
+  . lib/system.sh
+  . lib/manage.sh
+
+  [ "$(parse_size_bytes "10GiB")" = "10737418240" ]
+  [ "$(parse_size_bytes "unlimited")" = "0" ]
+
+  pkey=$(password_key "quota-secret-password")
+  curl() {
+    local out="" url=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -o) out="$2"; shift 2 ;;
+        http://*) url="$1"; shift ;;
+        *) shift ;;
+      esac
+    done
+    case "$url" in
+      */trojan/users)
+        printf "[{\"key\":\"%s\",\"up\":600000000,\"down\":600000000}]\n" "$pkey" > "$out"
+        ;;
+      */trojan/traffic/prune*)
+        printf "{\"pruned\":4}\n"
+        ;;
+      */trojan/traffic*)
+        :
+        ;;
+    esac
+  }
+
+  do_user quota --password "quota-secret-password" --limit 1GiB >/dev/null
+  [ "$(get_user_quota "quota-secret-password")" = "1073741824" ]
+  do_traffic enforce-quota >/dev/null
+  [ ! -s "$PASSWD_FILE" ] || ! grep -Fxq "quota-secret-password" "$PASSWD_FILE"
+  grep -Fxq "quota-secret-password" "$SUSPENDED_PASSWD_FILE"
+  list_out=$(do_user list)
+  echo "$list_out" | grep -qF "SUSPENDED: quota"
+
+  do_traffic reset --yes >/dev/null
+  grep -Fxq "quota-secret-password" "$PASSWD_FILE"
+  [ ! -f "$SUSPENDED_PASSWD_FILE" ]
+
+  prune_out=$(do_traffic prune --yes --days 30 --max-per-user 500)
+  echo "$prune_out" | grep -qF "Pruned 4"
+
+  do_traffic schedule enable --monthly-day 1 --prune-days 30 --max-per-user 500 --enforce-quota >/dev/null
+  [ -f "$TRAFFIC_RESET_TIMER_FILE" ] && grep -qF "OnCalendar=*-*-01 00:05:00" "$TRAFFIC_RESET_TIMER_FILE"
+  [ -f "$TRAFFIC_MAINTAIN_TIMER_FILE" ] && grep -qF "easytrojan traffic maintain" "$TRAFFIC_MAINTAIN_SERVICE_FILE"
+  do_traffic schedule disable >/dev/null
+  [ ! -f "$TRAFFIC_RESET_TIMER_FILE" ] && [ ! -f "$TRAFFIC_MAINTAIN_TIMER_FILE" ]
+' _ "$quota_test_root"; then
+  rm -rf "$quota_test_root"
+  fail "traffic quota, prune, or schedule CLI test failed"
+fi
+rm -rf "$quota_test_root"
+pass "traffic quota, prune, and schedule CLI work as expected"
+
 # ---------- install dependency package mapping ----------
 info "install dependency package mapping"
 dependency_calls=$(bash -c '
@@ -496,7 +594,6 @@ if ! bash -c '
   calls="${test_root}/systemctl.calls"
   info() { :; }
   warn() { :; }
-  chown() { :; }
   systemctl() {
     printf "%s\n" "$*" >> "$calls"
     return 0
@@ -1187,6 +1284,124 @@ if grep -q "$HUB_TMP" "${HUB_TMP}/err.json"; then
   fail "503 body leaked a server file path: $(cat "${HUB_TMP}/err.json")"
 fi
 pass "corrupt node state fails closed with a generic message"
+
+# ---------- live fq qdisc, custom WS path, and Cloudflare origin firewall ----------
+info "live fq qdisc, custom WS path, and Cloudflare firewall helpers"
+extra_test_root=$(mktemp -d)
+if ! bash -c '
+  set -euo pipefail
+  test_root=$1
+  TROJAN_DIR="${test_root}/trojan"
+  CADDY_DIR="${test_root}/caddy"
+  CADDY_XDG_DATA_HOME="${test_root}/live-data"
+  CADDY_DATA_DIR="${CADDY_XDG_DATA_HOME}/caddy"
+  WWW_DIR="${CADDY_DIR}/www"
+  CADDYFILE="${CADDY_DIR}/Caddyfile"
+  PASSWD_FILE="${TROJAN_DIR}/passwd.txt"
+  DOMAIN_FILE="${TROJAN_DIR}/domain.txt"
+  OUTBOUND_IP_PRIORITY_FILE="${TROJAN_DIR}/outbound-ip-priority.txt"
+  WS_PATH_FILE="${TROJAN_DIR}/ws-path.txt"
+  TLS_MODE_FILE="${TROJAN_DIR}/tls-mode.txt"
+  TLS_CERT_FILE_REC="${TROJAN_DIR}/tls-cert.path"
+  TLS_KEY_FILE_REC="${TROJAN_DIR}/tls-key.path"
+  ORIGIN_CERT_DEFAULT="${CADDY_DIR}/certs/origin.crt"
+  ORIGIN_KEY_DEFAULT="${CADDY_DIR}/certs/origin.key"
+  HUB_ENABLED_FILE="${TROJAN_DIR}/hub/enabled"
+  HUB_LISTEN="127.0.0.1:2099"
+  MANAGED_MARKER="${CADDY_DIR}/.easytrojan-managed"
+  CONFIG_LOCK_FILE="${TROJAN_DIR}/.config.lock"
+  CADDY_BIN="${test_root}/bin/caddy"
+  CF_FIREWALL_CONF="${TROJAN_DIR}/cf-firewall.conf"
+  CF_FIREWALL_BIN="${test_root}/bin/easytrojan-cf-firewall"
+  CF_FIREWALL_SERVICE_FILE="${test_root}/systemd/easytrojan-cf-firewall.service"
+  CF_FIREWALL_SKIP_APPLY=1
+  mkdir -p "$TROJAN_DIR" "$CADDY_DIR" "$WWW_DIR" "${test_root}/bin"
+  cat > "$CADDY_BIN" <<'"'"'EOF'"'"'
+#!/bin/sh
+exit 0
+EOF
+  chmod +x "$CADDY_BIN"
+  tc_log="${test_root}/tc.log"
+  cat > "${test_root}/bin/ip" <<'"'"'EOF'"'"'
+#!/bin/sh
+if [ "$1" = "-6" ]; then
+  echo "default via fe80::1 dev eth0 proto ra metric 1024"
+else
+  echo "default via 10.0.0.1 dev ens3 proto dhcp"
+fi
+EOF
+  cat > "${test_root}/bin/tc" <<EOF
+#!/bin/sh
+printf "%s\n" "\$*" >> "${tc_log}"
+EOF
+  chmod +x "${test_root}/bin/ip" "${test_root}/bin/tc"
+  export PATH="${test_root}/bin:${PATH}"
+
+  chown() { :; }
+  ok() { :; }
+  info() { :; }
+  warn() { :; }
+  require_root() { :; }
+  error() { echo -e "[ERROR] $*" >&2; return 1; }
+  . lib/common.sh
+  . lib/tls.sh
+  . lib/system.sh
+  . lib/caddy.sh
+  . lib/hub.sh
+  . lib/manage.sh
+
+  # 1. apply_fq_qdisc_to_default_iface applies fq to unique default interfaces
+  apply_fq_qdisc_to_default_iface
+  grep -qxF "qdisc replace dev ens3 root fq" "$tc_log"
+  grep -qxF "qdisc replace dev eth0 root fq" "$tc_log"
+
+  # 2. WebSocket path normalization, Caddyfile generation, share link & Hub payloads
+  rand_ws=$(normalize_ws_path auto)
+  [[ "$rand_ws" =~ ^/ws-[0-9a-f]{12}$ ]]
+  [ "$(normalize_ws_path reset)" = "/" ]
+  printf "%s\n" "secret-pass" > "$PASSWD_FILE"
+  printf "%s\n" "example.com" > "$DOMAIN_FILE"
+  ws_path="/stealth-ws"
+  generate_caddyfile "example.com"
+  grep -qF "websocket /stealth-ws" "$CADDYFILE"
+  grep -qF "trusted_proxies static 173.245.48.0/20" "$CADDYFILE"
+  grep -qxF "/stealth-ws" "$WS_PATH_FILE"
+  ws_link=$(build_share_link example.com secret-pass ws)
+  echo "$ws_link" | grep -qF "path=%2Fstealth-ws"
+  reg_json=$(hub_register_payload node1 example.com secret-pass example.com 443 ws)
+  echo "$reg_json" | grep -qF "\"path\":\"/stealth-ws\""
+  sync_json=$(hub_sync_payload node1 example.com example.com 443 ws)
+  echo "$sync_json" | grep -qE "\"path\":[[:space:]]*\"/stealth-ws\""
+  ws_path="/"
+  generate_caddyfile "example.com"
+  grep -qxE "[[:space:]]*websocket" "$CADDYFILE"
+  if normalize_ws_path "/bad/../path" >/dev/null 2>&1; then
+    exit 1
+  fi
+
+  # 3. Cloudflare firewall dry-run, staging, syntax, and removal
+  dry=$(do_firewall cf-only --port 443 --dry-run)
+  echo "$dry" | grep -qF "mode=cf-only"
+  echo "$dry" | grep -qF "port=443"
+  echo "$dry" | grep -qF "173.245.48.0/20"
+  apply_cf_only_firewall 8443 0 0
+  grep -qxF "MODE=cf-only" "$CF_FIREWALL_CONF"
+  grep -qxF "PORT=8443" "$CF_FIREWALL_CONF"
+  bash -n "$CF_FIREWALL_BIN"
+  if command -v shellcheck >/dev/null 2>&1; then
+    shellcheck --severity=warning "$CF_FIREWALL_BIN"
+  fi
+  grep -qF "ExecStart=${CF_FIREWALL_BIN} apply" "$CF_FIREWALL_SERVICE_FILE"
+  disable_cf_firewall
+  [ ! -e "$CF_FIREWALL_CONF" ]
+  [ ! -e "$CF_FIREWALL_BIN" ]
+  [ ! -e "$CF_FIREWALL_SERVICE_FILE" ]
+' _ "$extra_test_root"; then
+  rm -rf "$extra_test_root"
+  fail "live fq qdisc, WS path, or CF firewall tests failed"
+fi
+rm -rf "$extra_test_root"
+pass "live fq qdisc, custom WS path, and Cloudflare origin firewall"
 
 info "all checks passed (no node install)"
 pass "ci_validate done"
